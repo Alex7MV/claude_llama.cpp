@@ -1178,7 +1178,7 @@ static void ggml_compute_forward_acc_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
     }
 
     const int ith = params->ith;
@@ -1660,7 +1660,7 @@ static void ggml_compute_forward_count_equal_i32(
     if (ith != 0) {
         sums[ith] = sum_thread;
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     if (ith != 0) {
         return;
@@ -4236,7 +4236,7 @@ static void ggml_compute_forward_out_prod_f32(
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     // dst[:,:,:,:] = 0
     // for i2,i3:
@@ -4358,7 +4358,7 @@ static void ggml_compute_forward_out_prod_q_f32(
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     // parallelize by last three dimensions
 
@@ -4558,7 +4558,7 @@ static void ggml_compute_forward_set_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
     }
 
     const int ith = params->ith;
@@ -4629,7 +4629,7 @@ static void ggml_compute_forward_set_i32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
     }
 
     const int ith = params->ith;
@@ -5252,7 +5252,7 @@ static void ggml_compute_forward_diag_mask_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
     }
 
     // TODO: handle transposed/permuted matrices
@@ -6061,7 +6061,7 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
         // need to zero dst since we are accumulating into it
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
 
@@ -6149,7 +6149,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
         // need to zero dst since we are accumulating into it
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
 
@@ -6826,7 +6826,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
             }
         }   // patches handled by this thread
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
 
         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
 
@@ -6835,7 +6835,7 @@ static void ggml_compute_forward_conv_2d_impl(const ggml_compute_params * params
         // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
         ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
 
 
         //permute back [OC, N, OH, OW] to [N, OC, OH, OW]
@@ -6972,12 +6972,12 @@ static void ggml_compute_forward_conv_3d_impl(const ggml_compute_params * params
             }
         }
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
 
         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n_total * traits->type_size);
         ggml_call_mul_mat(kernel_type, params, patch_n_in_batch, oc, knl_n_total, tmp, knl_data, gemm_output);
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
 
         const int64_t permute_per_thread = (patch_n_in_batch + params->nth - 1) / params->nth;
         const int64_t permute_start = params->ith * permute_per_thread;
@@ -7072,7 +7072,7 @@ static void ggml_compute_forward_conv_transpose_2d_impl(
 
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     const int32_t stride = ggml_get_op_params_i32(dst, 0);
 
@@ -8921,7 +8921,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             }
         }
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
     } else {
 
@@ -8944,7 +8944,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             ggml_threadpool_chunk_set(params->threadpool, nth);
         }
 
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
 
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
@@ -9052,7 +9052,7 @@ static void ggml_compute_forward_flash_attn_back_f32(
     if (ith == 0) {
         memset(dst->data, 0, nb0*ne0*ne1*ne2*ne3);
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     const int64_t elem_q = ggml_nelements(q);
     const int64_t elem_k = ggml_nelements(k);
@@ -9957,7 +9957,7 @@ static void ggml_compute_forward_add_rel_pos_f32(
         if (params->ith == 0) {
             memcpy((char *) dst->data, (char *) src0->data, ggml_nbytes(dst));
         }
-        ggml_barrier(params->threadpool);
+        ggml_barrier(params->threadpool, params->ith);
     }
     // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/image_encoder.py#L357-L359
 
@@ -10059,7 +10059,7 @@ static void ggml_compute_forward_rwkv_wkv6_f32(
     if (ith == 0) {
         memset(dst_data, 0, T * C * sizeof(float));
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
 
     #if defined(__AVX__) && !defined(__AVX512F__)
@@ -10271,7 +10271,7 @@ static void ggml_compute_forward_gla_f32(
     if (ith == 0) {
         memset(dst_data, 0, T * C * sizeof(float));
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
 
     #if defined(__AVX__) && !defined(__AVX512F__)
@@ -10688,7 +10688,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
       ggml_threadpool_chunk_set(params->threadpool, nth);
     }
 
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     const int64_t dr = (nr + nchunk - 1) / nchunk;
 
@@ -11063,7 +11063,7 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
 #endif // NDEBUG
     }
     sums[ith] = sum_thread;
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params->threadpool, params->ith);
 
     if (ith == 0) {
         float * dp = (float *) dst->data;
