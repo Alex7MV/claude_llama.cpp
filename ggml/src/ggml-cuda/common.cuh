@@ -1136,6 +1136,15 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
+        int64_t * out_t_wait_us,
+        uint64_t * out_n_wait_ops,
+        int64_t * out_t_phase1_us,
+        int64_t * out_t_phase2_us,
+        int64_t * out_t_phase3_us,
+        int64_t * out_t_fallback_us,
+        uint64_t * out_n_wait_fallback);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1389,6 +1398,20 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Two-stream readback: dedicated stream for device-to-host copies
+    cudaStream_t readback_stream = nullptr;
+    cudaEvent_t  readback_event  = nullptr;
+    cudaEvent_t  copy_done_event = nullptr;
+
+    // Timing instrumentation for adaptive wait
+    int64_t  t_wait_us = 0;
+    uint64_t n_wait_ops = 0;
+    int64_t  t_wait_phase1_us = 0;
+    int64_t  t_wait_phase2_us = 0;
+    int64_t  t_wait_phase3_us = 0;
+    int64_t  t_wait_fallback_us = 0;
+    uint64_t n_wait_fallback = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
 
@@ -1464,6 +1487,16 @@ struct ggml_backend_cuda_context {
     }
 
     cudaStream_t stream() { return stream(device, curr_stream_no); }
+
+    cudaStream_t readback_stream_get() {
+        if (readback_stream == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&readback_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&readback_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&copy_done_event, cudaEventDisableTiming));
+        }
+        return readback_stream;
+    }
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 

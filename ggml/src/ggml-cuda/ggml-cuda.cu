@@ -2,6 +2,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <sched.h>
+#include <unistd.h>
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -300,13 +303,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
             turing_devices_without_mma.push_back({ id, device_name });
         }
 
-        // Temporary performance fix:
-        // Setting device scheduling strategy for iGPUs with cc121 to "spinning" to avoid delays in cuda synchronize calls.
-        // TODO: Check for future drivers the default scheduling strategy and
-        // remove this call again when cudaDeviceScheduleSpin is default.
+        // Use adaptive yield by default. Users can force spin for
+        // latency-sensitive workloads via GGML_CUDA_SCHEDULE_SPIN=1.
         if (prop.major == 12 && prop.minor == 1) {
             CUDA_CHECK(cudaSetDevice(id));
-            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            if (getenv("GGML_CUDA_SCHEDULE_SPIN") != nullptr) {
+                CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+            }
+            // else: use default cudaDeviceScheduleAuto (yields on shared GPUs)
         }
 
 #endif  // defined(GGML_USE_HIP)
@@ -606,6 +610,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (readback_stream != nullptr) {
+        CUDA_CHECK(cudaStreamSynchronize(readback_stream));
+        CUDA_CHECK(cudaStreamDestroy(readback_stream));
+    }
+    if (readback_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(readback_event));
+    }
+    if (copy_done_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(copy_done_event));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -671,12 +685,15 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// Forward declaration for buffer-level sync helper
+static inline void ggml_cuda_adaptive_wait_per_thread(int device);
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -684,7 +701,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -692,7 +709,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -702,7 +719,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -712,7 +729,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -728,7 +745,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_ctx->device, src->data, src_ctx->device, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_adaptive_wait_per_thread(dst_ctx->device);
         return true;
     }
     return false;
@@ -741,7 +758,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_adaptive_wait_per_thread(ctx->device);
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -1010,7 +1027,7 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
     }
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_adaptive_wait_per_thread(id);
     }
 }
 
@@ -1049,7 +1066,7 @@ static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buff
     }
 
     for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ggml_cuda_adaptive_wait_per_thread(id);
     }
 }
 
@@ -2690,7 +2707,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!ggml_cuda_adaptive_wait(stream, ctx.device,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -2711,7 +2731,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (!ggml_cuda_adaptive_wait(stream, ctx.device,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
@@ -3127,8 +3150,24 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     return cuda_ctx->name.c_str();
 }
 
+void ggml_backend_cuda_print_timing(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    GGML_LOG_INFO("\n=== CUDA Backend %s Adaptive Wait Timing ===\n", cuda_ctx->name.c_str());
+    GGML_LOG_INFO("  Total waits:     %" PRIu64 "\n", cuda_ctx->n_wait_ops);
+    GGML_LOG_INFO("  Total wait us:   %" PRId64 "\n", cuda_ctx->t_wait_us);
+    GGML_LOG_INFO("  Phase 1 (spin):  %" PRId64 " us\n", cuda_ctx->t_wait_phase1_us);
+    GGML_LOG_INFO("  Phase 2 (back):  %" PRId64 " us\n", cuda_ctx->t_wait_phase2_us);
+    GGML_LOG_INFO("  Phase 3 (yield): %" PRId64 " us\n", cuda_ctx->t_wait_phase3_us);
+    GGML_LOG_INFO("  Fallbacks:       %" PRIu64 " (%" PRId64 " us)\n",
+        cuda_ctx->n_wait_fallback, cuda_ctx->t_wait_fallback_us);
+    GGML_LOG_INFO("=====================================================\n\n");
+}
+
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    ggml_backend_cuda_print_timing(backend);
 
     delete cuda_ctx;
     delete backend;
@@ -3149,7 +3188,16 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    cudaStream_t rb_stream = cuda_ctx->readback_stream_get();
+
+    // Record event on compute stream marking end of kernels
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->readback_event, cuda_ctx->stream()));
+    // Readback stream waits for compute to finish
+    CUDA_CHECK(cudaStreamWaitEvent(rb_stream, cuda_ctx->readback_event, 0));
+    // Launch async copy on readback stream (pinned host memory already guaranteed by cuda_host buffer type)
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, rb_stream));
+    // Record completion event so synchronize can wait on it
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->copy_done_event, rb_stream));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3170,8 +3218,13 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    cudaStream_t rb_stream = cuda_ctx->readback_stream_get();
+
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->readback_event, cuda_ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(rb_stream, cuda_ctx->readback_event, 0));
     CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, rb_stream));
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->copy_done_event, rb_stream));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -3229,12 +3282,130 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+// 3-phase adaptive wait: spin -> backoff -> yield
+// Returns true if wait completed, false if fell back to cudaStreamSynchronize
+bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
+        int64_t * out_t_wait_us,
+        uint64_t * out_n_wait_ops,
+        int64_t * out_t_phase1_us,
+        int64_t * out_t_phase2_us,
+        int64_t * out_t_phase3_us,
+        int64_t * out_t_fallback_us,
+        uint64_t * out_n_wait_fallback) {
+
+    GGML_UNUSED(device);
+
+    // Create a transient event for querying completion
+    cudaEvent_t wait_event;
+    cudaError_t err = cudaEventCreateWithFlags(&wait_event, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        return false; // fallback caller will handle
+    }
+    cudaEventRecord(wait_event, stream);
+
+    const int64_t t_start = ggml_time_us();
+
+    // Phase 1: busy-spin with short usleep (0->~100 us)
+    // 10 iterations of 10 us sleep between event queries
+    {
+        const int64_t t_phase1_start = ggml_time_us();
+        for (int i = 0; i < 10; i++) {
+            err = cudaEventQuery(wait_event);
+            if (err == cudaSuccess) {
+                const int64_t t_total = ggml_time_us() - t_start;
+                if (out_t_wait_us) *out_t_wait_us += t_total;
+                if (out_n_wait_ops) (*out_n_wait_ops)++;
+                if (out_t_phase1_us) *out_t_phase1_us += ggml_time_us() - t_phase1_start;
+                cudaEventDestroy(wait_event);
+                return true;
+            }
+            if (err != cudaErrorNotReady) {
+                goto phase3; // error - fall through to OS-aware wait
+            }
+            usleep(10);
+        }
+        if (out_t_phase1_us) *out_t_phase1_us += ggml_time_us() - t_phase1_start;
+    }
+
+    // Phase 2: exponential backoff (100 us -> 10 ms)
+    {
+        const int64_t t_phase2_start = ggml_time_us();
+        static const uint32_t backoff_us[] = { 100, 200, 500, 1000, 2000, 5000, 10000 };
+        for (size_t i = 0; i < sizeof(backoff_us) / sizeof(backoff_us[0]); i++) {
+            usleep(backoff_us[i]);
+            err = cudaEventQuery(wait_event);
+            if (err == cudaSuccess) {
+                const int64_t t_total = ggml_time_us() - t_start;
+                if (out_t_wait_us) *out_t_wait_us += t_total;
+                if (out_n_wait_ops) (*out_n_wait_ops)++;
+                if (out_t_phase2_us) *out_t_phase2_us += ggml_time_us() - t_phase2_start;
+                cudaEventDestroy(wait_event);
+                return true;
+            }
+            if (err != cudaErrorNotReady) {
+                break; // error - fall through
+            }
+        }
+        if (out_t_phase2_us) *out_t_phase2_us += ggml_time_us() - t_phase2_start;
+    }
+
+    // Phase 3: yield CPU + OS-aware wait
+phase3:
+    {
+        const int64_t t_phase3_start = ggml_time_us();
+        sched_yield();
+
+        // cudaEventSynchronize uses CUDA's internal OS-aware wait mechanism
+        err = cudaEventSynchronize(wait_event);
+        cudaEventDestroy(wait_event);
+        if (out_t_phase3_us) *out_t_phase3_us += ggml_time_us() - t_phase3_start;
+
+        if (err == cudaSuccess) {
+            const int64_t t_total = ggml_time_us() - t_start;
+            if (out_t_wait_us) *out_t_wait_us += t_total;
+            if (out_n_wait_ops) (*out_n_wait_ops)++;
+            return true;
+        }
+    }
+
+    // Fallback: if event operations failed, use the original stream sync
+    {
+        if (out_t_fallback_us) *out_t_fallback_us += 0;
+        if (out_n_wait_fallback) (*out_n_wait_fallback)++;
+        return false;
+    }
+}
+
+// Adaptive wait wrapper for cudaStreamPerThread (used by buffer ops)
+static inline void ggml_cuda_adaptive_wait_per_thread(int device) {
+    ggml_cuda_set_device(device);
+    if (!ggml_cuda_adaptive_wait(cudaStreamPerThread, device,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    }
+}
+
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
-    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    // Synchronize compute stream — covers all kernels and cuBLAS work
+    if (!ggml_cuda_adaptive_wait(cuda_ctx->stream(), cuda_ctx->device,
+            &cuda_ctx->t_wait_us, &cuda_ctx->n_wait_ops,
+            &cuda_ctx->t_wait_phase1_us, &cuda_ctx->t_wait_phase2_us,
+            &cuda_ctx->t_wait_phase3_us,
+            &cuda_ctx->t_wait_fallback_us, &cuda_ctx->n_wait_fallback)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
-    GGML_UNUSED(backend);
+    // Synchronize readback stream — covers in-flight device-to-host copies.
+    // The copy_done_event is recorded on the readback stream after each
+    // memcpyAsync, so synchronizing it guarantees the copy finished.
+    if (cuda_ctx->copy_done_event != nullptr) {
+        cudaError_t err = cudaEventSynchronize(cuda_ctx->copy_done_event);
+        if (err != cudaSuccess) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->readback_stream));
+        }
+    }
 }
 
 #ifdef USE_CUDA_GRAPH
