@@ -40,11 +40,21 @@ bool ggml_epyc_pipeline_health_check(int gpu_device_id) {
             gpu_device_id);
     }
 
-    // Check 2: Verify async engine count for TMA
-    int device;
-    CUDA_CHECK(cudaGetDevice(&device));
+    // Check 2: Verify async engine count for TMA (non-fatal, no CUDA_CHECK)
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "WARN: health check skipped, CUDA not initialized (%s)\n",
+            cudaGetErrorString(err));
+        return true;
+    }
     cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "WARN: could not read device properties (%s)\n",
+            cudaGetErrorString(err));
+        return true;
+    }
 
     if (prop.asyncEngineCount < 2) {
         fprintf(stderr, "WARN: GPU has only %d async engines, TMA may be limited\n",
@@ -61,6 +71,7 @@ bool ggml_epyc_pipeline_health_check(int gpu_device_id) {
 
 ggml_epyc_pipeline_gpu * ggml_epyc_pipeline_gpu_init(int depth, cudaStream_t main_stream) {
     if (depth < 1 || depth > 4) return nullptr;
+    if (g_epyc_pipeline) return g_epyc_pipeline; // Prevent double-init leak
 
     g_epyc_pipeline = new ggml_epyc_pipeline_gpu();
     memset(g_epyc_pipeline, 0, sizeof(*g_epyc_pipeline));
