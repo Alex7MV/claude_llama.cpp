@@ -4,6 +4,8 @@
 #include "ggml-cpu.h"
 #include <cstring>
 #include <algorithm>
+#include <mutex>
+#include <atomic>
 
 // NOTE: This file is part of ggml-base and must NOT depend on CUDA.
 // TMA integration is done at the llama-context level (Task 4) where
@@ -21,7 +23,8 @@ struct ggml_backend_sched_pipelined {
     ggml_threadpool_t cpu_tp[2];
     int num_tp;
     int active_pool;
-    ggml_backend_t cpu_backend;
+    std::atomic<ggml_backend_t> cpu_backend{nullptr};
+    std::once_flag cpu_backend_init_flag;
 
     // GPU
     ggml_backend_t gpu_backend;
@@ -44,7 +47,6 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     sched->base = base;
     sched->depth = depth;
     sched->split_size = split_size;
-    sched->cpu_backend = nullptr;
     sched->gpu_backend = gpu_backend;
     sched->num_tp = 0;
     sched->active_pool = 0;
@@ -110,24 +112,26 @@ enum ggml_status ggml_backend_sched_pipelined_compute(
         return ggml_backend_sched_graph_compute_async(sched->base, gf);
     }
 
-    // Lazily find and cache the CPU backend.
+    // Lazily find and cache the CPU backend (thread-safe via call_once).
     // Backend order is [GPU..., CPU] — CPU is NOT at index 0 when offloading.
-    if (!sched->cpu_backend) {
-        int n_be = ggml_backend_sched_get_n_backends(sched->base);
-        for (int i = 0; i < n_be; i++) {
-            ggml_backend_t be = ggml_backend_sched_get_backend(sched->base, i);
-            if (ggml_backend_is_cpu(be)) {
-                sched->cpu_backend = be;
-                break;
+    if (!sched->cpu_backend.load(std::memory_order_relaxed)) {
+        std::call_once(sched->cpu_backend_init_flag, [sched]() {
+            int n_be = ggml_backend_sched_get_n_backends(sched->base);
+            for (int i = 0; i < n_be; i++) {
+                ggml_backend_t be = ggml_backend_sched_get_backend(sched->base, i);
+                if (ggml_backend_is_cpu(be)) {
+                    sched->cpu_backend.store(be, std::memory_order_release);
+                    return;
+                }
             }
-        }
+        });
     }
 
-    if (sched->cpu_backend) {
+    if (sched->cpu_backend.load(std::memory_order_acquire)) {
         ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
         // Resume before setting — rotation can swap in a previously-paused pool
         ggml_threadpool_resume(tp);
-        ggml_backend_cpu_set_threadpool(sched->cpu_backend, tp);
+        ggml_backend_cpu_set_threadpool(sched->cpu_backend.load(std::memory_order_acquire), tp);
     }
 
     // Let the base scheduler handle alloc/compute state machine normally.
