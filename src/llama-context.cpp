@@ -13,10 +13,13 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 
 //
@@ -394,10 +397,6 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    if (sched_pipeline) {
-        ggml_backend_sched_pipelined_free(sched_pipeline);
-        sched_pipeline = nullptr;
-    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -2245,35 +2244,44 @@ ggml_status llama_context::graph_compute(
     // and the MTP graph shape can exceed the scheduler's hash_set capacity.
     if (batched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
             cparams.pipeline_depth > 0 && cparams.pipeline_split_size > 0) {
-        // Lazy init of pipeline scheduler on first batched prefill
-        if (!sched_pipeline && !sched_pipeline_init_attempted) {
-            sched_pipeline_init_attempted = true;
-            ggml_backend_t gpu_be = nullptr;
-            int n_be = ggml_backend_sched_get_n_backends(sched.get());
-            for (int i = 0; i < n_be; i++) {
-                ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
-                auto dev = ggml_backend_get_device(be);
-                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    gpu_be = be;
-                    break;
+        // Lazy init of pipeline scheduler on first batched prefill (thread-safe via std::call_once)
+        if (!sched_pipeline) {
+            std::call_once(sched_pipeline_init_flag, [this, n_threads]() {
+                bool was_attempted = false;
+                sched_pipeline_init_attempted.compare_exchange_strong(was_attempted, true);
+
+                ggml_backend_t gpu_be = nullptr;
+                int n_be = ggml_backend_sched_get_n_backends(sched.get());
+                for (int i = 0; i < n_be; i++) {
+                    ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), i);
+                    auto dev = ggml_backend_get_device(be);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu_be = be;
+                        break;
+                    }
                 }
-            }
-            if (gpu_be) {
-                sched_pipeline = ggml_backend_sched_pipelined_init(
-                    sched.get(),
-                    cparams.pipeline_depth,
-                    cparams.pipeline_split_size,
-                    n_threads,
-                    GGML_SCHED_PRIO_NORMAL,
-                    1,  // poll
-                    gpu_be);
-            } else {
-                LLAMA_LOG_WARN("%s: pipeline prefill requested but no GPU backend found, falling back to sequential\n", __func__);
-            }
+
+                if (gpu_be) {
+                    sched_pipeline = std::shared_ptr<struct ggml_backend_sched_pipelined>(
+                        ggml_backend_sched_pipelined_init(
+                            sched.get(),
+                            cparams.pipeline_depth,
+                            cparams.pipeline_split_size,
+                            n_threads,
+                            GGML_SCHED_PRIO_NORMAL,
+                            1,
+                            gpu_be),
+                        [](struct ggml_backend_sched_pipelined * p) {
+                            ggml_backend_sched_pipelined_free(p);
+                        });
+                } else {
+                    LLAMA_LOG_WARN("%s: pipeline prefill requested but no GPU backend found, falling back to sequential\n", __func__);
+                }
+            });
         }
 
         if (sched_pipeline) {
-            auto status = ggml_backend_sched_pipelined_compute(sched_pipeline, gf);
+            auto status = ggml_backend_sched_pipelined_compute(sched_pipeline.get(), gf);
             if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR("%s: pipelined compute failed with error %d\n", __func__, status);
             }

@@ -11,7 +11,10 @@
 #include "ggml-opt.h"
 #include "ggml-backend-pipeline.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -328,8 +331,9 @@ private:
     ggml_backend_sched_ptr sched;
 
     // Pipelined prefill scheduler (optional, created when cparams.pipeline_depth > 0)
-    ggml_backend_sched_pipelined_t sched_pipeline = nullptr;
-    bool sched_pipeline_init_attempted = false;
+    std::shared_ptr<struct ggml_backend_sched_pipelined> sched_pipeline;
+    std::atomic<bool> sched_pipeline_init_attempted{false};
+    std::once_flag sched_pipeline_init_flag;
 
     bool sched_need_reserve = true;
 
