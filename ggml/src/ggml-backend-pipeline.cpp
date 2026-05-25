@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu-epyc.h"
 #include "ggml-cpu.h"
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <mutex>
@@ -11,7 +12,7 @@
 // TMA integration is done at the llama-context level (Task 4) where
 // both CPU and CUDA backends are linked.
 
-#define GGML_PIPELINE_MAX_EVENTS 2
+#define GGML_PIPELINE_MAX_EVENTS 4
 
 struct ggml_backend_sched_pipelined {
     ggml_backend_sched_t base;
@@ -28,7 +29,8 @@ struct ggml_backend_sched_pipelined {
 
     // GPU
     ggml_backend_t gpu_backend;
-    ggml_backend_event_t stage_events[GGML_PIPELINE_MAX_EVENTS];  // ping-pong
+    ggml_backend_event_t * stage_events;  // dynamic, [event_count]
+    int event_count;
     ggml_backend_dev_t gpu_device;
 
     bool initialized;
@@ -51,8 +53,8 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     sched->num_tp = 0;
     sched->active_pool = 0;
     sched->gpu_device = nullptr;
-    sched->stage_events[0] = nullptr;
-    sched->stage_events[1] = nullptr;
+    sched->stage_events = nullptr;
+    sched->event_count = 0;
     sched->initialized = false;
 
     // Initialize dual threadpools from CCD pairs
@@ -89,12 +91,14 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     }
 
     // Initialize backend events for pipeline synchronization.
-    // These are used for the full async TMA pipeline (deferred);
-    // currently only threadpool rotation is active.
+    // Dynamically allocated so we only create as many as needed.
     if (gpu_backend) {
         sched->gpu_device = ggml_backend_get_device(gpu_backend);
         if (sched->gpu_device) {
-            for (int i = 0; i < GGML_PIPELINE_MAX_EVENTS; i++) {
+            sched->event_count = std::min(depth, GGML_PIPELINE_MAX_EVENTS);
+            sched->stage_events = (ggml_backend_event_t *)calloc(
+                sched->event_count, sizeof(ggml_backend_event_t));
+            for (int i = 0; i < sched->event_count; i++) {
                 sched->stage_events[i] = ggml_backend_event_new(sched->gpu_device);
             }
         }
@@ -104,12 +108,19 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     return sched;
 }
 
-enum ggml_status ggml_backend_sched_pipelined_compute(
+enum ggml_status ggml_backend_sched_pipelined_compute_split(
     ggml_backend_sched_pipelined_t sched,
-    struct ggml_cgraph * gf) {
+    struct ggml_cgraph * gf,
+    int split_index) {
 
     if (!sched || !sched->initialized) {
         return ggml_backend_sched_graph_compute_async(sched->base, gf);
+    }
+
+    // Backpressure: wait for the stage event from depth ago
+    if (split_index >= sched->depth && sched->stage_events) {
+        int wait_stage = (split_index - sched->depth) % sched->depth;
+        ggml_backend_sched_pipelined_wait_stage(sched, wait_stage);
     }
 
     // Lazily find and cache the CPU backend (thread-safe via call_once).
@@ -127,8 +138,11 @@ enum ggml_status ggml_backend_sched_pipelined_compute(
         });
     }
 
+    // Assign threadpool based on split_index for NUMA interleaving
+    int tp_index = sched->num_tp > 1 ? split_index % sched->num_tp : 0;
+    ggml_threadpool_t tp = sched->cpu_tp[tp_index];
+
     if (sched->cpu_backend.load(std::memory_order_acquire)) {
-        ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
         // Set threadpool before resume to avoid unattached thread window
         ggml_backend_cpu_set_threadpool(sched->cpu_backend.load(std::memory_order_acquire), tp);
         ggml_threadpool_resume(tp);
@@ -143,7 +157,41 @@ enum ggml_status ggml_backend_sched_pipelined_compute(
         sched->active_pool = 1 - sched->active_pool;
     }
 
+    // Record stage completion event
+    if (sched->stage_events) {
+        int stage = split_index % sched->depth;
+        ggml_backend_sched_pipelined_record_stage(sched, stage);
+    }
+
+    // Pause threadpool after dispatch
+    if (tp) {
+        ggml_threadpool_pause(tp);
+    }
+
     return status;
+}
+
+enum ggml_status ggml_backend_sched_pipelined_compute(
+    ggml_backend_sched_pipelined_t sched,
+    struct ggml_cgraph * gf) {
+    return ggml_backend_sched_pipelined_compute_split(sched, gf, 0);
+}
+
+int ggml_backend_sched_pipelined_get_depth(ggml_backend_sched_pipelined_t sched) {
+    if (!sched) return 0;
+    return sched->depth;
+}
+
+void ggml_backend_sched_pipelined_record_stage(ggml_backend_sched_pipelined_t sched, int stage) {
+    if (!sched || !sched->stage_events || !sched->gpu_backend) return;
+    if (stage < 0 || stage >= sched->event_count) return;
+    ggml_backend_event_record(sched->stage_events[stage], sched->gpu_backend);
+}
+
+void ggml_backend_sched_pipelined_wait_stage(ggml_backend_sched_pipelined_t sched, int stage) {
+    if (!sched || !sched->stage_events || !sched->gpu_backend) return;
+    if (stage < 0 || stage >= sched->event_count) return;
+    ggml_backend_event_wait(sched->gpu_backend, sched->stage_events[stage]);
 }
 
 void ggml_backend_sched_pipelined_synchronize(ggml_backend_sched_pipelined_t sched) {
@@ -154,12 +202,13 @@ void ggml_backend_sched_pipelined_synchronize(ggml_backend_sched_pipelined_t sch
 void ggml_backend_sched_pipelined_free(ggml_backend_sched_pipelined_t sched) {
     if (!sched) return;
 
-    if (sched->gpu_device) {
-        for (int i = 0; i < GGML_PIPELINE_MAX_EVENTS; i++) {
+    if (sched->stage_events) {
+        for (int i = 0; i < sched->event_count; i++) {
             if (sched->stage_events[i]) {
                 ggml_backend_event_free(sched->stage_events[i]);
             }
         }
+        free(sched->stage_events);
     }
 
     for (int i = 0; i < sched->num_tp; i++) {

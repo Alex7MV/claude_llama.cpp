@@ -30,6 +30,24 @@ void ggml_backend_sched_pipelined_synchronize(ggml_backend_sched_pipelined_t sch
 
 void ggml_backend_sched_pipelined_free(ggml_backend_sched_pipelined_t sched);
 
+/**
+ * Compute a single split graph within the pipeline.
+ * split_index determines which stage event to wait on and rotate.
+ */
+enum ggml_status ggml_backend_sched_pipelined_compute_split(
+    ggml_backend_sched_pipelined_t sched,
+    struct ggml_cgraph * gf,
+    int split_index);
+
+/** Get the pipeline depth (number of stage events). */
+int ggml_backend_sched_pipelined_get_depth(ggml_backend_sched_pipelined_t sched);
+
+/** Record stage completion event from caller (e.g., after GPU dispatch). */
+void ggml_backend_sched_pipelined_record_stage(ggml_backend_sched_pipelined_t sched, int stage);
+
+/** Wait for stage event from caller side. */
+void ggml_backend_sched_pipelined_wait_stage(ggml_backend_sched_pipelined_t sched, int stage);
+
 #ifdef __cplusplus
 }
 #endif
