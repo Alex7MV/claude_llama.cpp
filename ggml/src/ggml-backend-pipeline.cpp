@@ -129,9 +129,9 @@ enum ggml_status ggml_backend_sched_pipelined_compute(
 
     if (sched->cpu_backend.load(std::memory_order_acquire)) {
         ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
-        // Resume before setting — rotation can swap in a previously-paused pool
-        ggml_threadpool_resume(tp);
+        // Set threadpool before resume to avoid unattached thread window
         ggml_backend_cpu_set_threadpool(sched->cpu_backend.load(std::memory_order_acquire), tp);
+        ggml_threadpool_resume(tp);
     }
 
     // Let the base scheduler handle alloc/compute state machine normally.

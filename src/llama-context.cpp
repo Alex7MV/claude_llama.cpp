@@ -2257,6 +2257,8 @@ ggml_status llama_context::graph_compute(
                     auto dev = ggml_backend_get_device(be);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                         gpu_be = be;
+                        // Note: for multi-GPU, pick the backend with the most matmul ops
+                        // instead of the first GPU found. Single GPU is the common case.
                         break;
                     }
                 }
