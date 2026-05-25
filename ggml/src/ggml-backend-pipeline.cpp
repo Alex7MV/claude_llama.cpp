@@ -1,5 +1,6 @@
 #include "ggml-backend-pipeline.h"
 #include "ggml-backend.h"
+#include "ggml-cpu-epyc.h"
 #include "ggml-cpu.h"
 #include <cstring>
 #include <algorithm>
