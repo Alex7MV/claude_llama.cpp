@@ -6,6 +6,23 @@
 extern "C" {
 #endif
 
+#ifndef GGML_NUMA_MAX_CPUS
+#define GGML_NUMA_MAX_CPUS 512
+#endif
+#ifndef GGML_NUMA_MAX_NODES
+#define GGML_NUMA_MAX_NODES 8
+#endif
+
+/**
+ * A pair of CCDs from opposite NUMA nodes for dual threadpool affinity.
+ * Each CCD contributes its primary + SMT threads to the shared pool.
+ */
+struct ggml_cpu_ccd_pair {
+    int ccd_indices[2];
+    uint32_t threads[GGML_NUMA_MAX_CPUS];
+    uint32_t thread_count;
+};
+
 /**
  * Probe CCD topology and return pairs of CCDs suitable for dual threadpool.
  * Returns number of pairs (0, 1, or 2). Each pair contains two CCDs
