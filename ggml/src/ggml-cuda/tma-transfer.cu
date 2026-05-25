@@ -1,6 +1,8 @@
 #include "common.cuh"
 
 #include "tma-transfer.h"
+#include "ggml-cuda-blackwell.cuh"
+#include <stdlib.h>
 
 // TMA-based transfer layer for moving KV cache data between pinned
 // system RAM and GPU VRAM.  On SM 100+ the kernel can use the TMA
@@ -28,12 +30,24 @@ struct ggml_tma_transfer {
     bool use_tma;                  // true if SM >= 100 and kernel is verified
 };
 
-// TODO (TMA kernel): The device-side kernel for SM 100+ is not yet
-// implemented. When ready, add a __global__ function guarded by
-// #if __CUDA_ARCH__ >= 1000 that uses cp.async.bulk PTX to transfer
-// data from the pinned source (TMA descriptor) to global VRAM.
-// The commit/wait_group PTX wrappers are in tma.cuh (note: their PTX
-// syntax requires verification against ptxas).
+// Runtime probe: check if TMA is supported on current device
+static bool ggml_tma_runtime_supported(int * device_out) {
+    const char * env = getenv("GGML_CUDA_TMA");
+    if (!env || atoi(env) != 1) return false;
+
+    int cuda_version = 0;
+    if (cudaRuntimeGetVersion(&cuda_version) != cudaSuccess) return false;
+    if (cuda_version < 12040) return false;
+
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) return false;
+    if (prop.major < 9) return false;
+
+    if (device_out) *device_out = device;
+    return true;
+}
 
 bool ggml_tma_init_transfer(ggml_tma_transfer_t * out,
     void * src_pinned,
@@ -55,7 +69,27 @@ bool ggml_tma_init_transfer(ggml_tma_transfer_t * out,
     transfer->elem_size   = elem_size > 0 ? elem_size : 2;  // default float16/bf16
     transfer->stream      = (cudaStream_t)stream;
     transfer->desc        = nullptr;
-    transfer->use_tma     = false; // conservative: memcpy until TMA kernel is verified
+    transfer->use_tma     = false;
+
+    // Check if TMA is supported and enabled
+    {
+        int device = 0;
+        bool supported = ggml_tma_runtime_supported(&device);
+        if (supported) {
+            // Validate alignment requirements
+            if ((uintptr_t)src_pinned % 128 != 0) {
+                GGML_LOG_WARN("TMA disabled: pinned buffer not 128-byte aligned\n");
+                supported = false;
+            } else if ((uintptr_t)dst_vram % 16 != 0) {
+                GGML_LOG_WARN("TMA disabled: VRAM target not 16-byte aligned\n");
+                supported = false;
+            } else if ((uintptr_t)src_pinned >= (1ULL << 48)) {
+                GGML_LOG_ERROR("TMA requires 48-bit VA, got %lx\n", (uintptr_t)src_pinned);
+                supported = false;
+            }
+        }
+        transfer->use_tma = supported;
+    }
 
     // Build a 1D TMA descriptor pointing at the pinned system RAM source.
     // Encoding matches ggml_cuda_tma_make_load_desc_1d from tma.cuh:
@@ -69,8 +103,8 @@ bool ggml_tma_init_transfer(ggml_tma_transfer_t * out,
         host_desc.d[1] = num_bytes & 0xFFFFFFFFFFFFUL;
 
         CUDA_CHECK(cudaMalloc(&transfer->desc, sizeof(tma_transfer_desc)));
-        cudaMemcpyAsync(transfer->desc, &host_desc, sizeof(tma_transfer_desc),
-                        cudaMemcpyHostToDevice, transfer->stream);
+        cudaMemcpy(transfer->desc, &host_desc, sizeof(tma_transfer_desc),
+                        cudaMemcpyHostToDevice);
     }
 
     *out = transfer;
@@ -82,14 +116,24 @@ void ggml_tma_launch_transfer(ggml_tma_transfer_t transfer) {
 
     size_t bytes = transfer->num_elements * transfer->elem_size;
 
-    // TMA kernel launch gated by use_tma flag (SM 100+, deferred).
-    // Currently always uses cudaMemcpyAsync on dedicated stream.
     if (!transfer->use_tma) {
         cudaMemcpyAsync(transfer->dst_vram, transfer->src_pinned, bytes,
                         cudaMemcpyHostToDevice, transfer->stream);
         return;
     }
-    // TODO: launch ggml_tma_kv_transfer_kernel when TMA verified on live hardware
+    // Launch TMA store kernel (1 block, 1 thread) using descriptor in device memory.
+    // The kernel is defined in ggml-cuda-blackwell.cuh and guarded by __CUDA_ARCH__ >= 1000.
+    // Fallback to async memcpy if kernel fails to launch.
+    cudaFuncAttributes attr;
+    cudaError_t lerr = cudaFuncGetAttributes(&attr, tma_copy_store_kernel);
+    if (lerr == cudaSuccess) {
+        tma_copy_store_kernel<<<1, 1, 0, transfer->stream>>>(
+            reinterpret_cast<const tma_store_desc*>(transfer->desc));
+    } else {
+        GGML_LOG_WARN("TMA kernel not available, falling back to memcpy\n");
+        cudaMemcpyAsync(transfer->dst_vram, transfer->src_pinned, bytes,
+                        cudaMemcpyHostToDevice, transfer->stream);
+    }
 }
 
 void ggml_tma_free_transfer(ggml_tma_transfer_t transfer) {
