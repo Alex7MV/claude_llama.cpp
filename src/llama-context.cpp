@@ -2283,11 +2283,34 @@ ggml_status llama_context::graph_compute(
         }
 
         if (sched_pipeline) {
-            auto status = ggml_backend_sched_pipelined_compute(sched_pipeline.get(), gf);
-            if (status != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: pipelined compute failed with error %d\n", __func__, status);
+            int n_layers = (int)model.hparams.n_layer;
+            int split_size = cparams.pipeline_split_size;
+            int num_splits = (n_layers + split_size - 1) / split_size;
+
+            for (int s = 0; s < num_splits; s++) {
+                int layer_start = s * split_size;
+                int layer_end = std::min(layer_start + split_size, n_layers);
+                int layer_count = layer_end - layer_start;
+
+                ggml_context * split_ctx = nullptr;
+                ggml_cgraph * split_graph = llama_graph_extract_split(
+                    gf, layer_start, layer_count, model, &split_ctx);
+                if (!split_graph) continue;
+
+                auto status = ggml_backend_sched_pipelined_compute_split(
+                    sched_pipeline.get(), split_graph, s);
+
+                ggml_free(split_ctx);
+
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: pipeline split %d failed: %s\n",
+                        __func__, s, ggml_status_to_string(status));
+                    return status;
+                }
             }
-            return status;
+
+            ggml_backend_sched_pipelined_synchronize(sched_pipeline.get());
+            return GGML_STATUS_SUCCESS;
         }
     }
 
