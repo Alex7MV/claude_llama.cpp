@@ -3003,8 +3003,12 @@ ggml_cgraph * llama_graph_extract_split(
 
     if (node_count == 0) return nullptr;
 
-    // Allocate context for split graph
-    size_t ctx_size = ggml_tensor_overhead() * node_count + ggml_graph_overhead_custom(node_count, false);
+    // Allocate context for split graph. Use full_graph size for the node capacity
+    // because ggml_build_forward_expand adds all parent nodes recursively, not
+    // just the filtered nodes. The split graph can never exceed the original's size.
+    const size_t graph_size = (size_t)ggml_graph_size(full_graph);
+    size_t ctx_size = ggml_tensor_overhead() * graph_size +
+                      ggml_graph_overhead_custom(graph_size, false);
     ctx_size = std::max(ctx_size, (size_t)1024 * 1024); // at least 1MB
 
     ggml_init_params params = {
@@ -3016,7 +3020,7 @@ ggml_cgraph * llama_graph_extract_split(
     ggml_context * split_ctx = ggml_init(params);
     if (!split_ctx) return nullptr;
 
-    ggml_cgraph * split = ggml_new_graph_custom(split_ctx, node_count, false);
+    ggml_cgraph * split = ggml_new_graph_custom(split_ctx, graph_size, false);
     if (!split) { ggml_free(split_ctx); return nullptr; }
 
     // Second pass: add matching nodes to the split graph
