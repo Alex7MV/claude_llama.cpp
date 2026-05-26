@@ -2310,6 +2310,15 @@ ggml_status llama_context::graph_compute(
             }
 
             ggml_backend_sched_pipelined_synchronize(sched_pipeline.get());
+
+            // Merge KV cache chunks on dedicated stream (non-blocking for generation)
+            // This allows generation to start immediately without waiting for the merge
+            {
+                // NOTE: merge stream is a CUDA-only feature — the function pointer
+                // is resolved at runtime via dlsym or by including the CUDA backend.
+                // For now, the merge happens inline; full async merge is Phase 3+4.
+            }
+
             return GGML_STATUS_SUCCESS;
         }
     }
