@@ -2307,17 +2307,19 @@ ggml_status llama_context::graph_compute(
                         __func__, s, ggml_status_to_string(status));
                     return status;
                 }
+
+                // TODO (TMA): After each split's CPU compute, dispatch TMA transfer
+                // for this split's KV cache data from pinned RAM to GPU VRAM.
+                // The transfer runs asynchronously on the GPU backend's stream,
+                // overlapping with the next split's CPU compute.
+                // Wire ggml_tma_launch_transfer() here once descriptors are populated.
             }
 
             ggml_backend_sched_pipelined_synchronize(sched_pipeline.get());
 
-            // Merge KV cache chunks on dedicated stream (non-blocking for generation)
-            // This allows generation to start immediately without waiting for the merge
-            {
-                // NOTE: merge stream is a CUDA-only feature — the function pointer
-                // is resolved at runtime via dlsym or by including the CUDA backend.
-                // For now, the merge happens inline; full async merge is Phase 3+4.
-            }
+            // TODO (KV merge): Dispatch async linear-to-ring KV merge on dedicated
+            // merge stream via ggml_epyc_pipeline_get_merge_stream().
+            // Generation can start immediately without waiting for the merge.
 
             return GGML_STATUS_SUCCESS;
         }
