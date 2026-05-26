@@ -16,7 +16,9 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 // dedup helpers
 
@@ -2946,4 +2948,85 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+ggml_cgraph * llama_graph_extract_split(
+        struct ggml_cgraph * full_graph,
+        int first_layer,
+        int layer_count,
+        const llama_model & model,
+        ggml_context ** split_ctx_out) {
+    if (!full_graph || first_layer < 0 || layer_count <= 0) return nullptr;
+    if (first_layer + layer_count > (int)model.hparams.n_layer) return nullptr;
+
+    if (split_ctx_out) *split_ctx_out = nullptr;
+
+    // Build the set of name prefixes for the target layer range.
+    // Layer tensors are named "blk.<layer>.<name>" in the GGUF format,
+    // and graph nodes that reference these tensors will have src pointers
+    // to tensors with these names.
+    std::vector<std::string> layer_prefixes;
+    layer_prefixes.reserve(layer_count);
+    for (int l = first_layer; l < first_layer + layer_count; l++) {
+        layer_prefixes.push_back("blk." + std::to_string(l) + ".");
+    }
+
+    // Helper: check if a tensor name belongs to our layer range
+    auto tensor_in_range = [&layer_prefixes](const char * name) -> bool {
+        if (!name) return false;
+        for (const auto & prefix : layer_prefixes) {
+            if (strncmp(name, prefix.c_str(), prefix.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Helper: check if a graph node references any tensor in our layer range
+    auto node_in_range = [&tensor_in_range](ggml_tensor * n) -> bool {
+        if (!n) return false;
+        // Check if the node itself is a layer weight tensor
+        if (tensor_in_range(n->name)) return true;
+        // Check if any input belongs to our layer range
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (n->src[s] && tensor_in_range(n->src[s]->name)) return true;
+        }
+        return false;
+    };
+
+    // First pass: count matching nodes to size the new context appropriately
+    int node_count = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(full_graph); i++) {
+        ggml_tensor * n = ggml_graph_node(full_graph, i);
+        if (node_in_range(n)) node_count++;
+    }
+
+    if (node_count == 0) return nullptr;
+
+    // Allocate context for split graph
+    size_t ctx_size = ggml_tensor_overhead() * node_count + ggml_graph_overhead_custom(node_count, false);
+    ctx_size = std::max(ctx_size, (size_t)1024 * 1024); // at least 1MB
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * split_ctx = ggml_init(params);
+    if (!split_ctx) return nullptr;
+
+    ggml_cgraph * split = ggml_new_graph_custom(split_ctx, node_count, false);
+    if (!split) { ggml_free(split_ctx); return nullptr; }
+
+    // Second pass: add matching nodes to the split graph
+    for (int i = 0; i < ggml_graph_n_nodes(full_graph); i++) {
+        ggml_tensor * n = ggml_graph_node(full_graph, i);
+        if (node_in_range(n)) {
+            ggml_build_forward_expand(split, n);
+        }
+    }
+
+    if (split_ctx_out) *split_ctx_out = split_ctx;
+    return split;
 }

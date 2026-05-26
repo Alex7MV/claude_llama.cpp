@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -1066,3 +1067,16 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+/**
+ * Extract a subgraph containing only the ops for layers [first_layer, first_layer + layer_count).
+ * Returns a new ggml_cgraph. The caller passes split_ctx_out which is set to the new ggml_context
+ * that owns the split graph's memory. Call ggml_free(*split_ctx_out) to release.
+ * Returns nullptr if the layer range is invalid.
+ */
+ggml_cgraph * llama_graph_extract_split(
+    struct ggml_cgraph * full_graph,
+    int first_layer,
+    int layer_count,
+    const llama_model & model,
+    ggml_context ** split_ctx_out);
