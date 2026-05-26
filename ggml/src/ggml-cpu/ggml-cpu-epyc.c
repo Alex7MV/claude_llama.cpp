@@ -30,8 +30,27 @@ static void ggml_epyc_probe_topology(void) {
     char buf[512];
     int cpu = 0;
 
+    // Determine CCD file: Linux >= 6.5 uses "die_id", older kernels use "core_defaults".
+    // Probe cpu0 first to pick the correct file name.
+    const char *ccd_file = NULL;
+    snprintf(path, sizeof(path), "%s/cpu0/topology/die_id", GGML_EPYC_SYSFS_PATH);
+    if (ggml_epyc_read_sysfs(path, buf, sizeof(buf)) == 0) {
+        ccd_file = "die_id";
+    } else {
+        snprintf(path, sizeof(path), "%s/cpu0/topology/core_defaults", GGML_EPYC_SYSFS_PATH);
+        if (ggml_epyc_read_sysfs(path, buf, sizeof(buf)) == 0) {
+            ccd_file = "core_defaults";
+        }
+    }
+
+    if (!ccd_file) {
+        fprintf(stderr, "WARN: CCD: core_defaults not available, CCD affinity disabled\n");
+        g_epyc_probed = true;
+        return;
+    }
+
     while (1) {
-        int n = snprintf(path, sizeof(path), "%s/cpu%u/topology/core_defaults", GGML_EPYC_SYSFS_PATH, cpu);
+        int n = snprintf(path, sizeof(path), "%s/cpu%u/topology/%s", GGML_EPYC_SYSFS_PATH, cpu, ccd_file);
         if (n < 0 || (size_t)n >= sizeof(path)) break;
         if (ggml_epyc_read_sysfs(path, buf, sizeof(buf)) != 0) break;
         uint32_t ccd_id = 0;
