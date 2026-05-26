@@ -3,6 +3,10 @@
 #include "tma-transfer.h"
 #include "ggml-cuda-blackwell.cuh"
 #include <stdlib.h>
+#include <cuda_runtime.h>
+
+// Forward declare EPYC pipeline accessor (defined in ggml-cuda-epyc-pipeline.cu)
+extern "C" cudaStream_t ggml_epyc_pipeline_get_compute_stream(void);
 
 // TMA-based transfer layer for moving KV cache data between pinned
 // system RAM and GPU VRAM.  On SM 100+ the kernel can use the TMA
@@ -49,6 +53,10 @@ static bool ggml_tma_runtime_supported(int * device_out) {
     return true;
 }
 
+int ggml_tma_supported(void) {
+    return ggml_tma_runtime_supported(nullptr) ? 1 : 0;
+}
+
 bool ggml_tma_init_transfer(ggml_tma_transfer_t * out,
     void * src_pinned,
     void * dst_vram,
@@ -60,6 +68,14 @@ bool ggml_tma_init_transfer(ggml_tma_transfer_t * out,
     if (!src_pinned || !dst_vram || num_elements == 0) {
         *out = nullptr;
         return false;
+    }
+
+    // Auto-resolve stream: use EPYC pipeline compute stream if available
+    if (!stream) {
+        cudaStream_t ps = ggml_epyc_pipeline_get_compute_stream();
+        if (ps) {
+            stream = (void*)ps;
+        }
     }
 
     ggml_tma_transfer * transfer = new ggml_tma_transfer();

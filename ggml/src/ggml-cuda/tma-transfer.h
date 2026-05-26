@@ -9,6 +9,10 @@ extern "C" {
 
 typedef struct ggml_tma_transfer * ggml_tma_transfer_t;
 
+// Check if TMA engine is available on the current device.
+// Requires GGML_CUDA_TMA=1 env var, CUDA >= 12.4, SM >= 90.
+int ggml_tma_supported(void);
+
 // Initialize a TMA transfer descriptor.
 // src_pinned: pinned RAM address (from ggml_backend_cpu_pinned_buffer_type)
 // dst_vram:   GPU VRAM address (from cudaMalloc)

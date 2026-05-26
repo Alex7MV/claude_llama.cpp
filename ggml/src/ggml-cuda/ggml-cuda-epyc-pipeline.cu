@@ -102,6 +102,10 @@ void ggml_epyc_pipeline_gpu_free(ggml_epyc_pipeline_gpu * pipe) {
     if (g_epyc_pipeline == pipe) g_epyc_pipeline = nullptr;
 }
 
+cudaStream_t ggml_epyc_pipeline_get_compute_stream() {
+    return g_epyc_pipeline ? g_epyc_pipeline->compute_stream : nullptr;
+}
+
 cudaStream_t ggml_epyc_pipeline_get_merge_stream() {
     return g_epyc_pipeline ? g_epyc_pipeline->merge_stream : nullptr;
 }
@@ -114,6 +118,37 @@ void ggml_epyc_pipeline_record_stage(int stage, cudaStream_t stream) {
 void ggml_epyc_pipeline_wait_stage(cudaStream_t stream, int stage) {
     if (!g_epyc_pipeline || stage < 0 || stage >= g_epyc_pipeline->depth) return;
     CUDA_CHECK(cudaStreamWaitEvent(stream, g_epyc_pipeline->stage_events[stage]));
+}
+
+// Dispatch async linear-to-ring KV cache merge on the merge stream.
+// Copies n_rows from a linear buffer into the ring buffer with dst_stride.
+// The merge stream implicitly waits on the compute stream's last event.
+void ggml_epyc_pipeline_dispatch_kv_merge(
+    void * src,
+    void * dst,
+    size_t row_size,
+    int32_t n_rows,
+    size_t dst_stride) {
+    if (!g_epyc_pipeline || !src || !dst || n_rows <= 0 || row_size == 0) return;
+    if (!dst_stride) dst_stride = row_size;  // contiguous fallback
+
+    // Make merge stream wait on compute stream to ensure data is ready
+    CUDA_CHECK(cudaStreamWaitEvent(g_epyc_pipeline->merge_stream,
+        g_epyc_pipeline->stage_events[g_epyc_pipeline->depth - 1], 0));
+
+    // Dispatch row-by-row async copies (each row is one KV cell)
+    for (int32_t i = 0; i < n_rows; i++) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            (char*)dst + i * (ssize_t)dst_stride,
+            (char*)src + i * (ssize_t)row_size,
+            row_size,
+            cudaMemcpyDeviceToDevice,
+            g_epyc_pipeline->merge_stream));
+    }
+
+    // Record merge completion event for generation to wait on if needed
+    CUDA_CHECK(cudaEventRecord(g_epyc_pipeline->stage_events[0],
+        g_epyc_pipeline->merge_stream));
 }
 
 } // extern "C"
