@@ -2360,6 +2360,12 @@ int llama_bench(int argc, char ** argv) {
             }
         }
 
+        // Pipeline timing accumulators (scoped outside reps loop for output)
+        int64_t t_pipeline_cpu = 0;
+        int64_t t_pipeline_transfer = 0;
+        int64_t t_pipeline_gpu = 0;
+        int     n_pipeline_splits = 0;
+
         for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2400,7 +2406,7 @@ int llama_bench(int argc, char ** argv) {
                 }
             }
 
-            uint64_t t_start = get_time_ns();
+           uint64_t t_start = get_time_ns();
 
             if (t.n_prompt > 0) {
                 if (params.progress) {
@@ -2444,6 +2450,16 @@ int llama_bench(int argc, char ** argv) {
         }
 
         llama_perf_context_print(ctx);
+
+        if (params.pipeline_depth > 0 && n_pipeline_splits > 0) {
+            fprintf(stderr, "  pipeline_splits: %d\n", n_pipeline_splits);
+            fprintf(stderr, "  pipeline_cpu_ms: %.1f\n", (double)t_pipeline_cpu / 1e6 / n_pipeline_splits);
+            fprintf(stderr, "  pipeline_gpu_ms: %.1f\n", (double)t_pipeline_gpu / 1e6 / n_pipeline_splits);
+            if (t_pipeline_cpu + t_pipeline_gpu > 0) {
+                fprintf(stderr, "  pipeline_overlap_pct: %.1f\n",
+                    100.0 * (1.0 - (double)t_pipeline_gpu / (t_pipeline_cpu + t_pipeline_gpu)));
+            }
+        }
 
         llama_free(ctx);
 
