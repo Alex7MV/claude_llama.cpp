@@ -1,11 +1,9 @@
 #pragma once
-#if __CUDA_ARCH__ >= 1000 || !defined(__CUDA_ARCH__)
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-// TMA store descriptor (128 bytes, packed)
-// Matches hwTmaStoreDesc format from PTX ISA
+// TMA descriptors (128 bytes, packed) — available in host and device code
 #pragma pack(push, 1)
 struct tma_store_desc {
     uint64_t d[16];
@@ -20,41 +18,25 @@ struct tma_load_desc {
 #pragma pack(pop)
 static_assert(sizeof(tma_load_desc) == 128, "TMA load desc must be 128 bytes");
 
-/**
- * TMA copy kernel for store operations.
- * Launch with 1 block, 1 thread. Uses cp.async.bulk intrinsic.
- * The descriptor must be in device memory and 128-byte aligned.
- */
+#ifndef __CUDA_ARCH__
+// Host-side declarations so kernels are visible for launching
+__global__ void tma_copy_store_kernel(const tma_store_desc *);
+__global__ void tma_copy_load_kernel(const tma_load_desc *);
+#endif
+
+// Device code only — stub implementations; the actual cp.async.bulk PTX
+// requires the correct compiler intrinsic for the target CUDA toolkit.
+// The runtime probe (ggml_tma_runtime_supported) guards actual TMA usage.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
 __global__ void tma_copy_store_kernel(const tma_store_desc * desc) {
-#if __CUDA_ARCH__ >= 1000
-    __cp_async_bulk_uniform_raw_tma_crypto_zero_copy_mem_first_pass(
-        *(const unsigned long long*)desc, 0);
+    (void)desc;
+    // TODO: insert cp.async.bulk PTX intrinsic once toolkit support is verified
     __threadfence_system();
-#endif
 }
 
-/**
- * TMA load kernel for prefetch operations.
- */
 __global__ void tma_copy_load_kernel(const tma_load_desc * desc) {
-#if __CUDA_ARCH__ >= 1000
-    __cp_async_bulk_uniform_raw_tma_crypto_zero_copy_mem_first_pass(
-        *(const unsigned long long*)desc, 0);
+    (void)desc;
+    // TODO: insert cp.async.bulk PTX intrinsic once toolkit support is verified
     __threadfence_system();
-#endif
 }
-
-// mbarrier wrappers for TMA completion sync
-__device__ inline void mbarrier_arrive_expect_tx(void * barrier, unsigned int expected_tx) {
-#if __CUDA_ARCH__ >= 900
-    __mbarrier_arrive_expect_tx(__cvta_generic_to_shared(barrier), expected_tx);
 #endif
-}
-
-__device__ inline void mbarrier_wait(void * barrier, unsigned int phase) {
-#if __CUDA_ARCH__ >= 900
-    __mbarrier_wait(__cvta_generic_to_shared(barrier), phase);
-#endif
-}
-
-#endif // __CUDA_ARCH__ >= 1000
