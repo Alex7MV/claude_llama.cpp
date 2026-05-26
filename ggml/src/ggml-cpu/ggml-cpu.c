@@ -953,6 +953,9 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     // Probe CCD topology once at startup so dual-threadpool can reuse it
     ggml_probe_ccd_topology();
+    if (numa_flag == GGML_NUMA_STRATEGY_CCD && g_state.ccd.n_ccds > 0) {
+        GGML_LOG_INFO("CCD affinity enabled (%u CCDs, %u threads)\n", g_state.ccd.n_ccds, g_state.ccd.total_threads);
+    }
 
     if (ggml_is_numa()) {
         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
@@ -2854,6 +2857,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
     cpu_set_t cpuset;
+    cpu_set_t avail;
     int err;
     uint32_t n = 0;
 
@@ -2865,6 +2869,16 @@ static bool ggml_thread_apply_affinity(const bool * mask) {
             CPU_SET(i, &cpuset);
             n++;
         }
+    }
+
+    // Intersect with process-visible CPUs to avoid EINVAL in containers/cgroups
+    CPU_ZERO(&avail);
+    pthread_getaffinity_np(pthread_self(), sizeof(avail), &avail);
+    CPU_AND(&cpuset, &cpuset, &avail);
+
+    if (!CPU_COUNT(&cpuset)) {
+        // No overlap — nothing to set
+        return true;
     }
 
 #ifdef __ANDROID__
