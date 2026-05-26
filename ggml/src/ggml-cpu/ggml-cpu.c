@@ -855,12 +855,24 @@ static void ggml_probe_ccd_topology(void) {
         GGML_LOG_INFO("  CCD %u: %u threads\n", c, g_state.ccd.ccd_thread_count[c]);
     }
 }
+
+// Forward declaration for the platform-specific affinity function (defined below)
+static bool ggml_thread_apply_affinity(const bool * mask);
+
+// Accessor for ggml-cpu-epyc.c — returns the CCD topology probed once at startup
+const struct ggml_ccd_topology * ggml_cpu_get_ccd_topology(void) {
+    return &g_state.ccd;
+}
+
+// Apply affinity to current thread using a bool mask (used by threadpool workers)
+bool ggml_cpu_thread_apply_affinity(const bool * mask) {
+    return ggml_thread_apply_affinity(mask);
+}
 #else
 static void ggml_probe_ccd_topology(void) {}
+const struct ggml_ccd_topology * ggml_cpu_get_ccd_topology(void) { return NULL; }
+bool ggml_cpu_thread_apply_affinity(const bool * mask) { (void)mask; return true; }
 #endif
-
-// CCD probing and dual threadpool moved to ggml-cpu-epyc.c (Task 3)
-// Placeholder disabled to avoid duplicate symbol with ggml-cpu-epyc.c
 
 void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     if (g_state.numa.n_nodes > 0) {
@@ -939,10 +951,8 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ggml_cpu_set_numa_interleave(g_state.numa.n_nodes);
     }
 
-    // Probe CCD topology if CCD strategy is requested
-    if (numa_flag == GGML_NUMA_STRATEGY_CCD) {
-        ggml_probe_ccd_topology();
-    }
+    // Probe CCD topology once at startup so dual-threadpool can reuse it
+    ggml_probe_ccd_topology();
 
     if (ggml_is_numa()) {
         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
@@ -2845,13 +2855,15 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 static bool ggml_thread_apply_affinity(const bool * mask) {
     cpu_set_t cpuset;
     int err;
+    uint32_t n = 0;
 
     CPU_ZERO(&cpuset);
 
-    for (uint32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
+    for (uint32_t i = 0; i < GGML_MAX_N_THREADS && i < CPU_SETSIZE; i++) {
         if (mask[i]) {
             GGML_PRINT_DEBUG("Thread %lx: adding %d to cpuset\n", pthread_self(), i);
             CPU_SET(i, &cpuset);
+            n++;
         }
     }
 
@@ -2864,7 +2876,7 @@ static bool ggml_thread_apply_affinity(const bool * mask) {
     err = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #endif
     if (err != 0) {
-        fprintf(stderr, "warn: failed to set affinity mask 0x%llx : %s (%d)\n", (unsigned long long)mask, strerror(err), err);
+        fprintf(stderr, "warn: failed to set affinity mask (cpus=%u): %s (%d)\n", n, strerror(err), err);
         return false;
     }
 

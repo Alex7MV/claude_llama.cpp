@@ -93,8 +93,13 @@ ggml/          Tensor operations library (ggml v0.12.0)
   ggml.h       Core tensor math (types, ops, graphs)
   ggml-alloc.h Memory allocators (arena, linear, graph)
   ggml-backend.h  Backend abstraction (buffer, device, scheduler)
+  ggml-backend-pipeline.cpp  Pipelined scheduler (CPU-TMA-GPU overlap)
   ggml/src/ggml-cpu/   CPU backend (AVX, AVX2, AVX512 variants)
+    ggml-cpu-epyc.c     EPYC CCD pairs probe + dual threadpool params
+    ggml-cpu-pinned-alloc.c  Sliding window pinned allocator (MAP_LOCKED)
   ggml/src/ggml-cuda/  CUDA backend
+    ggml-cuda-epyc-pipeline.cu  GPU-side pipeline, TMA handoff, KV merge
+    tma-transfer.cu    TMA transfer between pinned RAM and GPU VRAM
   ggml/src/ggml-metal/ Metal backend
   ggml/src/ggml-vulkan/ Vulkan backend
   ... (HIP, SYCL, OpenCL, OpenVINO, RPC, WebGPU, CANN, ZenDNN)
@@ -135,6 +140,8 @@ tools/         End-user binaries
 
 **Compute Graph**: `llama_graph.cpp` builds a `ggml_cgraph` representing the full forward pass. Each layer's tensors (norm, QKV projection, RoPE, attention, FFN, residual) are added as ggml operations. The graph is then allocated and evaluated by the ggml backend scheduler.
 
+**Graph Splitting for Pipelining**: `llama_graph_extract_split()` in `llama-graph.cpp` extracts a subgraph for a range of layers (`blk.<layer>.` prefix matching). Split graphs use `ggml_graph_size(full_graph)` for capacity (not `node_count`), because `ggml_build_forward_expand` adds parent nodes recursively.
+
 **KV Cache**: Managed by `llama_kv_cache` (or hybrid/recurrent variants). The cache is a ring buffer of cells, each holding K/V embeddings for a token position. Cells can belong to multiple sequences. SWA (Sliding Window Attention) is supported. State save/restore writes cells as ranges (not full buffers).
 
 **Memory Strategies**:
@@ -146,12 +153,29 @@ tools/         End-user binaries
 
 **Model Loading**: GGUF format, parsed by `llama_model_loader`. Architecture-specific init via `llama_arch` dispatch table. Supports quantization types Q2_K through Q8_0, plus IQ series.
 
+### EPYC/Blackwell Direct Path (Pipeline Prefill)
+
+**3-Stage Pipeline**: Depth-3 overlap pipeline for prefill on EPYC 9V74 + RTX 5090. CPU compute -> TMA transfer -> GPU compute. Stages overlap via `cudaStreamWaitEvent` and `mbarrier`. Controlled by `cparams.pipeline_depth` and `cparams.pipeline_split_size` (groups of N layers per split). The pipeline is skipped during warmup.
+
+**CCD Topology** (single probe): `ggml_numa_init()` in `ggml-cpu.c` probes CCD topology **once** at startup via `ggml_probe_ccd_topology()`. Reads `die_id` sysfs (Linux >= 6.5) or `core_defaults` (older). Results cached in `g_state.ccd`. Accessible via `ggml_cpu_get_ccd_topology()` from `ggml-cpu-epyc.c`. SMT siblings ordered after primaries.
+
+**Dual CCD Threadpools**: `ggml_cpu_init_dual_threadpool()` in `ggml-cpu-epyc.c` creates two threadpools pinned to CCD pairs from opposite NUMA nodes (CCD0+last vs CCD1+second-to-last). Used by `ggml_backend_sched_pipelined` for ping-pong CPU compute.
+
+**Pinned Allocator**: `ggml-cpu-pinned-alloc.c` provides a sliding window pinned memory region via `mmap(MAP_LOCKED)`. First-fit + bump allocation, 128-byte alignment (TMA requirement). Supports `compact()` to defragment. Header: `ggml-cpu-pinned-alloc.h`.
+
+**TMA Transfers**: `tma-transfer.cu` uses Blackwell `cp.async.bulk` PTX for pinned-RAM-to-VRAM transfers. Guarded by `GGML_CUDA_TMA=1` env var, CUDA >= 12.4, SM >= 90. Falls back to `cudaMemcpyAsync` when unavailable. Auto-resolves stream from pipeline compute stream if NULL.
+
+**Pipeline Scheduler**: `ggml-backend-pipeline.cpp` (C++ only, zero CUDA deps). Wraps a base `ggml_backend_sched` and orchestrates split-graph execution across dual CPU threadpools + GPU backend via shared events. TMA handoff and KV merge dispatch wired at the `llama-context.cpp` level where both backends are linked.
+
 ### Important Design Patterns
 
 - Tensors are row-major: dimension 0 = columns, 1 = rows, 2 = matrices
 - `ggml_mul_mat(A, B)` computes `C = B @ A` (transposed convention)
 - Quantized types use chunked storage with shared quantization parameters
 - Model layer offload is per-layer, not per-tensor (a layer's all weights go to same device)
+- CCD topology is probed **once** in `ggml_numa_init()` — never re-probe, always use `ggml_cpu_get_ccd_topology()`
+- Thread affinity via `ggml_cpu_thread_apply_affinity()` — clamped to `CPU_SETSIZE`, never iterate to `GGML_MAX_N_THREADS` blindly
+- `ggml-backend-pipeline.cpp` must NOT depend on CUDA — all TMA/GPU handoffs happen at the `llama-context.cpp` level
 
 ## Useful Resources (load as needed)
 
