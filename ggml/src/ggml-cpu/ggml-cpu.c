@@ -737,12 +737,32 @@ static void ggml_probe_ccd_topology(void) {
     g_state.ccd.n_ccds = 0;
     g_state.ccd.total_threads = 0;
 
-    // Phase 1: read core_defaults for each CPU (L3 cache domain = CCD ID)
-    for (c = 0; c < g_state.numa.total_cpus; c++) {
-        rv = snprintf(path, sizeof(path),
-            "/sys/devices/system/cpu/cpu%u/topology/core_defaults", c);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+    // Detect sysfs file: Linux >= 6.5 uses "die_id", older kernels use "core_defaults"
+    {
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/topology/die_id");
         FILE *f = fopen(path, "r");
+        if (f) {
+            fclose(f);
+        } else {
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/topology/core_defaults");
+            f = fopen(path, "r");
+            if (f) {
+                fclose(f);
+            }
+        }
+    }
+    // Reuse the path buffer; just overwrite with per-CPU loop below.
+
+    // Phase 1: read CCD ID for each CPU (L3 cache domain = CCD ID)
+    for (c = 0; c < g_state.numa.total_cpus; c++) {
+        snprintf(path, sizeof(path),
+            "/sys/devices/system/cpu/cpu%u/topology/die_id", c);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            snprintf(path, sizeof(path),
+                "/sys/devices/system/cpu/cpu%u/topology/core_defaults", c);
+            f = fopen(path, "r");
+        }
         if (!f) continue;
         if (fgets(buf, sizeof(buf), f)) {
             int ccd_id = atoi(buf);
@@ -755,7 +775,7 @@ static void ggml_probe_ccd_topology(void) {
     }
 
     if (n_ccds == 0) {
-        GGML_LOG_WARN("CCD: core_defaults not available, CCD affinity disabled\n");
+        GGML_LOG_WARN("CCD: die_id/core_defaults not available, CCD affinity disabled\n");
         return;
     }
     g_state.ccd.n_ccds = n_ccds;

@@ -2247,7 +2247,9 @@ ggml_status llama_context::graph_compute(
     // Pipeline path for large batch prefill
     // Skip for MTP contexts — small speculative batches don't benefit from pipelining,
     // and the MTP graph shape can exceed the scheduler's hash_set capacity.
-    if (batched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+    // Skip during warmup — the tiny warmup graph doesn't benefit from pipelining
+    // and can trigger graph size edge cases in extract_split.
+    if (!cparams.warmup && batched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
             cparams.pipeline_depth > 0 && cparams.pipeline_split_size > 0) {
         // Lazy init of pipeline scheduler on first batched prefill (thread-safe via std::call_once)
         if (!sched_pipeline) {
