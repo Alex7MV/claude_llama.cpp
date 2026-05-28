@@ -1,5 +1,6 @@
 #include "ggml-pinned-buffer.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
