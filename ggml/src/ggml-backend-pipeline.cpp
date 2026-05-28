@@ -24,7 +24,8 @@ struct ggml_backend_sched_pipelined {
     ggml_threadpool_t cpu_tp[2];
     int num_tp;
     int active_pool;
-    ggml_backend_t cpu_backend;
+    std::atomic<ggml_backend_t> cpu_backend{nullptr};
+    std::once_flag cpu_backend_init_flag;
 
     // GPU
     ggml_backend_t gpu_backend;
@@ -160,15 +161,17 @@ void ggml_backend_sched_pipelined_set_gpu_dispatch(
 // ---------------------------------------------------------------------------
 
 static void ggml_pipeline_ensure_cpu_backend(ggml_backend_sched_pipelined_t sched) {
-    if (sched->cpu_backend) return;
-    int n_be = ggml_backend_sched_get_n_backends(sched->base);
-    for (int i = 0; i < n_be; i++) {
-        ggml_backend_t be = ggml_backend_sched_get_backend(sched->base, i);
-        if (ggml_backend_is_cpu(be)) {
-            sched->cpu_backend = be;
-            break;
+    if (sched->cpu_backend.load(std::memory_order_acquire)) return;
+    std::call_once(sched->cpu_backend_init_flag, [sched]() {
+        int n_be = ggml_backend_sched_get_n_backends(sched->base);
+        for (int i = 0; i < n_be; i++) {
+            ggml_backend_t be = ggml_backend_sched_get_backend(sched->base, i);
+            if (ggml_backend_is_cpu(be)) {
+                sched->cpu_backend.store(be, std::memory_order_release);
+                break;
+            }
         }
-    }
+    });
 }
 
 // Drain exactly one GPU-done slot (called when queue is full or at final drain).
@@ -225,10 +228,11 @@ enum ggml_status ggml_backend_sched_pipelined_compute(
 
     ggml_pipeline_ensure_cpu_backend(sched);
 
-    if (sched->cpu_backend) {
+    ggml_backend_t cpu_be = sched->cpu_backend.load(std::memory_order_acquire);
+    if (cpu_be) {
         ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
+        ggml_backend_cpu_set_threadpool(cpu_be, tp);
         ggml_threadpool_resume(tp);
-        ggml_backend_cpu_set_threadpool(sched->cpu_backend, tp);
     }
 
     enum ggml_status status = ggml_backend_sched_graph_compute_async(sched->base, gf);
@@ -275,15 +279,17 @@ enum ggml_status ggml_backend_sched_pipelined_compute_split(
 
     int split_idx = sched->next_split_idx++;
     int event_idx = split_idx % GGML_PIPELINE_MAX_EVENTS;
+    ggml_backend_t cpu_be = nullptr;
 
     if (is_cpu) {
         // ---- Stage 1: CPU Compute ----
         ggml_pipeline_ensure_cpu_backend(sched);
 
-        if (sched->cpu_backend) {
+        cpu_be = sched->cpu_backend.load(std::memory_order_acquire);
+        if (cpu_be) {
             ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
+            ggml_backend_cpu_set_threadpool(cpu_be, tp);
             ggml_threadpool_resume(tp);
-            ggml_backend_cpu_set_threadpool(sched->cpu_backend, tp);
         }
 
         // Compute this CPU split
@@ -324,8 +330,8 @@ enum ggml_status ggml_backend_sched_pipelined_compute_split(
         }
 
         // Record event so GPU stage can wait on this CPU split
-        if (sched->stage_events[event_idx]) {
-            ggml_backend_event_record(sched->stage_events[event_idx], sched->cpu_backend);
+        if (sched->stage_events[event_idx] && cpu_be) {
+            ggml_backend_event_record(sched->stage_events[event_idx], cpu_be);
         }
 
     } else {
