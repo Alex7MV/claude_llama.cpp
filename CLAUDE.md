@@ -153,6 +153,12 @@ tools/         End-user binaries
 - Quantized types use chunked storage with shared quantization parameters
 - Model layer offload is per-layer, not per-tensor (a layer's all weights go to same device)
 
+## MCP & Tooling
+The following MCP servers are configured for this project to handle low-level GPU/CPU optimizations:
+- **GPU Specialist (`@mcp/cuda-nextgen-tools`)**: Provides deep analysis for CUDA 13.2 and Blackwell (sm_100) architecture. Path: `/usr/local/cuda-13.2`.
+- **Context7 (`@context7/mcp-server`)**: Used to fetch the latest documentation for AOCC 5.2.0, Zen 5 optimizations, and real-time updates from the llama.cpp upstream.
+- **C++ Core Semantics**: Integrated with AOCC's clangd for AST-level code navigation.
+
 ## Useful Resources (load as needed)
 
 - [CONTRIBUTING.md](CONTRIBUTING.md) — coding guidelines, PR process, AI policy

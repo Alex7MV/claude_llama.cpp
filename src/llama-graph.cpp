@@ -3125,3 +3125,27 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
 
     return relative_bucket;
 }
+
+// ---------------------------------------------------------------------------
+// Graph splitting for pipelined prefill
+// ---------------------------------------------------------------------------
+// TODO: full implementation requires scanning node names for layer boundaries
+// and creating proper subgraph views. For now, returns nullptr to force
+// fallback to the legacy compute path.
+// ---------------------------------------------------------------------------
+
+ggml_cgraph * llama_graph_extract_split(
+    ggml_cgraph * full_graph,
+    int first_layer,
+    int layer_count,
+    int n_layers_total) {
+
+    (void) full_graph;
+    (void) first_layer;
+    (void) layer_count;
+    (void) n_layers_total;
+
+    // Graph extraction not yet implemented. The caller should fall back to
+    // ggml_backend_sched_pipelined_compute (legacy path).
+    return nullptr;
+}
