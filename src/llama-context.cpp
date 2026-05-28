@@ -2255,8 +2255,8 @@ ggml_status llama_context::graph_compute(
     if (batched && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
             cparams.pipeline_depth > 0 && cparams.pipeline_split_size > 0) {
         // Lazy init of pipeline scheduler on first batched prefill
-        if (!sched_pipeline && !sched_pipeline_init_attempted) {
-            sched_pipeline_init_attempted = true;
+        bool expected = false;
+        if (!sched_pipeline && sched_pipeline_init_attempted.compare_exchange_strong(expected, true)) {
             ggml_backend_t gpu_be = nullptr;
             int n_be = ggml_backend_sched_get_n_backends(sched.get());
             for (int i = 0; i < n_be; i++) {
