@@ -287,7 +287,8 @@ enum ggml_status ggml_backend_sched_pipelined_compute_split(
 
         cpu_be = sched->cpu_backend.load(std::memory_order_acquire);
         if (cpu_be) {
-            ggml_threadpool_t tp = sched->cpu_tp[sched->active_pool];
+            int pool_idx = (sched->num_tp > 0) ? (split_idx % sched->num_tp) : 0;
+            ggml_threadpool_t tp = sched->cpu_tp[pool_idx];
             ggml_backend_cpu_set_threadpool(cpu_be, tp);
             ggml_threadpool_resume(tp);
         }
@@ -296,11 +297,6 @@ enum ggml_status ggml_backend_sched_pipelined_compute_split(
         enum ggml_status status = ggml_backend_sched_graph_compute_async(sched->base, gf);
         if (status != GGML_STATUS_SUCCESS) {
             return status;
-        }
-
-        // Rotate pool for next CPU split
-        if (sched->num_tp >= 2) {
-            sched->active_pool = 1 - sched->active_pool;
         }
 
         // ---- Enqueue slot for Stage 2 (TMA) / Stage 3 (GPU) ----
