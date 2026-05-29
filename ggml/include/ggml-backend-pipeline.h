@@ -42,13 +42,17 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     uint32_t poll,
     ggml_backend_t gpu_backend);
 
-// Register the GPU dispatch callback. Must be called before first
-// compute_split if GPU stages are used. The callback runs on the
-// caller's thread (the orchestrator does not spawn threads).
+// Register GPU dispatch callback and pinned buffer (set by CUDA glue).
 void ggml_backend_sched_pipelined_set_gpu_dispatch(
     ggml_backend_sched_pipelined_t sched,
     ggml_pipeline_gpu_dispatch_fn fn,
     void * user_data);
+
+// Set an opaque pinned buffer handle for slot allocations.
+// The handle is passed through to the gpu_dispatch callback as slot->cpu_buf.
+void ggml_backend_sched_pipelined_set_pinned_buf(
+    ggml_backend_sched_pipelined_t sched,
+    void * pinned_buf);
 
 // Legacy compute path: single graph, threadpool rotation only.
 // Does NOT use the 3-stage queue; kept for backward compatibility.

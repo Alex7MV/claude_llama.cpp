@@ -45,6 +45,9 @@ struct ggml_backend_sched_pipelined {
     bool graph_allocated;
     std::mutex alloc_mutex;   // protects graph allocation (call_once pattern)
 
+    // Opaque pinned buffer handle (set by CUDA glue, e.g. llama-context.cpp)
+    void * pinned_buf;
+
     bool initialized;
 };
 
@@ -74,6 +77,7 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
     sched->gpu_dispatch = nullptr;
     sched->gpu_dispatch_user_data = nullptr;
     sched->graph_allocated = false;
+    sched->pinned_buf = nullptr;
     sched->initialized = false;
 
     // Initialize dual threadpools from CCD pairs
@@ -154,6 +158,14 @@ void ggml_backend_sched_pipelined_set_gpu_dispatch(
     if (!sched) return;
     sched->gpu_dispatch = fn;
     sched->gpu_dispatch_user_data = user_data;
+}
+
+void ggml_backend_sched_pipelined_set_pinned_buf(
+    ggml_backend_sched_pipelined_t sched,
+    void * pinned_buf) {
+
+    if (!sched) return;
+    sched->pinned_buf = pinned_buf;
 }
 
 // ---------------------------------------------------------------------------
