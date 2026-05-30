@@ -76,8 +76,9 @@ A new `llama_sampler_i` implementation added to the sampler chain at init time. 
   - `token == id_call` → set phase to `TOOL_INVOCATION`, create grammar
   - `token == id_end` → set phase to `TEXT`
 - If `phase == TOOL_INVOCATION`:
-  - JSON brace-depth tracking: increment counter on `{`, decrement on `}`. When depth reaches 0 after decrement → JSON block complete → set phase to `TEXT`, destroy grammar
-  - `token == id_end` → set phase to `TEXT` (fallback), destroy grammar
+  - **Primary exit:** Check `llama_grammar_is_finished(inner_grmr)`. If true → JSON is valid and complete → set phase to `TEXT`, destroy grammar
+  - **Fallback exit:** JSON brace-depth tracking: increment counter on `{`, decrement on `}`. When depth reaches 0 after decrement and primary check is unavailable → JSON block complete → set phase to `TEXT`, destroy grammar
+  - `token == id_end` → set phase to `TEXT` (last resort), destroy grammar
 
 **Grammar creation** (on entering `TOOL_INVOCATION`):
 - Convert stored `json_schema` string → GBNF grammar via `json_schema_to_grammar()`
@@ -87,6 +88,17 @@ A new `llama_sampler_i` implementation added to the sampler chain at init time. 
 **Grammar destruction** (on exiting `TOOL_INVOCATION`):
 - Call grammar sampler's `reset()` then `free()`
 - Set inner grammar pointer to `nullptr`
+
+### 3a. Sampler Chain Position Guarantee
+
+`sampler_gen_phase` MUST be the **first** sampler added to `llama_sampler_chain`. This guarantees the forbidden `<|call|>` token is masked with `-FLT_MAX` before any other sampler (temperature, top_k, min_p, etc.) can transform the probability distribution. If masking happened after temperature scaling, residual probability mass could leak through numerical imprecision.
+
+Insertion order in `common_sampler_init()`:
+```
+chain.add(sampler_gen_phase)   // 1st: mask forbidden tokens
+chain.add(logit_bias)          // 2nd: user logit biases
+chain.add(grammar/dry/...)     // 3rd+: all other samplers
+```
 
 ### 4. `resolve_model_signatures()` — Vocab Scan
 
@@ -104,6 +116,12 @@ Supports `--model-type [deepseek|kimi|auto]` CLI flag. Default `auto`.
 **`server-context.cpp` — `launch_slot_with_task()`:**
 - Drop pre-filled tool-call grammar from `params.sampling.grammar` when tools are present
 - Pass `json_schema` string through to `common_sampler_init()` via a new field
+
+**`server_context_impl` — GBNF compilation cache:**
+- Add `std::unordered_map<std::string, std::string> schema_to_gbnf_cache` to `server_context_impl`
+- Before converting a JSON schema to GBNF, check the cache: `if (cache.count(json_schema)) { return cache[json_schema]; }`
+- Cache is per-server-instance, persists across requests
+- Motivation: MCP agents repeatedly call the same tools (e.g. `read_file`, `google_search`), producing identical JSON schemas. Caching avoids re-compiling the same schema → GBNF conversion on every request.
 
 **`server-context.cpp` — `update_slots()`:**
 - No changes needed at this layer (all phase logic is in the sampler)
@@ -130,8 +148,9 @@ REASONING                                       │
   │ accept(id_end) → TEXT                       │
   ▼                                             │
 TOOL_INVOCATION ◄───────────────────────────────┘
-  │ JSON close '}' (valid nesting) → TEXT
-  │ accept(id_end) → TEXT (fallback)
+  │ llama_grammar_is_finished() → TEXT (primary)
+  │ brace_depth == 0 → TEXT (fallback)
+  │ accept(id_end) → TEXT (last resort)
   │ slot release / n_predict → TEXT (hard reset)
 ```
 
@@ -168,3 +187,5 @@ Four test cases in `tests/isolation_test.py` using `pytest` + `requests`:
 - Grammar activation is a single null-pointer check: `if (grmr) { ... }`
 - No allocations in the hot path (grammar creation/destruction happens on phase transitions, not per-token)
 - The `apply()` fast path for non-TOOL_INVOCATION phases is: 1 comparison + 1 branch + 1 array write = ~3 cycles
+- `sampler_gen_phase` being **first in chain** means downstream samplers never perform entropy work on the masked `<|call|>` token — it is removed from the candidate pool before any distribution transform
+- GBNF cache in server_context eliminates repeated `json_schema → GBNF` compilation for MCP-style repeated tool calls
