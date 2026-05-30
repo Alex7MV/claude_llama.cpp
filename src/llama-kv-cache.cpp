@@ -1429,7 +1429,6 @@ struct args_set_input_kq_mask {
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
-  //const auto & hparams = args.hparams;
     const auto & ubatch  = args.ubatch;
     const auto & v_cells       = args.v_cells;
     const auto & seq_to_stream = args.seq_to_stream;
@@ -1505,13 +1504,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                 // fast path: empty cell is always masked
                 if (cells.is_empty(j)) {
-                    data[d] = -INFINITY;
+                    data[d] = mask_drop;
                     continue;
                 }
 
                 // mask different-sequence cells
                 if (!cells.seq_has(j, seq_id)) {
-                    data[d] = -INFINITY;
+                    data[d] = mask_drop;
                     continue;
                 }
 
@@ -1539,15 +1538,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     visible = !llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1);
                 }
 
-                if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
-                } else {
-                    data[idst + j] = mask_keep;
-                }
-
-                continue;
-skip:
-                data[idst + j] = mask_drop;
+                data[d] = visible
+                    ? (alibi ? llama_cast<T>(-std::abs((float)(p0 - p1))) : mask_keep)
+                    : mask_drop;
             }
         }
     }

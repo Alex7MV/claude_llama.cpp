@@ -11,6 +11,7 @@
 #include "ggml-opt.h"
 #include "ggml-backend-pipeline.h"
 
+#include <atomic>
 #include <map>
 #include <vector>
 

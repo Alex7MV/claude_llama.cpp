@@ -27,6 +27,7 @@
 /.cache/
 /.ccls-cache/
 /.claude/
+/.superpowers/
 /.direnv/
 /.envrc
 /.idea/

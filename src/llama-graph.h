@@ -1139,3 +1139,13 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
+// Extract a subgraph for layers [first_layer, first_layer + layer_count).
+// Returns nullptr if extraction is not possible (not yet implemented).
+// The caller must ensure the returned graph is freed after use.
+// TODO: full implementation requires proper node boundary detection.
+ggml_cgraph * llama_graph_extract_split(
+    ggml_cgraph * full_graph,
+    int first_layer,
+    int layer_count,
+    int n_layers_total);

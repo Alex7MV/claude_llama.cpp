@@ -4,6 +4,11 @@
 extern "C" {
 #endif
 
+// TMA capability probe.
+// Returns true if TMA is available and GGML_CUDA_TMA=1 is set.
+// Requires: CUDA runtime >= 12.4, device compute capability >= sm_90.
+bool ggml_cuda_tma_supported(void);
+
 // TMA transfer between pinned system RAM and GPU VRAM.
 // Falls back to cudaMemcpyAsync when TMA is unavailable.
 

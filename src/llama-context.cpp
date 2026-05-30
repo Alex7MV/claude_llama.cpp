@@ -19,6 +19,15 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef GGML_USE_CUDA
+// Forward declarations for CUDA pipeline dispatch callback.
+// Defined in ggml/src/ggml-cuda/ggml-cuda-blackwell-pipeline.cu.
+extern "C" {
+    void ggml_bw_pipeline_gpu_dispatch(void * user_data, const struct ggml_pipeline_slot_info * slot);
+    void * ggml_bw_pipeline_get_stream(void);
+}
+#endif
+
 //
 // llama_context
 //
@@ -2267,17 +2276,70 @@ ggml_status llama_context::graph_compute(
                     GGML_SCHED_PRIO_NORMAL,
                     1,  // poll
                     gpu_be);
+#ifdef GGML_USE_CUDA
+                if (sched_pipeline) {
+                    void * stream = ggml_bw_pipeline_get_stream();
+                    if (stream) {
+                        ggml_backend_sched_pipelined_set_gpu_dispatch(
+                            sched_pipeline, ggml_bw_pipeline_gpu_dispatch, stream);
+                    }
+                }
+#endif
             } else {
                 LLAMA_LOG_WARN("%s: pipeline prefill requested but no GPU backend found, falling back to sequential\n", __func__);
             }
         }
 
         if (sched_pipeline) {
-            auto status = ggml_backend_sched_pipelined_compute(sched_pipeline, gf);
-            if (status != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: pipelined compute failed with error %d\n", __func__, status);
+            // Attempt pipelined split compute.  If graph extraction is not
+            // available (returns nullptr), fall back to legacy path.
+            bool use_split = false;
+            int n_layers = model.hparams.n_layer;
+            int split_size = cparams.pipeline_split_size;
+
+            if (n_layers > 0 && split_size > 0 && split_size < n_layers) {
+                int num_splits = (n_layers + split_size - 1) / split_size;
+                ggml_cgraph * first_split = llama_graph_extract_split(
+                    gf, 0, split_size, n_layers);
+                if (first_split) {
+                    use_split = true;
+                    // Extract and compute each split
+                    for (int s = 0; s < num_splits; s++) {
+                        int first = s * split_size;
+                        int count = std::min(split_size, n_layers - first);
+                        bool is_cpu = (s < num_splits / 2);
+
+                        ggml_cgraph * split_gf = (s == 0)
+                            ? first_split
+                            : llama_graph_extract_split(gf, first, count, n_layers);
+                        if (!split_gf) {
+                            // Extraction failed mid-loop; drain and fall back
+                            ggml_backend_sched_pipelined_drain(sched_pipeline);
+                            use_split = false;
+                            break;
+                        }
+
+                        auto status = ggml_backend_sched_pipelined_compute_split(
+                            sched_pipeline, split_gf, first, count, is_cpu);
+                        if (status != GGML_STATUS_SUCCESS) {
+                            LLAMA_LOG_ERROR("%s: pipeline split %d failed\n", __func__, s);
+                            ggml_backend_sched_pipelined_drain(sched_pipeline);
+                            return status;
+                        }
+                    }
+                    ggml_backend_sched_pipelined_drain(sched_pipeline);
+                }
             }
-            return status;
+
+            if (!use_split) {
+                // Legacy path: compute full graph with threadpool rotation
+                auto status = ggml_backend_sched_pipelined_compute(sched_pipeline, gf);
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: pipelined compute failed with error %d\n", __func__, status);
+                }
+                return status;
+            }
+            return GGML_STATUS_SUCCESS;
         }
     }
 
@@ -3340,7 +3402,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
-        /*.pipeline_depth              =*/ 0,
+       /*.pipeline_depth              =*/ 0,
         /*.pipeline_split_size         =*/ 8,
     };
 
