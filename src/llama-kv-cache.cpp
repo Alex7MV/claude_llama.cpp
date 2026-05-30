@@ -1539,7 +1539,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 data[d] = visible
-                    ? (alibi ? llama_cast<T>(-std::abs(p0 - p1)) : mask_keep)
+                    ? (alibi ? llama_cast<T>(-std::abs((float)(p0 - p1))) : mask_keep)
                     : mask_drop;
             }
         }
