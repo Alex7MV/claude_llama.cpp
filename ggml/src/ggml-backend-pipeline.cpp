@@ -96,7 +96,6 @@ ggml_backend_sched_pipelined_t ggml_backend_sched_pipelined_init(
 
     // Fallback: if dual pool fails, use single pool
     if (sched->num_tp < 2) {
-        // Free any threadpools created in the failed dual-init loop
         for (int j = 0; j < sched->num_tp; j++) {
             if (sched->cpu_tp[j]) ggml_threadpool_free(sched->cpu_tp[j]);
         }

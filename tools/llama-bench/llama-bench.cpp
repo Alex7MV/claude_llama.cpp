@@ -394,7 +394,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
-  /* pipeline_depth       */ 0,
+    /* pipeline_depth       */ 3,
     /* pipeline_split_size  */ 8,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
