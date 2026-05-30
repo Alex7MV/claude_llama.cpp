@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
             case 't':
                 mode = "tma-kv-prefill";
                 {
-                    size_t kv_size = 4 * 1024 * 1024 * 1024;  // 4 GB default
+                    size_t kv_size = 4ULL * 1024 * 1024 * 1024;  // 4 GB default
                     const char * size_arg = optarg;
                     if (size_arg && size_arg[0] != '-') {
                         char * end;
