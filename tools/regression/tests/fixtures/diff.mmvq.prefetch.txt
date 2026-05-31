@@ -1,0 +1,21 @@
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -120,15 +120,14 @@ static __global__ void mul_mat_vec_q4_0_q8_0(
+     const int row = blockIdx.x * blockDim.y + threadIdx.y;
+     if (row >= nrows) return;
+
+-    #pragma unroll
+     for (int col = threadIdx.x; col < ncols; col += blockDim.x) {
+         const int ib = row * ncols + col;
+         float sum = 0.0f;
+         #pragma unroll
+         for (int j = 0; j < QK4_0; j += 4) {
+-            // prefetch registers: load 4 values ahead
+-            const float4 v = v4_load(&x[ib].qs[j]);
+-            sum += v.x * (float)y[ib].qs[j] + v.y * (float)y[ib].qs[j+1]
+-                 + v.z * (float)y[ib].qs[j+2] + v.w * (float)y[ib].qs[j+3];
++            // fallback: scalar load
++            for (int k = 0; k < 4; k++)
++                sum += (float)(x[ib].qs[j+k] & 0x0F) * (float)y[ib].qs[j+k];
+         }
+     }

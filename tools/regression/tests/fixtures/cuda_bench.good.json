@@ -1,0 +1,9 @@
+{
+  "gpu_name": "NVIDIA RTX 5090",
+  "compute_capability": "12.1",
+  "num_devices": 1,
+  "h2d_bandwidth_gbs": 58.2,
+  "h2d_max_size_bytes": 1073741824,
+  "p2p_enabled": false,
+  "p2p_bandwidth_gbs": null
+}

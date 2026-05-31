@@ -1,0 +1,13 @@
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -130,6 +130,10 @@ static __global__ void mul_mat_vec_q4_0_q8_0(
+     const int row = blockIdx.x * blockDim.y + threadIdx.y;
+     if (row >= nrows) return;
+
++    // new safety check for out-of-bounds
++    if (threadIdx.x >= blockDim.x) return;
++    if (row >= nrows) return;
++
+     for (int col = threadIdx.x; col < ncols; col += blockDim.x) {
+         const int ib = row * ncols + col;
+         float sum = 0.0f;

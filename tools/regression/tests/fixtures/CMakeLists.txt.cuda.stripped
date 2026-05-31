@@ -1,0 +1,7 @@
+# Stripped CUDA config — regression scenario
+option(GGML_CUDA_FA "enable flash attention" OFF)
+option(GGML_CUDA_FORCE_MMQ "force mmq kernels" OFF)
+option(GGML_CUDA_NCCL "enable NCCL" ON)
+
+set(CMAKE_CUDA_ARCHITECTURES "75-virtual 80-virtual 86-real 89-real 90-virtual")
+target_compile_options(ggml-cuda PRIVATE -extended-lambda)
