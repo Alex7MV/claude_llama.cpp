@@ -415,7 +415,7 @@ static void bench(const char *name, vec_dot_fn fn,
         ? fabsf(result - expected) / fabsf(expected)
         : fabsf(result - expected);
     int correct = rel_err < 1e-3f;
-    if (!correct) {
+    if (!correct && all_pass) {
         *all_pass = 0;
         // Debug: find where it diverges
         debug_check(name, fn, x, y, nb, expected);
@@ -483,9 +483,12 @@ int main(void) {
     // Enable debug for the failing case
     debug_on = 1;
 
-    const int test_nb[] = {8, 64, 256, 1024};
+    // Test sizes: small (L1) to large (L3/DRAM)
+    const int test_nb[] = {8, 64, 256, 1024, 4096, 16384, 65536};
     const int num_sizes = sizeof(test_nb) / sizeof(test_nb[0]);
 
+    // all_pass only tracks CORRECT implementations (sign-ext, VNNI).
+    // ggml-sign and fallback are reference-only (known bug with y=-128).
     int all_pass = 1;
 
     for (int si = 0; si < num_sizes; si++) {
@@ -504,8 +507,8 @@ int main(void) {
         printf("\nn=%5d (%4d blocks):\n", n, nb);
 
 #if defined(__AVX2__)
-        bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, &all_pass);
-        bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, &all_pass);
+        bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, NULL);
+        bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, NULL);
         bench("AVX2 sign-ext",  vec_dot_avx2_signext, x, y, nb, expected, &all_pass);
 #endif
 #if defined(__AVX512VNNI__)

@@ -124,10 +124,25 @@ static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i zero = _mm256_setzero_si256();
     const __m256i summed_pairs = _mm256_dpbssd_epi32(zero, x, y);
     return _mm256_cvtepi32_ps(summed_pairs);
+#elif defined(__AVX2__)
+    // sign_epi8 overflow bug: when y[i] = -128 and x[i] < 0,
+    // -(-128) = 128 overflows int8 and wraps to -128.
+    // The maddubs then computes ax[i] * (-128) instead of ax[i] * 128.
+    // Fix: sign-extend bytes to 16-bit, multiply, and sum groups of 4.
+    const __m256i x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
+    const __m256i x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
+    const __m256i y_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(y));
+    const __m256i y_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(y, 1));
+    const __m256i s_lo = _mm256_madd_epi16(x_lo, y_lo);
+    const __m256i s_hi = _mm256_madd_epi16(x_hi, y_hi);
+    __m256i p = _mm256_hadd_epi32(s_lo, s_hi);
+    // hadd layout: [0-3, 4-7, 16-19, 20-23, 8-11, 12-15, 24-27, 28-31]
+    // reorder to: [0-3, 4-7, 8-11, 12-15, 16-19, 20-23, 24-27, 28-31]
+    const __m256i perm = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
+    p = _mm256_permutevar8x32_epi32(p, perm);
+    return _mm256_cvtepi32_ps(p);
 #else
-    // Get absolute values of x vectors
     const __m256i ax = _mm256_sign_epi8(x, x);
-    // Sign the values of the y vectors
     const __m256i sy = _mm256_sign_epi8(y, x);
     return mul_sum_us8_pairs_float(ax, sy);
 #endif
