@@ -230,7 +230,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+        .vec_dot                  = ggml_vec_dot_q4_0_q8_0_avx512_vnni,
+#else
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
+#endif
         .vec_dot_type             = GGML_TYPE_Q8_0,
 #if defined (__ARM_FEATURE_MATMUL_INT8)
         .nrows                    = 2,

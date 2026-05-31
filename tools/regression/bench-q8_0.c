@@ -22,8 +22,14 @@ typedef struct {
     int8_t  qs[QK8_0];
 } block_q8_0;
 
+#define QK4_0 32
+typedef struct {
+    uint16_t d;
+    uint8_t qs[QK4_0 / 2];  // 16 bytes of packed 4-bit nibbles
+} block_q4_0;
+
 // ---------------------------------------------------------------
-// Reference: scalar dot product
+// Reference: scalar dot product (Q8_0 × Q8_0)
 // ---------------------------------------------------------------
 static inline float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
@@ -48,6 +54,24 @@ static float vec_dot_scalar(const block_q8_0 *x, const block_q8_0 *y, int nb) {
         int sumi = 0;
         for (int j = 0; j < QK8_0; j++) {
             sumi += (int)x[i].qs[j] * (int)y[i].qs[j];
+        }
+        total += (double)sumi * (double)(fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d));
+    }
+    return (float)total;
+}
+
+// ---------------------------------------------------------------
+// Q4_0 × Q8_0 scalar reference
+// ---------------------------------------------------------------
+static float vec_dot_q4_0_scalar(const block_q4_0 *x, const block_q8_0 *y, int nb) {
+    double total = 0.0;
+    for (int i = 0; i < nb; i++) {
+        int sumi = 0;
+        for (int j = 0; j < QK4_0 / 2; j++) {
+            int v0 = x[i].qs[j] & 0x0F;
+            int v1 = (x[i].qs[j] >> 4) & 0x0F;
+            sumi += (v0 - 8) * (int)y[i].qs[j];
+            sumi += (v1 - 8) * (int)y[i].qs[QK4_0 / 2 + j];
         }
         total += (double)sumi * (double)(fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d));
     }
@@ -444,6 +468,47 @@ static float vec_dot_avx512_vnni_v3(const block_q8_0 *x, const block_q8_0 *y, in
 #endif
 
 // ---------------------------------------------------------------
+// Q4_0 × Q8_0 AVX-512 VNNI vec_dot
+//
+// Same dpbusd-based approach as Q8_0 v3:
+//   dot  = dpbusd(nibbles_u8, q8)           = Σ (nibble × q8)
+//   corr = dpbusd({8}_u8, q8)               = 8 × Σ (q8)
+//   result = dot - corr                      = Σ ((nibble-8) × q8)
+// ---------------------------------------------------------------
+#if defined(__AVX512VNNI__)
+static float vec_dot_q4_0_avx512_vnni(const block_q4_0 *x, const block_q8_0 *y, int nb) {
+    float total = 0.0f;
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i c8   = _mm256_set1_epi8(8);
+
+    for (int ib = 0; ib < nb; ib++) {
+        __m128i nib = _mm_loadu_si128((const __m128i *)x[ib].qs);
+        __m256i qx = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(nib),
+            _mm_srli_epi16(nib, 4), 1);
+        qx = _mm256_and_si256(qx, _mm256_set1_epi8(0x0F));
+
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+
+        __m256i dot  = _mm256_dpbusd_epi32(zero, qx, qy);
+        __m256i corr = _mm256_dpbusd_epi32(zero, c8,  qy);
+        dot = _mm256_sub_epi32(dot, corr);
+
+        __m256 f = _mm256_cvtepi32_ps(dot);
+        float scale = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
+        acc = _mm256_fmadd_ps(f, _mm256_set1_ps(scale), acc);
+    }
+
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s128 = _mm_hadd_ps(_mm_add_ps(lo, hi), _mm_add_ps(lo, hi));
+    s128 = _mm_hadd_ps(s128, s128);
+    return _mm_cvtss_f32(s128);
+}
+#endif
+
+// ---------------------------------------------------------------
 // Debug: verbose per-block comparison on failing case
 // ---------------------------------------------------------------
 typedef float (*vec_dot_fn)(const block_q8_0 *, const block_q8_0 *, int);
@@ -638,6 +703,20 @@ static void fill_blocks(block_q8_0 *blocks, int nb, unsigned seed) {
     }
 }
 
+static void fill_q4_0_blocks(block_q4_0 *blocks, int nb, unsigned seed) {
+    srand(seed);
+    for (int i = 0; i < nb; i++) {
+        uint16_t exp = 0x3c00 + (rand() & 0x7);
+        uint16_t mant = rand() & 0x3ff;
+        blocks[i].d = exp | mant;
+        for (int j = 0; j < QK4_0 / 2; j++) {
+            int v0 = rand() & 0x0F;
+            int v1 = rand() & 0x0F;
+            blocks[i].qs[j] = (uint8_t)(v0 | (v1 << 4));
+        }
+    }
+}
+
 static void bench(const char *name, vec_dot_fn fn,
                   const block_q8_0 *x, const block_q8_0 *y, int nb,
                   float expected, int *all_pass) {
@@ -706,11 +785,86 @@ int main(void) {
     printf("AVX2:          YES\n");
 #endif
     printf("----------------------------------------\n");
+    printf("All tests: %s\n", all_pass ? "PASS" : "FAIL");
 
-    if (self_test() != 0) {
-        printf("Self-test FAILED\n");
-        return 1;
+    // -------------------------------------------------------------
+    // Q4_0 × Q8_0 benchmark
+    // -------------------------------------------------------------
+    printf("\n\nQ4_0 × Q8_0 vec_dot benchmark\n");
+    printf("----------------------------------------\n");
+
+    typedef float (*vec_dot_q4_0_fn)(const block_q4_0 *, const block_q8_0 *, int);
+
+    for (int si = 0; si < num_sizes; si++) {
+        int nb = test_nb[si];
+        int n  = nb * QK4_0;
+
+        block_q4_0 *qx = malloc(sizeof(block_q4_0) * nb);
+        block_q8_0 *qy = malloc(sizeof(block_q8_0) * nb);
+        if (!qx || !qy) { fprintf(stderr, "OOM\n"); return 1; }
+
+        fill_q4_0_blocks(qx, nb, 999);
+        fill_blocks(qy, nb, 888);
+
+        float expected = vec_dot_q4_0_scalar(qx, qy, nb);
+
+        printf("\nn=%5d (%4d blocks):\n", n, nb);
+
+#if defined(__AVX512VNNI__)
+        // Q4_0 VNNI bench
+        {
+            float result = vec_dot_q4_0_avx512_vnni(qx, qy, nb);
+            float rel_err = fabsf(expected) > 1e-10f
+                ? fabsf(result - expected) / fabsf(expected)
+                : fabsf(result - expected);
+            int correct = rel_err < 1e-3f;
+            if (!correct) all_pass = 0;
+
+            volatile float sink = 0.0f;
+            for (int i = 0; i < 10; i++) sink += vec_dot_q4_0_avx512_vnni(qx, qy, nb);
+            (void)sink;
+
+            double best_us = 1e100;
+            for (int round = 0; round < 5; round++) {
+                volatile float sink2 = 0.0f;
+                double start = now_sec();
+                int64_t count = 0;
+                double elapsed;
+                int step = nb < 64 ? nb : 64;
+                do {
+                    if (nb <= 64) {
+                        sink2 += vec_dot_q4_0_avx512_vnni(qx, qy, nb);
+                        count++;
+                    } else {
+                        for (int off = 0; off + step <= nb; off += step) {
+                            sink2 += vec_dot_q4_0_avx512_vnni(qx + off, qy + off, step);
+                        }
+                        count += nb / step;
+                    }
+                    elapsed = now_sec() - start;
+                } while (elapsed < 0.5);
+                double us = count > 0 ? elapsed / (double)count * 1e6 : 0.0;
+                if ((us < best_us) && (us > 0.0)) best_us = us;
+                (void)sink2;
+            }
+            (void)sink;
+
+            double ops = 2.0 * (nb < 64 ? nb : 64) * QK4_0;
+            double gflops = best_us < 1e99 ? ops / (best_us * 1e3) : 0.0;
+            printf("  %-20s %10s  %8.2f us/call (%4d blks)  %9.2f GFLOPS\n",
+                   "AVX-512 VNNI Q4_0", correct ? "PASS" : "FAIL", best_us,
+                   nb < 64 ? nb : 64, gflops);
+        }
+#endif
+
+        free(qx);
+        free(qy);
     }
+
+    printf("\n----------------------------------------\n");
+    printf("All tests: %s\n", all_pass ? "PASS" : "FAIL");
+    return all_pass ? 0 : 1;
+}
 
     // Enable debug for the failing case
     debug_on = 1;

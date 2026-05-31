@@ -182,4 +182,66 @@ void ggml_vec_dot_q8_0_q8_0_avx512_vnni(
     *s = total;
 }
 
+// ---------------------------------------------------------------
+// Q4_0 × Q8_0 VNNI vec_dot
+// ---------------------------------------------------------------
+// Q4_0 block: {ggml_half d; uint8_t qs[16]} = 18 bytes, 32 packed
+// 4-bit nibbles (0..15). Dequantized to (-8..+7) by subtracting 8.
+//
+// Uses _mm256_dpbusd_epi32 (unsigned × signed):
+//   dot  = dpbusd(nibbles_u8, q8)           = Σ (nibble × q8)
+//   corr = dpbusd({8}_u8, q8)               = 8 × Σ (q8)
+//   result = dot - corr                      = Σ ((nibble-8) × q8)
+// ---------------------------------------------------------------
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+
+void ggml_vec_dot_q4_0_q8_0_avx512_vnni(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx,
+        const void * GGML_RESTRICT vy, size_t by, int nrc) {
+
+    assert(n % QK4_0 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_0 * GGML_RESTRICT x = (const block_q4_0 *) vx;
+    const block_q8_0 * GGML_RESTRICT y = (const block_q8_0 *) vy;
+
+    const int nb = n / QK4_0;
+
+    __m256 acc = _mm256_setzero_ps();
+    const __m256i zero = _mm256_setzero_si256();
+    const __m256i c8   = _mm256_set1_epi8(8);  // 8 as unsigned byte
+
+    for (int ib = 0; ib < nb; ib++) {
+        // Expand 16 packed nibbles -> 32 uint8 values (0..15)
+        __m128i nib = _mm_loadu_si128((const __m128i *)x[ib].qs);
+        __m256i qx = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(nib),
+            _mm_srli_epi16(nib, 4), 1);
+        qx = _mm256_and_si256(qx, _mm256_set1_epi8(0x0F));
+
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+
+        __m256i dot  = _mm256_dpbusd_epi32(zero, qx, qy);
+        __m256i corr = _mm256_dpbusd_epi32(zero, c8,  qy);
+        dot = _mm256_sub_epi32(dot, corr);
+
+        __m256 f = _mm256_cvtepi32_ps(dot);
+        float scale = GGML_CPU_FP16_TO_FP32(x[ib].d)
+                    * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        acc = _mm256_fmadd_ps(f, _mm256_set1_ps(scale), acc);
+    }
+
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s128 = _mm_hadd_ps(_mm_add_ps(lo, hi), _mm_add_ps(lo, hi));
+    s128 = _mm_hadd_ps(s128, s128);
+    *s = _mm_cvtss_f32(s128);
+}
+
+#endif /* __AVX512VNNI__ && __AVX512VL__ */
 #endif /* __AVX512VNNI__ */
