@@ -71,6 +71,60 @@ CUDA_CRITICAL_PATTERNS = [
     "cp.async",
 ]
 
+FILE_CRITICAL_KEYWORDS = {
+    "ggml/CMakeLists.txt": [
+        "AOCC",
+        "GGML_AVX512_VNNI",
+        "GGML_AVX512_BF16",
+        "GGML_AVX512",
+        "GGML_FMA",
+    ],
+    "ggml/src/ggml-cpu/CMakeLists.txt": [
+        "__AVX512VNNI__",
+        "GGML_AVX512_VNNI",
+        "epyc-cpu.c",
+        "GGML_OPENMP",
+    ],
+    "ggml/src/ggml-cuda/CMakeLists.txt": [
+        "ggml-cuda-epyc-pipeline",
+        "WGMMA",
+        "GGML_CUDA_HAS_WGMMA",
+        "100a-real",
+        "101a-real",
+    ],
+    "ggml/src/ggml-cpu/vec.cpp": [
+        "ggml_vec_dot_f16",
+        "ggml_sve_f16_fma_widened",
+        "svfloat16_t",
+        "svcntb",
+        "svcnth",
+    ],
+    "ggml/src/ggml-cpu/ggml-cpu-impl.h": [
+        "ggml_vec_dot",
+        "type_traits",
+    ],
+}
+
+FILE_WARN_KEYWORDS = {
+    "ggml/CMakeLists.txt": [
+        "GGML_VERSION",
+        "GGML_USE_AOCC",
+    ],
+    "ggml/src/ggml-cpu/CMakeLists.txt": [
+        "ggml-cpu-epyc.c",
+        "pinned.c",
+        "pinned.h",
+        "GGML_CPU_SOURCES",
+    ],
+    "ggml/src/ggml-cuda/CMakeLists.txt": [
+        "GGML_CUDA_ARCHITECTURES",
+    ],
+    "ggml/src/ggml-cpu/vec.cpp": [
+        "GGML_F16x_VEC",
+        "DEFAULT_PG32",
+    ],
+}
+
 DEFAULT_FILES = list(FILES_CONFIG.keys()) + [
     "ggml/src/ggml-cuda/ggml-cuda-epyc-pipeline.cu",
     "ggml/src/ggml-cuda/CMakeLists.txt",
@@ -101,6 +155,8 @@ def classify_diff(filename: str, diff_text: str) -> list:
     critical_funcs = config.get("CRITICAL", [])
     warn_funcs = config.get("WARN", [])
     is_cuda = "cuda" in filename
+    critical_keywords = FILE_CRITICAL_KEYWORDS.get(filename, [])
+    warn_keywords = FILE_WARN_KEYWORDS.get(filename, [])
 
     hunks = re.split(r'(?=^@@)', diff_text, flags=re.MULTILINE)
     for hunk in hunks:
@@ -128,6 +184,16 @@ def classify_diff(filename: str, diff_text: str) -> list:
                 if pattern.lower() in hunk.lower():
                     sev = "critical"
                     break
+        if sev == "info":
+            for kw in critical_keywords:
+                if kw.lower() in hunk.lower():
+                    sev = "critical"
+                    break
+        if sev == "info":
+            for kw in warn_keywords:
+                if kw.lower() in hunk.lower():
+                    sev = "warning"
+                    break
 
         results.append({
             "function": func_name,
@@ -135,7 +201,7 @@ def classify_diff(filename: str, diff_text: str) -> list:
             "hunk": hunk.strip(),
         })
 
-    if not config and not is_cuda and diff_text.strip():
+    if not config and not is_cuda and not critical_keywords and not warn_keywords and diff_text.strip():
         results.append({
             "function": "(whole file)",
             "severity": "warning",

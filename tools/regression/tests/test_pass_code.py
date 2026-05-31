@@ -66,3 +66,47 @@ def test_classify_diff_cuda():
     classified = classify_diff("ggml-cuda-epyc-pipeline.cu", cuda_diff)
     critical = [c for c in classified if c["severity"] == "critical"]
     assert len(critical) >= 1
+
+
+def test_classify_diff_cmakelists_ggml_critical():
+    diff = """@@ -298,6 +298,36 @@
++# AOCC auto-detection
++    set(GGML_AVX512_VNNI ON CACHE BOOL "" FORCE)
+ """
+    classified = classify_diff("ggml/CMakeLists.txt", diff)
+    critical = [c for c in classified if c["severity"] == "critical"]
+    assert len(critical) >= 1
+
+
+def test_classify_diff_cmakelists_cpu_adds_epyc():
+    diff = """@@ -250,6 +245,7 @@
++            ggml-cpu/arch/x86/epyc-cpu.c
+ """
+    classified = classify_diff("ggml/src/ggml-cpu/CMakeLists.txt", diff)
+    critical = [c for c in classified if c["severity"] == "critical"]
+    assert len(critical) >= 1
+
+
+def test_classify_diff_vec_sve_rewrite():
+    diff = """@@ -273,67 +273,51 @@
+-        const int ggml_f16_epr = sve_register_length / 16;
++        const int ggml_f16_epr = svcnth();
++        const int ggml_f16_step = 8 * ggml_f16_epr;
+ """
+    classified = classify_diff("ggml/src/ggml-cpu/vec.cpp", diff)
+    critical = [c for c in classified if c["severity"] == "critical"]
+    assert len(critical) >= 1
+
+
+def test_classify_diff_known_file_no_unclassified_warning():
+    """Files with keyword rules should not produce 'Unclassified file' warning."""
+    for fname in ["ggml/CMakeLists.txt", "ggml/src/ggml-cpu/CMakeLists.txt",
+                  "ggml/src/ggml-cuda/CMakeLists.txt", "ggml/src/ggml-cpu/vec.cpp",
+                  "ggml/src/ggml-cpu/ggml-cpu-impl.h"]:
+        diff = """@@ -1,3 +1,3 @@
+-old line
++new line
+"""
+        classified = classify_diff(fname, diff)
+        unclassified = [c for c in classified if "Unclassified file" in c["hunk"]]
+        assert len(unclassified) == 0, f"{fname} produced unclassified warning"
