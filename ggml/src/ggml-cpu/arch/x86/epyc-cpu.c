@@ -243,4 +243,5 @@ void ggml_vec_dot_q4_0_q8_0_avx512_vnni(
     *s = _mm_cvtss_f32(s128);
 }
 
-#endif /* __AVX512VNNI__ */
+#endif /* __AVX512VNNI__ (Q4_0) */
+#endif /* __AVX512VNNI__ && __AVX512VL__ (Q8_0) */
