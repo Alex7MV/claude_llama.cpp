@@ -560,7 +560,35 @@ struct server_slot {
     }
 };
 
+//
+// kv_trace_reason — decision codes for [KV] event logging
+//
+enum kv_trace_reason : uint8_t {
+    KV_TRACE_NO_CACHE_PROMPT   = 0, // cache_prompt==false → n_past=0
+    KV_TRACE_PREFIX_MISMATCH   = 1, // get_common_prefix returned partial match
+    KV_TRACE_ALORA_BOUNDARY    = 2, // n_past capped at alora_invocation_start-1
+    KV_TRACE_NO_CHECKPOINT     = 3, // no usable checkpoint → n_past=0
+    KV_TRACE_MIN_ONE_EVAL      = 4, // n_past==task.n_tokens → decrement
+    KV_TRACE_CONTEXT_SHIFT     = 5, // context shift discarding tokens
+    KV_TRACE_CACHE_REUSE_SHIFT = 6, // cache_reuse chunk shift
+    KV_TRACE_SLOT_CACHED       = 7, // slot saved to prompt cache
+    KV_TRACE_IDLE_SLOT_PURGE   = 8, // slot cleared by try_clear_idle_slots
+};
 
+inline const char * kv_trace_reason_str(kv_trace_reason r) {
+    switch (r) {
+        case KV_TRACE_NO_CACHE_PROMPT:   return "NO_CACHE_PROMPT";
+        case KV_TRACE_PREFIX_MISMATCH:   return "PREFIX_MISMATCH";
+        case KV_TRACE_ALORA_BOUNDARY:    return "ALORA_BOUNDARY";
+        case KV_TRACE_NO_CHECKPOINT:     return "NO_CHECKPOINT";
+        case KV_TRACE_MIN_ONE_EVAL:      return "MIN_ONE_EVAL";
+        case KV_TRACE_CONTEXT_SHIFT:     return "CONTEXT_SHIFT";
+        case KV_TRACE_CACHE_REUSE_SHIFT: return "CACHE_REUSE_SHIFT";
+        case KV_TRACE_SLOT_CACHED:       return "SLOT_CACHED";
+        case KV_TRACE_IDLE_SLOT_PURGE:   return "IDLE_SLOT_PURGE";
+    }
+    return "UNKNOWN";
+}
 
 //
 // server_metrics
@@ -656,6 +684,15 @@ public:
             // we don't call it again here to avoid double free
             destroy();
         }
+    }
+
+    // [KV] event logging helper
+    void kv_trace(server_slot & slot, kv_trace_reason reason, const char * fmt = "") {
+        SLT_INF(slot, "[KV] n_past=%d n_total=%d reason=%s %s\n",
+                slot.prompt.n_tokens(),
+                slot.task ? (int)slot.task->n_tokens() : 0,
+                kv_trace_reason_str(reason),
+                fmt);
     }
 
 private:
