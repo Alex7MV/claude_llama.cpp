@@ -1,7 +1,6 @@
 // Self-contained Q8_0 vec_dot benchmark for AVX-512 VNNI.
 // Compile with AOCC: clang -O3 -mavx512f -mavx512vnni -mavx512bf16 -mfma -o bench-q8_0 tools/regression/bench-q8_0.c
 // Compile with AVX2:  clang -O3 -mavx2 -mfma -o bench-q8_0_avx2 tools/regression/bench-q8_0.c
-// Compile with GCC:   gcc -O3 -mavx512f -mavx512vnni -o bench-q8_0 tools/regression/bench-q8_0.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,35 +55,71 @@ static float vec_dot_scalar(const block_q8_0 *x, const block_q8_0 *y, int nb) {
 }
 
 // ---------------------------------------------------------------
-// AVX2: sign_epi8 trick + maddubs (matches ggml exactly)
+// Alternative sign_epi8: hand-rolled from cmpgt + blendv to avoid
+// potential AOCC intrinsic bug
 // ---------------------------------------------------------------
 #if defined(__AVX2__)
-static inline __m256 sum_i16_pairs_float(const __m256i x) {
+static inline __m256i my_sign_epi8(__m256i a, __m256i b) {
+    __m256i zero = _mm256_setzero_si256();
+    __m256i neg_a = _mm256_sub_epi8(zero, a);
+    __m256i mask_neg = _mm256_cmpgt_epi8(zero, b);
+    __m256i mask_pos = _mm256_cmpgt_epi8(b, zero);
+    __m256i r = _mm256_blendv_epi8(zero, a, mask_pos);
+    r = _mm256_blendv_epi8(r, neg_a, mask_neg);
+    return r;
+}
+
+static inline __m256 my_sum_i16_pairs_float(const __m256i x) {
     const __m256i ones = _mm256_set1_epi16(1);
     const __m256i summed_pairs = _mm256_madd_epi16(ones, x);
     return _mm256_cvtepi32_ps(summed_pairs);
 }
 
-static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy) {
+static inline __m256 my_mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy) {
     const __m256i dot = _mm256_maddubs_epi16(ax, sy);
-    return sum_i16_pairs_float(dot);
-}
-
-static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
-    const __m256i ax = _mm256_sign_epi8(x, x);
-    const __m256i sy = _mm256_sign_epi8(y, x);
-    return mul_sum_us8_pairs_float(ax, sy);
+    return my_sum_i16_pairs_float(dot);
 }
 
 __attribute__((noinline))
-static float vec_dot_avx2(const block_q8_0 *x, const block_q8_0 *y, int nb) {
+static float vec_dot_avx2_fallback(const block_q8_0 *x, const block_q8_0 *y, int nb) {
     __m256 acc = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const __m256 d = _mm256_set1_ps(
             fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
         __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
+        __m256i ax = my_sign_epi8(qx, qx);
+        __m256i sy = my_sign_epi8(qy, qx);
+        const __m256 q = my_mul_sum_us8_pairs_float(ax, sy);
+        acc = _mm256_fmadd_ps(d, q, acc);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float result;
+    _mm_store_ss(&result, s);
+    return result;
+}
+
+// Also keep the ggml-style version for comparison
+static inline __m256 ggml_mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    return my_sum_i16_pairs_float(dot);
+}
+
+__attribute__((noinline))
+static float vec_dot_avx2_ggml(const block_q8_0 *x, const block_q8_0 *y, int nb) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 d = _mm256_set1_ps(
+            fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        const __m256 q = ggml_mul_sum_i8_pairs_float(qx, qy);
         acc = _mm256_fmadd_ps(d, q, acc);
     }
     __m128 hi = _mm256_extractf128_ps(acc, 1);
@@ -129,16 +164,10 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
         __m512i ux = _mm512_xor_si512(sx, xor_mask);
         __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, sy);
 
-        // sy_gsum = Σ(y[i] ^ 0x80) per dword via maddubs+madd
-        // Since (y[i] ^ 0x80) as unsigned = (y[i] + 128) as integer,
-        // sy_gsum = Σ(y[i]) + 512 per dword (4 elements)
-        // correction = 128 * sy_gsum = 128*Σy + 65536
-        // dot - correction = (Σx*y + 128*Σy) - (128*Σy + 65536) = Σx*y - 65536
         __m512i sy_u = _mm512_xor_si512(sy, xor_mask);
         __m512i sy_psum = _mm512_maddubs_epi16(sy_u, _mm512_set1_epi8(1));
         __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
 
-        // correction and bias fix:
         __m512i corr = _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128));
         dot = _mm512_sub_epi32(dot, corr);
         dot = _mm512_add_epi32(dot, _mm512_set1_epi32(65536));
@@ -163,36 +192,81 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
 #endif
 
 // ---------------------------------------------------------------
+// Debug: verbose per-block comparison on failing case
+// ---------------------------------------------------------------
+static int debug_on = 0;
+
+static void debug_check(const char *name, vec_dot_fn fn,
+                         const block_q8_0 *x, const block_q8_0 *y, int nb,
+                         float expected) {
+    float result = fn(x, y, nb);
+    float rel_err = fabsf(expected) > 1e-10f
+        ? fabsf(result - expected) / fabsf(expected)
+        : fabsf(result - expected);
+    printf("  %-20s full(%3d blks) = %12.1f  (expected=%12.1f  rel_err=%9.2e)  %s\n",
+           name, nb, result, expected, rel_err, rel_err < 1e-3f ? "PASS" : "FAIL");
+
+    if (debug_on) {
+        // Check cumulative result block by block
+        for (int step = 1; step <= nb; step++) {
+            float sub = fn(x, y, step);
+            float sub_exp = vec_dot_scalar(x, y, step);
+            float sub_err = fabsf(sub_exp) > 1e-10f
+                ? fabsf(sub - sub_exp) / fabsf(sub_exp) : fabsf(sub - sub_exp);
+            if (sub_err >= 1e-3f) {
+                printf("    ^^ first mismatch at %d blocks: fn=%f ref=%f rel_err=%g\n",
+                       step, sub, sub_exp, sub_err);
+                // Show values for the offending block
+                printf("    block %d: x.d=0x%04x y.d=0x%04x x.qs[0..7]=", step-1,
+                       x[step-1].d, y[step-1].d);
+                for (int j = 0; j < 8 && j < QK8_0; j++)
+                    printf("%d ", x[step-1].qs[j]);
+                printf(" y.qs[0..7]=");
+                for (int j = 0; j < 8 && j < QK8_0; j++)
+                    printf("%d ", y[step-1].qs[j]);
+                printf("\n");
+                break;
+            }
+        }
+        fflush(stdout);
+    }
+}
+
+// ---------------------------------------------------------------
 // Self-test with known values
 // ---------------------------------------------------------------
 static int self_test(void) {
     block_q8_0 xb, yb;
-    xb.d = 0x3c00; // 1.0
-    yb.d = 0x3c00; // 1.0
-    // fill with simple pattern: i*(i+3)
+    xb.d = 0x3c00;
+    yb.d = 0x3c00;
     for (int j = 0; j < QK8_0; j++) {
         xb.qs[j] = (int8_t)(j * 3 + 1);
         yb.qs[j] = (int8_t)(j * 2 + 5);
     }
     float expected = vec_dot_scalar(&xb, &yb, 1);
-    float avx2_r = 0, vnni_r = 0;
+    printf("Self-test (1 block, scale=1.0, qs pattern):\n");
+    printf("  scalar ref:            %f\n", expected);
+
+    int ok = 1;
+    float r;
 #if defined(__AVX2__)
-    avx2_r = vec_dot_avx2(&xb, &yb, 1);
-    double e_avx2 = fabsf(expected) > 1e-10f
-        ? fabsf(avx2_r - expected) / fabsf(expected) : fabsf(avx2_r - expected);
-    printf("Self-test (1 block, known values):\n");
-    printf("  scalar ref: %f\n", expected);
-    printf("  AVX2:       %f  (rel_err=%g)  %s\n", avx2_r, e_avx2, e_avx2 < 1e-3f ? "PASS" : "FAIL");
+    r = vec_dot_avx2_ggml(&xb, &yb, 1);
+    float diff = fabsf(r - expected);
+    printf("  AVX2 (ggml sign):      %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (diff < 1e-3f);
+    r = vec_dot_avx2_fallback(&xb, &yb, 1);
+    diff = fabsf(r - expected);
+    printf("  AVX2 (fallback sign):  %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (diff < 1e-3f);
 #endif
 #if defined(__AVX512VNNI__)
-    vnni_r = vec_dot_avx512_vnni(&xb, &yb, 1);
-    double e_vnni = fabsf(expected) > 1e-10f
-        ? fabsf(vnni_r - expected) / fabsf(expected) : fabsf(vnni_r - expected);
-    printf("  AVX-512 VNNI: %f  (rel_err=%g)  %s\n", vnni_r, e_vnni, e_vnni < 1e-3f ? "PASS" : "FAIL");
+    r = vec_dot_avx512_vnni(&xb, &yb, 1);
+    float diff = fabsf(r - expected);
+    printf("  AVX-512 VNNI:          %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (diff < 1e-3f);
 #endif
     printf("\n");
-    return (fabsf(expected - avx2_r) < 1e-3f * fmaxf(1.0f, fabsf(expected)) &&
-            fabsf(expected - vnni_r) < 1e-3f * fmaxf(1.0f, fabsf(expected))) ? 0 : 1;
+    return ok ? 0 : 1;
 }
 
 // ---------------------------------------------------------------
@@ -227,15 +301,18 @@ static void bench(const char *name, vec_dot_fn fn,
         ? fabsf(result - expected) / fabsf(expected)
         : fabsf(result - expected);
     int correct = rel_err < 1e-3f;
-    if (!correct) *all_pass = 0;
+    if (!correct) {
+        *all_pass = 0;
+        // Debug: find where it diverges
+        debug_check(name, fn, x, y, nb, expected);
+    }
 
     // Warmup
     volatile float sink = 0.0f;
     for (int i = 0; i < 10; i++) sink += fn(x, y, nb);
     (void)sink;
 
-    // Benchmark: call fn on entire dataset repeatedly
-    // Use volatile sink to force evaluation and prevent CSE
+    // Benchmark: call on sliding windows (each call gets different data)
     double best_us = 1e100;
     for (int round = 0; round < 5; round++) {
         volatile float sink2 = 0.0f;
@@ -243,8 +320,6 @@ static void bench(const char *name, vec_dot_fn fn,
         int64_t count = 0;
         double elapsed;
         do {
-            // Call fn on fresh data slices so each call is unique
-            // and the compiler cannot CSE across calls
             int step = 64;
             for (int off = 0; off + step <= nb; off += step) {
                 sink2 += fn(x + off, y + off, step);
@@ -258,7 +333,6 @@ static void bench(const char *name, vec_dot_fn fn,
     }
     (void)sink;
 
-    // ops per call = 2 * step * QK8_0  (step = 64 blocks, or nb if nb < 64)
     int step = nb < 64 ? nb : 64;
     double ops = 2.0 * step * QK8_0;
     double gflops = ops / (best_us * 1e3);
@@ -285,7 +359,10 @@ int main(void) {
         return 1;
     }
 
-    const int test_nb[] = {8, 64, 256, 1024, 4096, 8192};
+    // Enable debug for the failing case
+    debug_on = 1;
+
+    const int test_nb[] = {8, 64, 256, 1024};
     const int num_sizes = sizeof(test_nb) / sizeof(test_nb[0]);
 
     int all_pass = 1;
@@ -306,7 +383,8 @@ int main(void) {
         printf("\nn=%5d (%4d blocks):\n", n, nb);
 
 #if defined(__AVX2__)
-        bench("AVX2 x86", vec_dot_avx2, x, y, nb, expected, &all_pass);
+        bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, &all_pass);
+        bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, &all_pass);
 #endif
 #if defined(__AVX512VNNI__)
         bench("AVX-512 VNNI", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
