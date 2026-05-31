@@ -1,6 +1,7 @@
 // Self-contained Q8_0 vec_dot benchmark for AVX-512 VNNI.
-// Compile with AOCC: clang -O3 -mavx512f -mavx512vnni -mavx512bf16 -mfma -o bench-q8_0 bench-q8_0.c
-// Compile with GCC:  gcc -O3 -mavx512f -mavx512vnni -mavx512bf16 -mfma -o bench-q8_0 bench-q8_0.c
+// Compile with AOCC: clang -O3 -mavx512f -mavx512vnni -mavx512bf16 -mfma -o bench-q8_0 tools/regression/bench-q8_0.c
+// Compile with AVX2:  clang -O3 -mavx2 -mfma -o bench-q8_0_avx2 tools/regression/bench-q8_0.c
+// Compile with GCC:   gcc -O3 -mavx512f -mavx512vnni -o bench-q8_0 tools/regression/bench-q8_0.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +24,7 @@ typedef struct {
 } block_q8_0;
 
 // ---------------------------------------------------------------
-// Reference: scalar dot product (always correct)
+// Reference: scalar dot product
 // ---------------------------------------------------------------
 static inline float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
@@ -55,39 +56,50 @@ static float vec_dot_scalar(const block_q8_0 *x, const block_q8_0 *y, int nb) {
 }
 
 // ---------------------------------------------------------------
-// AVX2 baseline (existing ggml implementation)
+// AVX2: sign_epi8 trick + maddubs
 // ---------------------------------------------------------------
 #if defined(__AVX2__)
-static int hsum_i32_8_avx2(__m256i v) {
-    __m128i lo = _mm256_castsi256_si128(v);
-    __m128i hi = _mm256_extracti128_si256(v, 1);
-    __m128i s  = _mm_add_epi32(lo, hi);
-    s = _mm_hadd_epi32(s, s);
-    s = _mm_hadd_epi32(s, s);
-    return _mm_cvtsi128_si32(s);
+static inline __m256 sum_i16_pairs_float(const __m256i x) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    const __m256i summed_pairs = _mm256_madd_epi16(ones, x);
+    return _mm256_cvtepi32_ps(summed_pairs);
+}
+
+static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy) {
+    const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    return sum_i16_pairs_float(dot);
+}
+
+static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
+    const __m256i ax = _mm256_sign_epi8(x, x);
+    const __m256i sy = _mm256_sign_epi8(y, x);
+    return mul_sum_us8_pairs_float(ax, sy);
 }
 
 static float vec_dot_avx2(const block_q8_0 *x, const block_q8_0 *y, int nb) {
     __m256 acc = _mm256_setzero_ps();
     int ib = 0;
     for (; ib < nb; ++ib) {
-        __m256 d = _mm256_set1_ps(fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+        const __m256 d = _mm256_set1_ps(
+            fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
         __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
-        // mul_sum_i8_pairs_float: unpack, widen, multiply, accumulate
-        __m256i sum16 = _mm256_maddubs_epi16(
-            _mm256_unpacklo_epi8(qx, qy),
-            _mm256_set1_epi16(1));
-        __m256i sum32 = _mm256_madd_epi16(sum16, _mm256_set1_epi16(1));
-        __m256 q = _mm256_cvtepi32_ps(sum32);
+        const __m256 q = mul_sum_i8_pairs_float(qx, qy);
         acc = _mm256_fmadd_ps(d, q, acc);
     }
-    return hsum_i32_8_avx2(_mm256_castps_si256(acc));
+    __m128i hi = _mm256_extractf128_si256(_mm256_castps_si256(acc), 1);
+    __m128i lo = _mm256_castsi256_si128(_mm256_castps_si256(acc));
+    __m128i s = _mm_add_epi32(lo, hi);
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    float result;
+    _mm_store_ss(&result, _mm_castsi128_ps(s));
+    return result;
 }
 #endif
 
 // ---------------------------------------------------------------
-// AVX-512 VNNI kernel (optimized)
+// AVX-512 VNNI: XOR-0x80 trick, fixed correction bias
 // ---------------------------------------------------------------
 #if defined(__AVX512VNNI__)
 static int hsum_i32_8_ymm(__m256i v) {
@@ -112,19 +124,25 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
         __m256i sy_hi = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
         __m512i sy = _mm512_inserti64x4(_mm512_castsi256_si512(sy_lo), sy_hi, 1);
 
+        // XOR sign bit: signed INT8 -> unsigned with 128 offset
         __m512i xor_mask = _mm512_set1_epi8((int8_t)0x80);
         __m512i ux = _mm512_xor_si512(sx, xor_mask);
 
+        // VNNI: 16 int32 from groups of 4 pairs
         __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, sy);
 
-        // Compute Σ(sy[i]) per dword group for -128 correction
+        // Compute sy_gsum = Σ(y[i] + 128) per dword group via sy ^ 0x80 + maddubs + madd
         __m512i ones = _mm512_set1_epi8(1);
         __m512i sy_u = _mm512_xor_si512(sy, xor_mask);
         __m512i sy_psum = _mm512_maddubs_epi16(sy_u, ones);
         __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
 
+        // correction = 128 * sy_gsum = 128 * (Σy + 512) = 128*Σy + 65536
+        // dot = Σ(x+128)*y - correction = (Σx*y + 128*Σy) - (128*Σy + 65536) = Σx*y - 65536
+        // Fix: add back 65536 per dword
         __m512i correction = _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128));
         dot = _mm512_sub_epi32(dot, correction);
+        dot = _mm512_add_epi32(dot, _mm512_set1_epi32(65536));
 
         __m256i blk0 = _mm512_castsi512_si256(dot);
         __m256i blk1 = _mm512_extracti64x4_epi64(dot, 1);
@@ -192,19 +210,24 @@ static void bench(const char *name, vec_dot_fn fn,
 
     // Benchmark: 5 rounds, take the best
     for (int round = 0; round < 5; round++) {
+        volatile float sink = 0.0f;
         double start = now_sec();
         int64_t count = 0;
         double elapsed;
         do {
-            for (int i = 0; i < 64; i++) fn(x, y, nb);
+            for (int i = 0; i < 64; i++) {
+                sink += fn(x, y, nb);
+            }
             count += 64;
             elapsed = now_sec() - start;
         } while (elapsed < 0.3);
         double us = elapsed / (double)count * 1e6;
         if (us < best_us) best_us = us;
+        // Use sink to prevent dead-code elimination
+        if (sink == 0.0f) { /* prevent optimizer from removing sink */ }
     }
 
-    double ops = 2.0 * nb * QK8_0; // 2 ops per element (mul+add)
+    double ops = 2.0 * nb * QK8_0;
     double gflops = ops / (best_us * 1e3);
 
     printf("  %-20s %10s %8.2f us/call %9.2f GFLOPS\n",

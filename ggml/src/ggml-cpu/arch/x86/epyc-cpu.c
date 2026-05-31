@@ -93,8 +93,13 @@ void ggml_vec_dot_q8_0_q8_0_avx512_vnni(
         __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
 
         // Correction: each dword -= 128 × group_sum(sy)
+        // sy_gsum = Σ(y[i] + 128) per dword = Σy + 512
+        // correction = 128 × sy_gsum = 128×Σy + 65536
+        // dot = Σ(x+128)×y - correction = (Σx×y + 128×Σy) - (128×Σy + 65536) = Σx×y - 65536
+        // Fix: add back 65536 per dword
         __m512i correction = _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128));
         dot = _mm512_sub_epi32(dot, correction);
+        dot = _mm512_add_epi32(dot, _mm512_set1_epi32(65536));
 
         // Block 0: first 8 dwords, Block 1: last 8 dwords
         __m256i blk0 = _mm512_castsi512_si256(dot);
