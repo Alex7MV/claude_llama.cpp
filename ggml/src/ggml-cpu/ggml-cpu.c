@@ -1934,6 +1934,33 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // Expert weight prefetch: immediately after routing, start DRAM reads
+        // for each selected expert's weight matrix. Overlaps memory latency
+        // with barrier + atomics setup from other threads.
+        // nb02 = byte span of one expert's weights (contiguous in expert dim).
+        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+            if (matrix_row_counts[cur_a] == 0) {
+                continue;
+            }
+            const char * expert_start = (const char *)src0->data + cur_a * nb02;
+
+            // 8 cache lines at 64B stride (DDR5 burst) + 2 at 4KB stride (DDR5 page)
+            __builtin_prefetch(expert_start,             0, 3);
+            __builtin_prefetch(expert_start + 64,        0, 3);
+            __builtin_prefetch(expert_start + 128,       0, 3);
+            __builtin_prefetch(expert_start + 256,       0, 3);
+            __builtin_prefetch(expert_start + 512,       0, 3);
+            __builtin_prefetch(expert_start + 1024,      0, 3);
+            __builtin_prefetch(expert_start + 2048,      0, 3);
+            // Trigger DDR5 page open at 4KB boundary
+            if (nb02 > 4096) {
+                __builtin_prefetch(expert_start + 4096,  0, 3);
+                if (nb02 > 8192) {
+                    __builtin_prefetch(expert_start + 8192, 0, 3);
+                }
+            }
+        }
     }
 
     // reset current_chunk
@@ -1949,6 +1976,21 @@ static void ggml_compute_forward_mul_mat_id(
 
         if (cne1 == 0) {
             continue;
+        }
+
+        // Prefetch next 2 experts' weight starts while threads compute current
+        // This overlaps DRAM read for upcoming experts with current computation.
+        if (ith == 0) {
+            int prefetched = 0;
+            for (int p = cur_a + 1; p < n_as && prefetched < 2; p++) {
+                if (matrix_row_counts[p] > 0) {
+                    const char * next_start = (const char *)src0->data + p * nb02;
+                    __builtin_prefetch(next_start,       0, 3);
+                    __builtin_prefetch(next_start + 64,  0, 3);
+                    __builtin_prefetch(next_start + 4096, 0, 3);
+                    prefetched++;
+                }
+            }
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
