@@ -55,10 +55,14 @@ def test_cmp_cuda_flags_detects_stripped():
     full = open(f"{FIXTURE_DIR}/CMakeLists.txt.cuda.full").read()
     stripped = open(f"{FIXTURE_DIR}/CMakeLists.txt.cuda.stripped").read()
     findings = cmp_cuda_flags(full, stripped)
-    mismatch_flags = [f for f in findings if f.get("status", "") == "mismatch"]
-    # Should detect: GGML_CUDA_FA (ON→OFF), missing sm_120a, sm_121a, sm_100a, sm_101a,
+    # Should detect: GGML_CUDA_FA (ON→OFF), missing sm_120a/sm_121a/sm_100a/sm_101a,
     # missing -use_fast_math, missing -compress-mode
-    assert len(mismatch_flags) >= 4
-    # Also check that critical findings exist for missing critical flags
+    # Use severity field (not status)
+    all_findings = [f for f in findings]
+    assert len(all_findings) >= 6
+    # Check that critical findings exist for missing critical flags
     critical_flags = [f for f in findings if f.get("severity") == "critical"]
     assert len(critical_flags) >= 1
+    # Check that warning findings exist for missing archs
+    warning_flags = [f for f in findings if f.get("severity") == "warning"]
+    assert len(warning_flags) >= 4
