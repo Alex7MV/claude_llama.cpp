@@ -90,6 +90,10 @@
 #include <string>
 #include <vector>
 
+// ---- [KV] CUDA op tracing (debug) ----
+static bool                    g_cuda_trace_ops = false;
+static thread_local std::string g_cuda_op_trace;
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -2868,6 +2872,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    if (g_cuda_trace_ops) {
+        if (!g_cuda_op_trace.empty()) {
+            g_cuda_op_trace += ',';
+        }
+        g_cuda_op_trace += ggml_op_name(dst->op);
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -5901,6 +5911,33 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     }
 
     return &reg;
+}
+
+// ---- [KV] CUDA op tracing API ----
+void ggml_backend_cuda_set_trace_ops(ggml_backend_t backend, bool enable) {
+    GGML_UNUSED(backend);
+    g_cuda_trace_ops = enable;
+    if (!enable) {
+        g_cuda_op_trace.clear();
+    }
+}
+
+const char * ggml_backend_cuda_get_trace_ops(ggml_backend_t backend, int * n_ops) {
+    GGML_UNUSED(backend);
+    if (!g_cuda_trace_ops || g_cuda_op_trace.empty()) {
+        *n_ops = 0;
+        return nullptr;
+    }
+    *n_ops = 1;
+    for (size_t i = 0; i < g_cuda_op_trace.size(); i++) {
+        if (g_cuda_op_trace[i] == ',') (*n_ops)++;
+    }
+    return g_cuda_op_trace.c_str();
+}
+
+void ggml_backend_cuda_reset_trace_ops(ggml_backend_t backend) {
+    GGML_UNUSED(backend);
+    g_cuda_op_trace.clear();
 }
 
 ggml_backend_t ggml_backend_cuda_init(int device) {

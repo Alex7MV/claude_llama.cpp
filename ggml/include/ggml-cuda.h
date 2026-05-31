@@ -47,6 +47,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 GGML_BACKEND_API void ggml_backend_cuda_print_timing(ggml_backend_t backend);
 
+// [KV] CUDA op tracing for inference observability at ngl=0
+GGML_BACKEND_API void        ggml_backend_cuda_set_trace_ops(ggml_backend_t backend, bool enable);
+GGML_BACKEND_API const char * ggml_backend_cuda_get_trace_ops(ggml_backend_t backend, int * n_ops);
+GGML_BACKEND_API void        ggml_backend_cuda_reset_trace_ops(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif
