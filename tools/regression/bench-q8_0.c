@@ -208,26 +208,44 @@ static void debug_check(const char *name, vec_dot_fn fn,
            name, nb, result, expected, rel_err, rel_err < 1e-3f ? "PASS" : "FAIL");
 
     if (debug_on) {
-        // Check cumulative result block by block
+        int bad = -1;
         for (int step = 1; step <= nb; step++) {
             float sub = fn(x, y, step);
             float sub_exp = vec_dot_scalar(x, y, step);
             float sub_err = fabsf(sub_exp) > 1e-10f
                 ? fabsf(sub - sub_exp) / fabsf(sub_exp) : fabsf(sub - sub_exp);
-            if (sub_err >= 1e-3f) {
-                printf("    ^^ first mismatch at %d blocks: fn=%f ref=%f rel_err=%g\n",
-                       step, sub, sub_exp, sub_err);
-                // Show values for the offending block
-                printf("    block %d: x.d=0x%04x y.d=0x%04x x.qs[0..7]=", step-1,
-                       x[step-1].d, y[step-1].d);
-                for (int j = 0; j < 8 && j < QK8_0; j++)
-                    printf("%d ", x[step-1].qs[j]);
-                printf(" y.qs[0..7]=");
-                for (int j = 0; j < 8 && j < QK8_0; j++)
-                    printf("%d ", y[step-1].qs[j]);
-                printf("\n");
-                break;
+            if (sub_err >= 1e-3f) { bad = step; break; }
+        }
+        if (bad > 0) {
+            printf("    Divergence at block %d.\n", bad - 1);
+            printf("    Cumulative sums per block:\n");
+            int start = (bad - 3) > 0 ? (bad - 3) : 0;
+            int end = (bad + 5) < nb ? (bad + 5) : nb;
+            for (int b = start; b < end; b++) {
+                float scalar_cum = vec_dot_scalar(x, y, b + 1);
+                float fn_cum = fn(x, y, b + 1);
+                printf("      blk %3d: scalar_cum=%12.1f  fn_cum=%12.1f  diff=%g\n",
+                       b, scalar_cum, fn_cum, fn_cum - scalar_cum);
+                fflush(stdout);
             }
+            int bb = bad - 1;
+            printf("    block %d: x.d=0x%04x y.d=0x%04x scale_x=%f scale_y=%f\n",
+                   bb, x[bb].d, y[bb].d,
+                   fp16_to_fp32(x[bb].d), fp16_to_fp32(y[bb].d));
+            printf("      x.qs[0..31]=");
+            for (int j = 0; j < QK8_0; j++)
+                printf("%d ", x[bb].qs[j]);
+            printf("\n      y.qs[0..31]=");
+            for (int j = 0; j < QK8_0; j++)
+                printf("%d ", y[bb].qs[j]);
+            printf("\n");
+            // Also compute exact scalar dot product for this block
+            int qs_dot = 0;
+            for (int j = 0; j < QK8_0; j++)
+                qs_dot += (int)x[bb].qs[j] * (int)y[bb].qs[j];
+            float scale = fp16_to_fp32(x[bb].d) * fp16_to_fp32(y[bb].d);
+            printf("      qs_dot=%d  scale=%f  exact_contrib=%f\n",
+                   qs_dot, scale, (float)((double)qs_dot * (double)scale));
         }
         fflush(stdout);
     }
@@ -316,30 +334,37 @@ static void bench(const char *name, vec_dot_fn fn,
     for (int i = 0; i < 10; i++) sink += fn(x, y, nb);
     (void)sink;
 
-    // Benchmark: call on sliding windows (each call gets different data)
+    // Benchmark: call on full dataset repeatedly (larger datasets for
+    // throughput); or on sliding windows for CSE resistance.
     double best_us = 1e100;
+    int step = nb < 64 ? nb : 64;
     for (int round = 0; round < 5; round++) {
         volatile float sink2 = 0.0f;
         double start = now_sec();
         int64_t count = 0;
         double elapsed;
         do {
-            int step = 64;
-            for (int off = 0; off + step <= nb; off += step) {
-                sink2 += fn(x + off, y + off, step);
+            if (nb <= 64) {
+                // Small dataset: call full dataset, each call unique via sink
+                sink2 += fn(x, y, nb);
+                count++;
+            } else {
+                // Sliding window over the data
+                for (int off = 0; off + step <= nb; off += step) {
+                    sink2 += fn(x + off, y + off, step);
+                }
+                count += nb / step;
             }
-            count += nb / step;
             elapsed = now_sec() - start;
         } while (elapsed < 0.5);
-        double us = elapsed / (double)count * 1e6;
-        if (us < best_us) best_us = us;
+        double us = count > 0 ? elapsed / (double)count * 1e6 : 0.0;
+        if ((us < best_us) && (us > 0.0)) best_us = us;
         (void)sink2;
     }
     (void)sink;
 
-    int step = nb < 64 ? nb : 64;
     double ops = 2.0 * step * QK8_0;
-    double gflops = ops / (best_us * 1e3);
+    double gflops = best_us < 1e99 ? ops / (best_us * 1e3) : 0.0;
 
     printf("  %-20s %10s  %8.2f us/call (%4d blks)  %9.2f GFLOPS\n",
            name, correct ? "PASS" : "FAIL", best_us, step, gflops);
