@@ -314,7 +314,7 @@ int llama_server(int argc, char ** argv) {
                     SRV_INF("gen-phase: state machine enabled (call=%d, thought=%d, end=%d)\n",
                             gen_tokens.id_call, gen_tokens.id_thought, gen_tokens.id_end);
                 } else {
-                    SRV_INF("gen-phase: no markers found, state machine disabled (pass-through)\n");
+                    SRV_INF("%s", "gen-phase: no markers found, state machine disabled (pass-through)\n");
                 }
             }
         }
