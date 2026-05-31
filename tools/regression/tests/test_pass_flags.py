@@ -1,5 +1,4 @@
 import pytest
-from pathlib import Path
 from tools.regression.pass_flags import (
     parse_cmake_options,
     check_config_h_propagation,
@@ -45,28 +44,29 @@ def test_config_h_template_present():
     assert result["GGML_FMA"] == "template_line_present"
 
 
-def test_numa_off_critical():
-    warnings, critical = [], []
-    check_numa("OFF", {"GGML_NUMA": "found"}, True, warnings, critical)
-    assert len(critical) > 0
-    assert "NUMA" in critical[0]
-
-
-def test_numa_in_config_h_missing_critical():
-    warnings, critical = [], []
-    check_numa("ON", {"GGML_NUMA": "not found"}, True, warnings, critical)
-    assert len(critical) > 0
-    assert "NUMA" in critical[0]
-
-
 def test_numa_init_missing_critical():
     warnings, critical = [], []
-    check_numa("ON", {"GGML_NUMA": "found"}, False, warnings, critical)
+    check_numa(False, True, warnings, critical)
     assert len(critical) > 0
     assert "NUMA" in critical[0]
+
+
+def test_numa_available_missing_warning():
+    warnings, critical = [], []
+    check_numa(True, False, warnings, critical)
+    assert len(warnings) > 0
+    assert "NUMA" in warnings[0]
+
+
+def test_numa_both_missing():
+    warnings, critical = [], []
+    check_numa(False, False, warnings, critical)
+    assert len(critical) > 0
+    assert len(warnings) > 0
 
 
 def test_numa_all_ok():
     warnings, critical = [], []
-    check_numa("ON", {"GGML_NUMA": "found"}, True, warnings, critical)
+    check_numa(True, True, warnings, critical)
     assert len(critical) == 0
+    assert len(warnings) == 0

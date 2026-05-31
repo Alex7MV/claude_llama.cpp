@@ -163,7 +163,7 @@ def run_code_pass(baseline: str, head: str,
         classified = classify_diff(fpath, diff)
         for item in classified:
             sev = item["severity"]
-            entry = {"file": fpath, "function": item["function"], "severity": sev, "hunk": item["hunk"]}
+            entry = {"flag": fpath, "baseline": item["function"], "severity": sev, "head": item["hunk"]}
             all_classified.append(entry)
             if sev == "critical":
                 critical.append(f"{fpath}:{item['function']} — critical change")
