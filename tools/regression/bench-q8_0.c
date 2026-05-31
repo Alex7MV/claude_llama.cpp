@@ -235,6 +235,76 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
 #endif
 
 // ---------------------------------------------------------------
+// AVX-512 VNNI v2: YMM dpbusd + float accumulation
+// Uses independent YMM VNNI chains per block (avoids insert/extract
+// overhead), float accumulation in ZMM (avoids hsum in hot loop).
+// ---------------------------------------------------------------
+#if defined(__AVX512VNNI__)
+__attribute__((noinline))
+static float vec_dot_avx512_vnni_v2(const block_q8_0 *x, const block_q8_0 *y, int nb) {
+    int ib = 0;
+    float total = 0.0f;
+
+    __m512 acc = _mm512_setzero_ps();
+
+    const __m256i xormask_256 = _mm256_set1_epi8((int8_t)0x80);
+    const __m256i zeroy_256   = _mm256_setzero_si256();
+    const __m256i onesy_256   = _mm256_set1_epi8(1);
+    const __m256i ones16y_256 = _mm256_set1_epi16(1);
+    const __m256i c128_256    = _mm256_set1_epi32(128);
+
+    for (; ib + 1 < nb; ib += 2) {
+        __m256i sx0 = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        __m256i sy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        __m256i ux0 = _mm256_xor_si256(sx0, xormask_256);
+        __m256i d0 = _mm256_dpbusd_epi32(zeroy_256, ux0, sy0);
+        __m256i p0 = _mm256_maddubs_epi16(onesy_256, sy0);
+        __m256i g0 = _mm256_madd_epi16(p0, ones16y_256);
+        d0 = _mm256_sub_epi32(d0, _mm256_mullo_epi32(g0, c128_256));
+
+        __m256i sx1 = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);
+        __m256i sy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+        __m256i ux1 = _mm256_xor_si256(sx1, xormask_256);
+        __m256i d1 = _mm256_dpbusd_epi32(zeroy_256, ux1, sy1);
+        __m256i p1 = _mm256_maddubs_epi16(onesy_256, sy1);
+        __m256i g1 = _mm256_madd_epi16(p1, ones16y_256);
+        d1 = _mm256_sub_epi32(d1, _mm256_mullo_epi32(g1, c128_256));
+
+        __m256 f0 = _mm256_cvtepi32_ps(d0);
+        __m256 f1 = _mm256_cvtepi32_ps(d1);
+        __m512 fdot = _mm512_insertf64x4(_mm512_castps256_ps512(f0), f1, 1);
+
+        float s0 = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
+        float s1 = fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d);
+        __m256 slo = _mm256_set1_ps(s0);
+        __m256 shi = _mm256_set1_ps(s1);
+        __m512 scale = _mm512_insertf64x4(_mm512_castps256_ps512(slo), shi, 1);
+
+        acc = _mm512_fmadd_ps(scale, fdot, acc);
+    }
+
+    for (; ib < nb; ++ib) {
+        int sumi = 0;
+        for (int j = 0; j < QK8_0; ++j)
+            sumi += x[ib].qs[j] * y[ib].qs[j];
+        total += (float)sumi * (fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+    }
+
+    __m256 hi = _mm512_extractf64x4_ps(acc, 1);
+    __m256 lo = _mm512_castps512_ps256(acc);
+    __m256 s256 = _mm256_add_ps(lo, hi);
+    __m128 bot = _mm256_castps256_ps128(s256);
+    __m128 top = _mm256_extractf128_ps(s256, 1);
+    __m128 s128 = _mm_add_ps(bot, top);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    total += _mm_cvtss_f32(s128);
+
+    return total;
+}
+#endif
+
+// ---------------------------------------------------------------
 // Debug: verbose per-block comparison on failing case
 // ---------------------------------------------------------------
 typedef float (*vec_dot_fn)(const block_q8_0 *, const block_q8_0 *, int);
@@ -342,7 +412,13 @@ static int self_test(void) {
     {
     float r = vec_dot_avx512_vnni(&xb, &yb, 1);
     float d = fabsf(r - expected);
-    printf("  AVX-512 VNNI:          %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    printf("  AVX-512 VNNI v1:      %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
+    {
+    float r = vec_dot_avx512_vnni_v2(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX-512 VNNI v2:      %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     ok = ok && (d < 1e-3f);
     }
 #endif
@@ -375,7 +451,13 @@ static int self_test(void) {
     {
     float r = vec_dot_avx512_vnni(&xb, &yb, 1);
     float d = fabsf(r - str_expected);
-    printf("    AVX-512 VNNI:          %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    printf("    AVX-512 VNNI v1:        %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    str_ok = str_ok && (d < 1e-3f);
+    }
+    {
+    float r = vec_dot_avx512_vnni_v2(&xb, &yb, 1);
+    float d = fabsf(r - str_expected);
+    printf("    AVX-512 VNNI v2:        %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     str_ok = str_ok && (d < 1e-3f);
     }
 #endif
@@ -511,7 +593,8 @@ int main(void) {
         bench("AVX2 sign-ext",  vec_dot_avx2_signext, x, y, nb, expected, &all_pass);
 #endif
 #if defined(__AVX512VNNI__)
-        bench("AVX-512 VNNI", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
+        bench("AVX-512 VNNI v1", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
+        bench("AVX-512 VNNI v2", vec_dot_avx512_vnni_v2, x, y, nb, expected, &all_pass);
 #endif
 
         free(x);
