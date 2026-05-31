@@ -307,6 +307,143 @@ static float vec_dot_avx512_vnni_v2(const block_q8_0 *x, const block_q8_0 *y, in
 #endif
 
 // ---------------------------------------------------------------
+// AVX-512 VNNI v3 (Hyper-Unrolled): 8× unroll, dpbusd correction
+// ---------------------------------------------------------------
+// 8 independent YMM chains × 1 block each per iteration.
+// Uses dpbusd(zero, {128}, sy) for the -128 offset correction
+// instead of maddubs+madd+mullo (saves 1 operation per block).
+//
+// 8 separate YMM accumulators (one per block) eliminate the
+// fmadd serial dependency — the GFLOP rate becomes limited by
+// the 6-execution-port Zen4 back-end rather than the fmadd
+// recurrence.
+// ---------------------------------------------------------------
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+__attribute__((noinline))
+static float vec_dot_avx512_vnni_v3(const block_q8_0 *x, const block_q8_0 *y, int nb) {
+    int ib = 0;
+    float total = 0.0f;
+
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps();
+    __m256 acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps();
+    __m256 acc7 = _mm256_setzero_ps();
+
+    const __m256i xormask = _mm256_set1_epi8((int8_t)0x80);
+    const __m256i zero256 = _mm256_setzero_si256();
+    const __m256i c128_u8 = _mm256_set1_epi8((int8_t)(uint8_t)128);
+
+    for (; ib + 7 < nb; ib += 8) {
+        // 8 independent chains, no data dependencies between them
+        __m256i sx, sy, dot, corr;
+        float s;
+
+        // Block 0
+        sx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
+        acc0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc0);
+
+        // Block 1
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 1].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d);
+        acc1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc1);
+
+        // Block 2
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 2].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 2].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 2].d) * fp16_to_fp32(y[ib + 2].d);
+        acc2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc2);
+
+        // Block 3
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 3].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 3].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 3].d) * fp16_to_fp32(y[ib + 3].d);
+        acc3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc3);
+
+        // Block 4
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 4].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 4].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 4].d) * fp16_to_fp32(y[ib + 4].d);
+        acc4 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc4);
+
+        // Block 5
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 5].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 5].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 5].d) * fp16_to_fp32(y[ib + 5].d);
+        acc5 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc5);
+
+        // Block 6
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 6].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 6].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 6].d) * fp16_to_fp32(y[ib + 6].d);
+        acc6 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc6);
+
+        // Block 7
+        sx = _mm256_loadu_si256((const __m256i *)x[ib + 7].qs);
+        sy = _mm256_loadu_si256((const __m256i *)y[ib + 7].qs);
+        dot  = _mm256_dpbusd_epi32(zero256, _mm256_xor_si256(sx, xormask), sy);
+        corr = _mm256_dpbusd_epi32(zero256, c128_u8, sy);
+        s = fp16_to_fp32(x[ib + 7].d) * fp16_to_fp32(y[ib + 7].d);
+        acc7 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(dot, corr)),
+                               _mm256_set1_ps(s), acc7);
+    }
+
+    // Scalar tail
+    for (; ib < nb; ++ib) {
+        int sumi = 0;
+        for (int j = 0; j < QK8_0; ++j)
+            sumi += x[ib].qs[j] * y[ib].qs[j];
+        total += (float)sumi * (fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+    }
+
+    // Reduce 8 YMM accumulators → scalar
+    acc0 = _mm256_add_ps(acc0, acc1);
+    acc2 = _mm256_add_ps(acc2, acc3);
+    acc4 = _mm256_add_ps(acc4, acc5);
+    acc6 = _mm256_add_ps(acc6, acc7);
+    acc0 = _mm256_add_ps(acc0, acc2);
+    acc4 = _mm256_add_ps(acc4, acc6);
+    acc0 = _mm256_add_ps(acc0, acc4);
+
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 s128 = _mm_add_ps(lo, hi);
+    s128 = _mm_hadd_ps(s128, s128);
+    s128 = _mm_hadd_ps(s128, s128);
+    total += _mm_cvtss_f32(s128);
+
+    return total;
+}
+#endif
+
+// ---------------------------------------------------------------
 // Debug: verbose per-block comparison on failing case
 // ---------------------------------------------------------------
 typedef float (*vec_dot_fn)(const block_q8_0 *, const block_q8_0 *, int);
@@ -423,6 +560,12 @@ static int self_test(void) {
     printf("  AVX-512 VNNI v2:      %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     ok = ok && (d < 1e-3f);
     }
+    {
+    float r = vec_dot_avx512_vnni_v3(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX-512 VNNI v3:      %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
 #endif
 
     // Stress test with y=-128 to expose sign_epi8 overflow bug
@@ -460,6 +603,12 @@ static int self_test(void) {
     float r = vec_dot_avx512_vnni_v2(&xb, &yb, 1);
     float d = fabsf(r - str_expected);
     printf("    AVX-512 VNNI v2:        %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    str_ok = str_ok && (d < 1e-3f);
+    }
+    {
+    float r = vec_dot_avx512_vnni_v3(&xb, &yb, 1);
+    float d = fabsf(r - str_expected);
+    printf("    AVX-512 VNNI v3:        %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     str_ok = str_ok && (d < 1e-3f);
     }
 #endif
@@ -597,6 +746,7 @@ int main(void) {
 #if defined(__AVX512VNNI__)
         bench("AVX-512 VNNI v1", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
         bench("AVX-512 VNNI v2", vec_dot_avx512_vnni_v2, x, y, nb, expected, &all_pass);
+        bench("AVX-512 VNNI v3", vec_dot_avx512_vnni_v3, x, y, nb, expected, &all_pass);
 #endif
 
         free(x);
