@@ -103,7 +103,51 @@ static float vec_dot_avx2_fallback(const block_q8_0 *x, const block_q8_0 *y, int
     return result;
 }
 
-// Also keep the ggml-style version for comparison
+// -----------------------------------------------------------------
+// Corrected AVX2: sign-extend to 16-bit, avoiding sign_epi8 -128 overflow
+// -----------------------------------------------------------------
+// sign_epi8 fails when y[i] = -128 and x[i] < 0 because -(-128) = 128
+// overflows int8 and wraps back to -128. Sign-extension avoids this.
+__attribute__((noinline))
+static float vec_dot_avx2_signext(const block_q8_0 *x, const block_q8_0 *y, int nb) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m256 d = _mm256_set1_ps(
+            fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+        __m256i qx = _mm256_loadu_si256((const __m256i *)x[ib].qs);
+        __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+
+        // Sign-extend bytes to 16-bit (two 128-bit halves per 256-bit reg)
+        __m256i x_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qx));
+        __m256i x_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qx, 1));
+        __m256i y_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qy));
+        __m256i y_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qy, 1));
+
+        // Sum pairs of 16-bit products to 32-bit (8 per half)
+        __m256i s_lo = _mm256_madd_epi16(x_lo, y_lo);
+        __m256i s_hi = _mm256_madd_epi16(x_hi, y_hi);
+
+        // Combine adjacent 2-element sums into 4-element sums
+        // hadd(s_lo, s_hi) gives: [0-3, 4-7, 16-19, 20-23, 8-11, 12-15, 24-27, 28-31]
+        // Need:              [0-3, 4-7, 8-11, 12-15, 16-19, 20-23, 24-27, 28-31]
+        __m256i p = _mm256_hadd_epi32(s_lo, s_hi);
+        const __m256i perm_idx = _mm256_set_epi32(7, 6, 3, 2, 5, 4, 1, 0);
+        p = _mm256_permutevar8x32_epi32(p, perm_idx);
+
+        __m256 q = _mm256_cvtepi32_ps(p);
+        acc = _mm256_fmadd_ps(d, q, acc);
+    }
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    float result;
+    _mm_store_ss(&result, s);
+    return result;
+}
+
+// Keep original ggml-style version for A/B comparison
 static inline __m256 ggml_mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
@@ -246,6 +290,14 @@ static void debug_check(const char *name, vec_dot_fn fn,
             float scale = fp16_to_fp32(x[bb].d) * fp16_to_fp32(y[bb].d);
             printf("      qs_dot=%d  scale=%f  exact_contrib=%f\n",
                    qs_dot, scale, (float)((double)qs_dot * (double)scale));
+            // Check for sign_epi8 overflow (y=-128, x<0)
+            int overflow_count = 0;
+            for (int j = 0; j < QK8_0; j++)
+                if (x[bb].qs[j] < 0 && y[bb].qs[j] == -128) overflow_count++;
+            if (overflow_count > 0)
+                printf("      *** ROOT CAUSE: %d byte(s) with y=-128 AND x<0 -> "
+                       "sign_epi8 overflow (-(-128)=128 wraps to -128 in int8)\n",
+                       overflow_count);
         }
         fflush(stdout);
     }
@@ -280,12 +332,48 @@ static int self_test(void) {
     printf("  AVX2 (fallback sign):  %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     ok = ok && (d < 1e-3f);
     }
+    {
+    float r = vec_dot_avx2_signext(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX2 (sign-extension): %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
 #endif
 #if defined(__AVX512VNNI__)
     {
     float r = vec_dot_avx512_vnni(&xb, &yb, 1);
     float d = fabsf(r - expected);
     printf("  AVX-512 VNNI:          %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
+#endif
+
+    // Test with y=-128 to expose sign_epi8 overflow bug
+    printf("\n  Stress test (y=-128, x<0):\n");
+    xb.d = 0x3c00; yb.d = 0x3c00;
+    memset(xb.qs, -105, QK8_0); // all x < 0
+    memset(yb.qs, -128, QK8_0); // all y = -128
+    float str_expected = vec_dot_scalar(&xb, &yb, 1);
+    printf("    scalar ref:          %f\n", str_expected);
+#if defined(__AVX2__)
+    {
+    float r = vec_dot_avx2_ggml(&xb, &yb, 1);
+    float d = fabsf(r - str_expected);
+    printf("    AVX2 (ggml sign):     %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
+    {
+    float r = vec_dot_avx2_signext(&xb, &yb, 1);
+    float d = fabsf(r - str_expected);
+    printf("    AVX2 (sign-extension):%f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
+#endif
+#if defined(__AVX512VNNI__)
+    {
+    float r = vec_dot_avx512_vnni(&xb, &yb, 1);
+    float d = fabsf(r - str_expected);
+    printf("    AVX-512 VNNI:         %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
     ok = ok && (d < 1e-3f);
     }
 #endif
@@ -414,6 +502,7 @@ int main(void) {
 #if defined(__AVX2__)
         bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, &all_pass);
         bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, &all_pass);
+        bench("AVX2 sign-ext",  vec_dot_avx2_signext, x, y, nb, expected, &all_pass);
 #endif
 #if defined(__AVX512VNNI__)
         bench("AVX-512 VNNI", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
