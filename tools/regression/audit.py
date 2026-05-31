@@ -1,20 +1,20 @@
-#!/usr/bin/env python3
 """CLI entry point for GGML regression audit.
 
 Usage:
-    python tools/regression/audit.py <baseline_commit> [--head HEAD] [--files FILE...] [--runtime]
+    python tools/regression/audit.py <baseline_commit> [--head HEAD] [--files FILE...] [--runtime] [--cuda]
 """
 
 import argparse
 import html
-import subprocess
-import json
+import importlib
+import inspect
 import os
+import pkgutil
+import subprocess
 import sys
 
-# Add project root to path so `from tools.regression.*` imports work
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))  # tools/regression/../.. = project root
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 from pathlib import Path
@@ -24,13 +24,15 @@ REPORT_DIR = Path(__file__).parent / "report"
 
 def render_html(report: dict) -> str:
     """Build a flat HTML report from structured findings dict."""
-    lines = ["<!DOCTYPE html><html><head><meta charset='utf-8'><title>GGML Regression Audit</title>",
-             "<style>body{font-family:monospace;max-width:960px;margin:auto;padding:2em}"
-             ".critical{color:#c00;font-weight:bold}.warning{color:#c60}table{border-collapse:collapse;width:100%}"
-             "td,th{border:1px solid #ccc;padding:4px 8px;text-align:left}"
-             "th{background:#eee}</style></head><body>",
-             f"<h1>GGML Regression Audit</h1>",
-             f"<p>Baseline: {report.get('baseline', '?')} | Head: {report.get('head', '?')}</p>"]
+    lines = [
+        "<!DOCTYPE html><html><head><meta charset='utf-8'><title>GGML Regression Audit</title>",
+        "<style>body{font-family:monospace;max-width:960px;margin:auto;padding:2em}"
+        ".critical{color:#c00;font-weight:bold}.warning{color:#c60}table{border-collapse:collapse;width:100%}"
+        "td,th{border:1px solid #ccc;padding:4px 8px;text-align:left}"
+        "th{background:#eee}</style></head><body>",
+        f"<h1>GGML Regression Audit</h1>",
+        f"<p>Baseline: {report.get('baseline', '?')} | Head: {report.get('head', '?')}</p>",
+    ]
 
     if report.get("critical"):
         lines += ["<h2 class='critical'>Critical Issues</h2><ul>"]
@@ -40,7 +42,10 @@ def render_html(report: dict) -> str:
 
     passes = report.get("passes", {})
     for name, data in passes.items():
-        lines.append(f"<h2>Pass: {html.escape(name)}</h2>")
+        if name.startswith("cuda_") and data is None:
+            continue
+        display_name = name.replace("_", " ").title()
+        lines.append(f"<h2>Pass: {html.escape(display_name)}</h2>")
         if data is None:
             lines.append("<p>skipped</p>")
         elif isinstance(data, str):
@@ -49,14 +54,18 @@ def render_html(report: dict) -> str:
             if not data:
                 lines.append("<p>No issues found.</p>")
             else:
-                lines += ["<table><tr><th>Flag</th><th>Baseline</th><th>Head</th><th>Severity</th></tr>"]
+                lines += [
+                    "<table><tr><th>Flag</th><th>Baseline</th><th>Head</th><th>Severity</th></tr>"
+                ]
                 for row in data:
                     sev = row.get("severity", "info")
                     cls = f" class='{sev}'" if sev in ("critical", "warning") else ""
-                    lines.append(f"<tr{cls}><td>{html.escape(str(row.get('flag','')))}</td>"
-                                 f"<td>{html.escape(str(row.get('baseline','')))}</td>"
-                                 f"<td>{html.escape(str(row.get('head','')))}</td>"
-                                 f"<td>{sev}</td></tr>")
+                    lines.append(
+                        f"<tr{cls}><td>{html.escape(str(row.get('flag','')))}</td>"
+                        f"<td>{html.escape(str(row.get('baseline','')))}</td>"
+                        f"<td>{html.escape(str(row.get('head','')))}</td>"
+                        f"<td>{sev}</td></tr>"
+                    )
                 lines.append("</table>")
         else:
             lines.append(f"<pre>{html.escape(str(data))}</pre>")
@@ -65,39 +74,138 @@ def render_html(report: dict) -> str:
     return "\n".join(lines)
 
 
+def _discover_cuda_passes():
+    """Discover pass_cuda_*.py modules in the regression directory.
+
+    Returns dict mapping pass name -> (module, run_function).
+    """
+    cuda_passes = {}
+    reg_dir = os.path.dirname(os.path.abspath(__file__))
+    for importer, modname, ispkg in pkgutil.iter_modules([reg_dir]):
+        if modname.startswith("pass_cuda_") and not ispkg:
+            mod = importlib.import_module(f"tools.regression.{modname}")
+            for name, obj in inspect.getmembers(mod, inspect.isfunction):
+                if name.startswith("run_"):
+                    cuda_passes[modname] = (mod, obj)
+                    break
+    return cuda_passes
+
+
 def main():
-    parser = argparse.ArgumentParser(description="GGML regression audit against a known-good baseline")
+    parser = argparse.ArgumentParser(
+        description="GGML regression audit against a known-good baseline"
+    )
     parser.add_argument("baseline", help="Baseline commit hash (known-good)")
-    parser.add_argument("--head", default="HEAD", help="Head revision to compare (default: HEAD)")
-    parser.add_argument("--files", nargs="*", help="Limit audit to specific files (default: all hot-path files)")
-    parser.add_argument("--runtime", action="store_true", help="Run runtime microbenchmarks (requires builds)")
-    parser.add_argument("--build-dir-baseline", default=None, help="Path to baseline build dir (for config.h)")
-    parser.add_argument("--build-dir-head", default=None, help="Path to HEAD build dir (for config.h)")
+    parser.add_argument(
+        "--head", default="HEAD", help="Head revision to compare (default: HEAD)"
+    )
+    parser.add_argument(
+        "--files",
+        nargs="*",
+        help="Limit audit to specific files (default: all hot-path files)",
+    )
+    parser.add_argument(
+        "--runtime",
+        action="store_true",
+        help="Run runtime microbenchmarks (requires builds)",
+    )
+    parser.add_argument(
+        "--cuda", action="store_true", help="Run CUDA-specific regression passes (requires GPU)"
+    )
+    parser.add_argument(
+        "--cuda-bench",
+        default=None,
+        help="Path to cuda_bench binary (default: tools/regression/cuda_bench)",
+    )
+    parser.add_argument(
+        "--build-dir-baseline",
+        default=None,
+        help="Path to baseline build dir (for config.h)",
+    )
+    parser.add_argument(
+        "--build-dir-head",
+        default=None,
+        help="Path to HEAD build dir (for config.h)",
+    )
     args = parser.parse_args()
 
-    report = {"baseline": args.baseline, "head": args.head, "warnings": [], "critical": [], "passes": {}}
+    report = {
+        "baseline": args.baseline,
+        "head": args.head,
+        "warnings": [],
+        "critical": [],
+        "passes": {},
+    }
 
     print(f"Baseline: {args.baseline}  Head: {args.head}")
 
     from tools.regression.pass_flags import run_flags_pass
-    report["passes"]["flags"] = run_flags_pass(args.baseline, args.head,
-                                                args.build_dir_baseline, args.build_dir_head,
-                                                report["critical"], report["warnings"])
+
+    report["passes"]["flags"] = run_flags_pass(
+        args.baseline,
+        args.head,
+        args.build_dir_baseline,
+        args.build_dir_head,
+        report["critical"],
+        report["warnings"],
+    )
 
     from tools.regression.pass_compiler import run_compiler_pass
-    report["passes"]["compiler"] = run_compiler_pass(args.build_dir_baseline, args.build_dir_head,
-                                                      report["critical"], report["warnings"])
+
+    report["passes"]["compiler"] = run_compiler_pass(
+        args.build_dir_baseline,
+        args.build_dir_head,
+        report["critical"],
+        report["warnings"],
+    )
 
     from tools.regression.pass_code import run_code_pass
-    report["passes"]["code"] = run_code_pass(args.baseline, args.head, args.files,
-                                              report["critical"], report["warnings"])
+
+    report["passes"]["code"] = run_code_pass(
+        args.baseline,
+        args.head,
+        args.files,
+        report["critical"],
+        report["warnings"],
+    )
 
     if args.runtime:
         from tools.regression.pass_runtime import run_runtime_pass
-        report["passes"]["runtime"] = run_runtime_pass(args.baseline, args.head,
-                                                        report["critical"], report["warnings"])
+
+        report["passes"]["runtime"] = run_runtime_pass(
+            args.baseline,
+            args.head,
+            report["critical"],
+            report["warnings"],
+        )
     else:
         report["passes"]["runtime"] = None
+
+    # CUDA optional passes
+    cuda_passes = _discover_cuda_passes()
+    if args.cuda:
+        if not cuda_passes:
+            print("  No CUDA passes discovered (pass_cuda_*.py not found)")
+        for modname, (mod, run_fn) in cuda_passes.items():
+            pass_name = modname.replace("pass_", "")
+            print(f"  Running CUDA pass: {pass_name}")
+            sig = inspect.signature(run_fn)
+            extra_kwargs = {}
+            if "binary_path" in sig.parameters:
+                bench_path = args.cuda_bench or os.path.join(
+                    os.path.dirname(__file__), "cuda_bench"
+                )
+                extra_kwargs["binary_path"] = bench_path
+            report["passes"][pass_name] = run_fn(
+                args.baseline,
+                args.head,
+                report["critical"],
+                report["warnings"],
+                **extra_kwargs,
+            )
+    else:
+        for modname in cuda_passes:
+            report["passes"][modname.replace("pass_", "")] = None
 
     html_out = render_html(report)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
