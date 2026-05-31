@@ -16,6 +16,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "ggml-cuda.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -1111,6 +1113,10 @@ private:
 
             slot.reset();
         }
+
+        // Enable CUDA op tracing for [KV] debug logging
+        // trace is module-level global in ggml-cuda.cu, no per-backend handle needed
+        ggml_backend_cuda_set_trace_ops(nullptr, true);
 
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
@@ -3191,6 +3197,17 @@ private:
             const int ret = llama_decode(ctx_tgt, batch_view);
 
             metrics.on_decoded(slots);
+
+            // [KV][CUDA] per-decode op trace (ngl=0 leak detection)
+            if (ret == 0 && params_base.n_gpu_layers == 0) {
+                int n_ops = 0;
+                const char * ops = ggml_backend_cuda_get_trace_ops(nullptr, &n_ops);
+                if (n_ops > 0) {
+                    SRV_WRN("[KV][CUDA] ngl=%d n_ops=%d ops=%s\n",
+                            params_base.n_gpu_layers, n_ops, ops ? ops : "");
+                    ggml_backend_cuda_reset_trace_ops(nullptr);
+                }
+            }
 
             if (ret != 0) {
                 {
