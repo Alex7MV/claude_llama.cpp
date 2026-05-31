@@ -20,20 +20,30 @@ def get_compiler_version(compiler: str = "cc") -> str:
         return "timeout"
 
 
-def get_effective_feature_macros(compiler: str = "cc") -> dict:
-    """Compile an empty file with -mavx512f -E -dM and extract AVX512/FMA macros."""
+TARGET_MACROS = {"__AVX512F__", "__AVX512CD__", "__AVX512BW__",
+                 "__AVX512DQ__", "__AVX512VL__", "__AVX512VNNI__",
+                 "__AVX512BF16__", "__FMA__", "__AVX2__", "__AVX__",
+                 "__SSE4_2__", "__SSE__"}
+
+FEATURE_FLAGS = {
+    "generic": ["-mavx512f"],
+    "znver4":  ["-mavx512f", "-mavx512vnni", "-mavx512bf16", "-mfma", "-mavx2"],
+}
+
+
+def get_effective_feature_macros(compiler: str = "cc",
+                                  march: str = "generic") -> dict:
+    """Compile an empty file with -E -dM and extract AVX512/FMA macros."""
     macros = {}
+    flags = FEATURE_FLAGS.get(march, FEATURE_FLAGS["generic"])
     try:
         r = subprocess.run(
-            [compiler, "-mavx512f", "-E", "-dM", "-"],
+            [compiler] + flags + ["-E", "-dM", "-"],
             input="#include <cstdint>\n", capture_output=True, text=True, timeout=10,
         )
         for line in r.stdout.splitlines():
             m = re.match(r'#define\s+(\w+)\s+(\S+)', line)
-            if m and m.group(1) in ("__AVX512F__", "__AVX512CD__", "__AVX512BW__",
-                                     "__AVX512DQ__", "__AVX512VL__", "__AVX512VNNI__",
-                                     "__AVX512BF16__", "__FMA__", "__AVX2__", "__AVX__",
-                                     "__SSE4_2__", "__SSE__"):
+            if m and m.group(1) in TARGET_MACROS:
                 macros[m.group(1)] = m.group(2)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -105,10 +115,14 @@ def run_compiler_pass(build_dir_baseline: str = None,
         lines.append(f"\n  {msg}")
         warnings.append(msg)
 
-    macros = get_effective_feature_macros()
+    head_march = "znver4" if head_comp == "AOCC" else "generic"
+    head_cc = _resolve_compiler(build_dir_head) if build_dir_head else "cc"
+    macros = get_effective_feature_macros(head_cc, head_march)
     if macros:
-        lines.append(f"\nEffective AVX512 feature macros (HEAD):")
+        lines.append(f"\nEffective feature macros ({head_comp} {head_march}):")
         for k, v in sorted(macros.items()):
             lines.append(f"  {k} = {v}")
+        if "__AVX512VNNI__" not in macros:
+            warnings.append("__AVX512VNNI__ not defined — Q8_0 VNNI kernel won't compile")
 
     return "\n".join(lines)
