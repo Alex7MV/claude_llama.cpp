@@ -245,6 +245,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/x86/quants.c
             ggml-cpu/arch/x86/repack.cpp
+            ggml-cpu/arch/x86/epyc-cpu.c
             )
 
         if (MSVC)

@@ -298,6 +298,36 @@ include(GNUInstallDirs)
 # build the library
 #
 
+#
+# AOCC (AMD Optimizing Compiler) auto-detection
+# Enables -march=znver4 and all Zen4 AVX-512 feature flags
+# when building with AMD's AOCC compiler.
+#
+if (NOT MSVC)
+    execute_process(
+        COMMAND ${CMAKE_C_COMPILER} --version
+        OUTPUT_VARIABLE GGML_CC_VERSION
+        ERROR_QUIET
+    )
+    if (GGML_CC_VERSION MATCHES "AMD|AOCC")
+        message(STATUS "GGML: AOCC detected — enabling Zen4 optimizations (GGML_USE_AOCC)")
+        set(GGML_USE_AOCC TRUE CACHE BOOL "ggml: enable AOCC-specific optimizations")
+        # Auto-enable all Zen4 AVX-512 features (user can still override)
+        if (NOT INS_ENB)
+            set(GGML_F16C   ON CACHE BOOL "" FORCE)
+            set(GGML_FMA    ON CACHE BOOL "" FORCE)
+            set(GGML_AVX2   ON CACHE BOOL "" FORCE)
+            set(GGML_BMI2   ON CACHE BOOL "" FORCE)
+            set(GGML_AVX512 ON CACHE BOOL "" FORCE)
+            set(GGML_AVX512_VBMI ON CACHE BOOL "" FORCE)
+            set(GGML_AVX512_VNNI ON CACHE BOOL "" FORCE)
+            set(GGML_AVX512_BF16 ON CACHE BOOL "" FORCE)
+        endif()
+    else()
+        set(GGML_USE_AOCC FALSE CACHE BOOL "ggml: enable AOCC-specific optimizations")
+    endif()
+endif()
+
 add_subdirectory(src)
 
 #
@@ -410,6 +440,9 @@ target_compile_definitions(ggml-base PRIVATE
     GGML_VERSION="${GGML_INSTALL_VERSION}"
     GGML_COMMIT="${GGML_BUILD_COMMIT}"
 )
+if (GGML_USE_AOCC)
+    target_compile_definitions(ggml-base PRIVATE GGML_USE_AOCC)
+endif()
 message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
