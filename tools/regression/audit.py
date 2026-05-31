@@ -6,6 +6,7 @@ Usage:
 """
 
 import argparse
+import html
 import subprocess
 import json
 import os
