@@ -404,7 +404,7 @@ task_params server_task::params_from_json_cmpl(
                 // Stored for lazy compilation by the gen_phase sampler when <|call|> is detected.
                 params.sampling.tool_call_grammar_str = std::move(grammar_str);
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_NONE, ""};
-                SRV_DBG("Tool-call grammar stored for lazy gen_phase compilation\n");
+                SRV_DBG("%s", "Tool-call grammar stored for lazy gen_phase compilation\n");
             } else {
                 // explicit grammar from the user (API field "grammar")
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
@@ -417,7 +417,7 @@ task_params server_task::params_from_json_cmpl(
             std::string tool_grammar = json_value(data, "tool_call_grammar", std::string());
             if (!tool_grammar.empty()) {
                 params.sampling.tool_call_grammar_str = std::move(tool_grammar);
-                SRV_DBG("Tool-call grammar from metadata stored for lazy compilation\n");
+                SRV_DBG("%s", "Tool-call grammar from metadata stored for lazy compilation\n");
             }
         }
 

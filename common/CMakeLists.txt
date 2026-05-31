@@ -75,6 +75,8 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    gen_phase.cpp
+    gen_phase.h
     hf-cache.cpp
     hf-cache.h
     http.h
