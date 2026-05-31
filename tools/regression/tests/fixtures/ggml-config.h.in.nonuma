@@ -1,0 +1,3 @@
+#cmakedefine GGML_AVX512
+#cmakedefine GGML_FMA
+#cmakedefine GGML_F16C

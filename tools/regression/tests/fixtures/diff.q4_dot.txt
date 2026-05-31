@@ -1,0 +1,8 @@
+--- a/ops.cpp
++++ b/ops.cpp
+@@ -100,5 +100,7 @@
+ static void ggml_compute_forward_mul_mat(...) {
+     const int64_t ne00 = src0->ne[0];
+-    for (int64_t i = 0; i < ne00; i++) { vec_dot(...) }
++    for (int64_t i = 0; i < ne01; i++) { vec_dot(...) }
+ }

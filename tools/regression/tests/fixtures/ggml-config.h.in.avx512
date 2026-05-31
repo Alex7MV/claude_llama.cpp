@@ -1,0 +1,6 @@
+#cmakedefine GGML_AVX512
+#cmakedefine GGML_AVX512_VNNI
+#cmakedefine GGML_AVX512_BF16
+#cmakedefine GGML_FMA
+#cmakedefine GGML_F16C
+#cmakedefine GGML_NUMA

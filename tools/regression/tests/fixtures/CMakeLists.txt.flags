@@ -1,0 +1,5 @@
+# Minimal CMakeLists.txt for unit tests
+option(GGML_AVX512   "ggml: enable AVX512F" OFF)
+option(GGML_FMA      "ggml: enable FMA"     ON)
+option(GGML_NUMA     "ggml: enable NUMA"    ON)
+option(GGML_AVX2     "ggml: enable AVX2"    ON)
