@@ -785,6 +785,55 @@ int main(void) {
     printf("AVX2:          YES\n");
 #endif
     printf("----------------------------------------\n");
+
+    if (self_test() != 0) {
+        printf("Self-test FAILED\n");
+        return 1;
+    }
+
+    // Enable debug for the failing case
+    debug_on = 1;
+
+    // Test sizes: small (L1) to large (L3/DRAM)
+    const int test_nb[] = {8, 64, 256, 1024, 4096, 16384, 65536};
+    const int num_sizes = sizeof(test_nb) / sizeof(test_nb[0]);
+
+    // all_pass only tracks CORRECT implementations (sign-ext, VNNI).
+    // ggml-sign and fallback are reference-only (known bug with y=-128).
+    int all_pass = 1;
+
+    // Q8_0 × Q8_0 benchmark
+    for (int si = 0; si < num_sizes; si++) {
+        int nb = test_nb[si];
+        int n  = nb * QK8_0;
+
+        block_q8_0 *x = malloc(sizeof(block_q8_0) * nb);
+        block_q8_0 *y = malloc(sizeof(block_q8_0) * nb);
+        if (!x || !y) { fprintf(stderr, "OOM\n"); return 1; }
+
+        fill_blocks(x, nb, 42);
+        fill_blocks(y, nb, 12345);
+
+        float expected = vec_dot_scalar(x, y, nb);
+
+        printf("\nn=%5d (%4d blocks):\n", n, nb);
+
+#if defined(__AVX2__)
+        bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, NULL);
+        bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, NULL);
+        bench("AVX2 sign-ext",  vec_dot_avx2_signext, x, y, nb, expected, &all_pass);
+#endif
+#if defined(__AVX512VNNI__)
+        bench("AVX-512 VNNI v1", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
+        bench("AVX-512 VNNI v2", vec_dot_avx512_vnni_v2, x, y, nb, expected, &all_pass);
+        bench("AVX-512 VNNI v3", vec_dot_avx512_vnni_v3, x, y, nb, expected, &all_pass);
+#endif
+
+        free(x);
+        free(y);
+    }
+
+    printf("\n----------------------------------------\n");
     printf("All tests: %s\n", all_pass ? "PASS" : "FAIL");
 
     // -------------------------------------------------------------
@@ -859,52 +908,6 @@ int main(void) {
 
         free(qx);
         free(qy);
-    }
-
-    printf("\n----------------------------------------\n");
-    printf("All tests: %s\n", all_pass ? "PASS" : "FAIL");
-    return all_pass ? 0 : 1;
-}
-
-    // Enable debug for the failing case
-    debug_on = 1;
-
-    // Test sizes: small (L1) to large (L3/DRAM)
-    const int test_nb[] = {8, 64, 256, 1024, 4096, 16384, 65536};
-    const int num_sizes = sizeof(test_nb) / sizeof(test_nb[0]);
-
-    // all_pass only tracks CORRECT implementations (sign-ext, VNNI).
-    // ggml-sign and fallback are reference-only (known bug with y=-128).
-    int all_pass = 1;
-
-    for (int si = 0; si < num_sizes; si++) {
-        int nb = test_nb[si];
-        int n  = nb * QK8_0;
-
-        block_q8_0 *x = malloc(sizeof(block_q8_0) * nb);
-        block_q8_0 *y = malloc(sizeof(block_q8_0) * nb);
-        if (!x || !y) { fprintf(stderr, "OOM\n"); return 1; }
-
-        fill_blocks(x, nb, 42);
-        fill_blocks(y, nb, 12345);
-
-        float expected = vec_dot_scalar(x, y, nb);
-
-        printf("\nn=%5d (%4d blocks):\n", n, nb);
-
-#if defined(__AVX2__)
-        bench("AVX2 ggml-sign", vec_dot_avx2_ggml, x, y, nb, expected, NULL);
-        bench("AVX2 fallback",  vec_dot_avx2_fallback, x, y, nb, expected, NULL);
-        bench("AVX2 sign-ext",  vec_dot_avx2_signext, x, y, nb, expected, &all_pass);
-#endif
-#if defined(__AVX512VNNI__)
-        bench("AVX-512 VNNI v1", vec_dot_avx512_vnni, x, y, nb, expected, &all_pass);
-        bench("AVX-512 VNNI v2", vec_dot_avx512_vnni_v2, x, y, nb, expected, &all_pass);
-        bench("AVX-512 VNNI v3", vec_dot_avx512_vnni_v3, x, y, nb, expected, &all_pass);
-#endif
-
-        free(x);
-        free(y);
     }
 
     printf("\n----------------------------------------\n");
