@@ -193,7 +193,7 @@ void ggml_vec_dot_q8_0_q8_0_avx512_vnni(
 //   corr = dpbusd({8}_u8, q8)               = 8 × Σ (q8)
 //   result = dot - corr                      = Σ ((nibble-8) × q8)
 // ---------------------------------------------------------------
-#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX512VNNI__)
 
 void ggml_vec_dot_q4_0_q8_0_avx512_vnni(
         int n, float * GGML_RESTRICT s, size_t bs,
@@ -243,5 +243,4 @@ void ggml_vec_dot_q4_0_q8_0_avx512_vnni(
     *s = _mm_cvtss_f32(s128);
 }
 
-#endif /* __AVX512VNNI__ && __AVX512VL__ */
 #endif /* __AVX512VNNI__ */

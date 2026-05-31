@@ -468,6 +468,7 @@ static float vec_dot_avx512_vnni_v3(const block_q8_0 *x, const block_q8_0 *y, in
 #endif
 
 // ---------------------------------------------------------------
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 // Q4_0 × Q8_0 AVX-512 VNNI vec_dot
 //
 // Same dpbusd-based approach as Q8_0 v3:
