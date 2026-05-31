@@ -768,6 +768,7 @@ private:
             return;
         }
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
+        kv_trace(slot, KV_TRACE_SLOT_CACHED, "");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
@@ -1407,6 +1408,7 @@ private:
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                kv_trace(slot, KV_TRACE_IDLE_SLOT_PURGE, "");
 
                 slot.prompt_clear(false);
 
@@ -2413,6 +2415,11 @@ private:
                 const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "n_keep=%d n_discard=%d n_left=%d", n_keep, n_discard, n_left);
+                    kv_trace(slot, KV_TRACE_CONTEXT_SHIFT, buf);
+                }
 
                 common_context_seq_rm (ctx_tgt, slot.id, n_keep            , n_keep + n_discard);
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
@@ -2683,11 +2690,21 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                {
+                                    char buf[128];
+                                    snprintf(buf, sizeof(buf), "common=%d total=%d", n_past, (int)input_tokens.size());
+                                    kv_trace(slot, KV_TRACE_PREFIX_MISMATCH, buf);
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
+                                    {
+                                        char buf[128];
+                                        snprintf(buf, sizeof(buf), "capped_at=%d", slot.alora_invocation_start - 1);
+                                        kv_trace(slot, KV_TRACE_ALORA_BOUNDARY, buf);
+                                    }
                                 }
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
@@ -2753,10 +2770,16 @@ private:
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+                                    {
+                                        char buf[128];
+                                        snprintf(buf, sizeof(buf), "n_past=%d", n_past);
+                                        kv_trace(slot, KV_TRACE_CACHE_REUSE_SHIFT, buf);
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                kv_trace(slot, KV_TRACE_NO_CACHE_PROMPT, "");
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -2844,6 +2867,7 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        kv_trace(slot, KV_TRACE_NO_CHECKPOINT, "");
                                     }
                                 }
                             }
@@ -2867,6 +2891,11 @@ private:
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+                            {
+                                char buf[128];
+                                snprintf(buf, sizeof(buf), "was=%d now=%d", n_past + 1, n_past);
+                                kv_trace(slot, KV_TRACE_MIN_ONE_EVAL, buf);
+                            }
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
