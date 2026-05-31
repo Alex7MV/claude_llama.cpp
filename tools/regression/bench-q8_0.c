@@ -272,13 +272,15 @@ static float vec_dot_avx512_vnni_v2(const block_q8_0 *x, const block_q8_0 *y, in
 
         __m256 f0 = _mm256_cvtepi32_ps(d0);
         __m256 f1 = _mm256_cvtepi32_ps(d1);
-        __m512 fdot = _mm512_insertf64x4(_mm512_castps256_ps512(f0), f1, 1);
+        __m512i fdot_i = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castps_si256(f0)), _mm256_castps_si256(f1), 1);
+        __m512 fdot = _mm512_castsi512_ps(fdot_i);
 
         float s0 = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
         float s1 = fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d);
         __m256 slo = _mm256_set1_ps(s0);
         __m256 shi = _mm256_set1_ps(s1);
-        __m512 scale = _mm512_insertf64x4(_mm512_castps256_ps512(slo), shi, 1);
+        __m512i scale_i = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_castps_si256(slo)), _mm256_castps_si256(shi), 1);
+        __m512 scale = _mm512_castsi512_ps(scale_i);
 
         acc = _mm512_fmadd_ps(scale, fdot, acc);
     }
@@ -290,7 +292,7 @@ static float vec_dot_avx512_vnni_v2(const block_q8_0 *x, const block_q8_0 *y, in
         total += (float)sumi * (fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
     }
 
-    __m256 hi = _mm512_extractf64x4_ps(acc, 1);
+    __m256 hi = _mm256_castsi256_ps(_mm512_extracti64x4_epi64(_mm512_castps_si512(acc), 1));
     __m256 lo = _mm512_castps512_ps256(acc);
     __m256 s256 = _mm256_add_ps(lo, hi);
     __m128 bot = _mm256_castps256_ps128(s256);
