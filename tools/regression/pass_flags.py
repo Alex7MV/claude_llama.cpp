@@ -41,9 +41,13 @@ def check_config_h_propagation(config_h_text: str, expected_flags: list) -> dict
 
 
 def parse_cmake_options(text: str) -> dict:
-    """Extract option(name default_value) from CMakeLists.txt content."""
+    """Extract option() defaults and set(... CACHE ... FORCE) overrides."""
     flags = {}
+    # option(name desc default) — always ON or OFF
     for match in re.finditer(r'^\s*option\s*\(\s*(\w+)\s+[^)]+\s+(ON|OFF)\s*\)', text, re.MULTILINE):
+        flags[match.group(1)] = match.group(2)
+    # set(name ON|OFF CACHE ... FORCE) — overrides option() defaults
+    for match in re.finditer(r'^\s*set\s*\(\s*(\w+)\s+(ON|OFF)\s+CACHE\s', text, re.MULTILINE):
         flags[match.group(1)] = match.group(2)
     return flags
 
