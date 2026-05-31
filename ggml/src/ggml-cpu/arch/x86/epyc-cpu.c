@@ -10,6 +10,8 @@
 #include <immintrin.h>
 #include <assert.h>
 
+#define UNUSED GGML_UNUSED
+
 // ---------------------------------------------------------------
 // AVX-512 VNNI vec_dot for Q8_0 (signed INT8 x signed INT8)
 // ---------------------------------------------------------------

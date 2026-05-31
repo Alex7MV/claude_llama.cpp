@@ -11,3 +11,10 @@
 //   - ggml_cpu_init_dual_threadpool()
 
 #include "ggml-cpu.h"
+
+int ggml_cpu_init_dual_threadpool_epyc(
+    struct ggml_threadpool_params params[],
+    int max_params,
+    int n_threads,
+    enum ggml_sched_priority prio,
+    uint32_t poll);
