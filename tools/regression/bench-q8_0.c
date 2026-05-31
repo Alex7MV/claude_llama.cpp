@@ -194,6 +194,7 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
 // ---------------------------------------------------------------
 // Debug: verbose per-block comparison on failing case
 // ---------------------------------------------------------------
+typedef float (*vec_dot_fn)(const block_q8_0 *, const block_q8_0 *, int);
 static int debug_on = 0;
 
 static void debug_check(const char *name, vec_dot_fn fn,
@@ -248,22 +249,27 @@ static int self_test(void) {
     printf("  scalar ref:            %f\n", expected);
 
     int ok = 1;
-    float r;
 #if defined(__AVX2__)
-    r = vec_dot_avx2_ggml(&xb, &yb, 1);
-    float diff = fabsf(r - expected);
-    printf("  AVX2 (ggml sign):      %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (diff < 1e-3f);
-    r = vec_dot_avx2_fallback(&xb, &yb, 1);
-    diff = fabsf(r - expected);
-    printf("  AVX2 (fallback sign):  %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (diff < 1e-3f);
+    {
+    float r = vec_dot_avx2_ggml(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX2 (ggml sign):      %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
+    {
+    float r = vec_dot_avx2_fallback(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX2 (fallback sign):  %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
 #endif
 #if defined(__AVX512VNNI__)
-    r = vec_dot_avx512_vnni(&xb, &yb, 1);
-    float diff = fabsf(r - expected);
-    printf("  AVX-512 VNNI:          %f  (diff=%g)  %s\n", r, diff, diff < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (diff < 1e-3f);
+    {
+    float r = vec_dot_avx512_vnni(&xb, &yb, 1);
+    float d = fabsf(r - expected);
+    printf("  AVX-512 VNNI:          %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    ok = ok && (d < 1e-3f);
+    }
 #endif
     printf("\n");
     return ok ? 0 : 1;
@@ -289,8 +295,6 @@ static void fill_blocks(block_q8_0 *blocks, int nb, unsigned seed) {
         }
     }
 }
-
-typedef float (*vec_dot_fn)(const block_q8_0 *, const block_q8_0 *, int);
 
 static void bench(const char *name, vec_dot_fn fn,
                   const block_q8_0 *x, const block_q8_0 *y, int nb,
