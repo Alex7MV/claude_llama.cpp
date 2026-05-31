@@ -1094,12 +1094,10 @@ json oaicompat_chat_params_parse(
     // The gen_phase sampler compiles it lazily when <|call|> is detected.
     if (!chat_params.grammar.empty()) {
         llama_params["tool_call_grammar"] = chat_params.grammar;
-    }
-
-    // grammar_lazy/triggers/preserved_tokens are only relevant for non-tool-call grammars.
-    // When a tool-call grammar is present (from chat template), these are not needed
-    // because the gen_phase state machine handles activation.
-    if (chat_params.grammar.empty()) {
+    } else {
+        // grammar_lazy/triggers/preserved_tokens are only relevant for non-tool-call grammars.
+        // When a tool-call grammar is present (from chat template), these are not needed
+        // because the gen_phase state machine handles activation.
         llama_params["grammar_lazy"] = chat_params.grammar_lazy;
         auto grammar_triggers = json::array();
         for (const auto & trigger : chat_params.grammar_triggers) {
@@ -1108,8 +1106,10 @@ json oaicompat_chat_params_parse(
         }
         llama_params["grammar_triggers"]  = grammar_triggers;
         llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
-        llama_params["generation_prompt"] = chat_params.generation_prompt;
     }
+
+    // generation_prompt is always set — used for grammar prefill AND reasoning budget init
+    llama_params["generation_prompt"] = chat_params.generation_prompt;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }
