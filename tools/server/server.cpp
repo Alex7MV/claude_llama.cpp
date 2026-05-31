@@ -8,6 +8,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gen_phase.h"
 #include "llama.h"
 #include "log.h"
 
@@ -298,6 +299,24 @@ int llama_server(int argc, char ** argv) {
             }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
+        }
+
+        // Resolve generation phase marker tokens from the model vocab.
+        // This enables the gen_phase state machine (TEXT/REASONING/TOOL_INVOCATION)
+        // for models with known marker tokens (DeepSeek, Kimi, etc.).
+        {
+            auto * ctx = ctx_server.get_llama_context();
+            if (ctx) {
+                auto gen_tokens = resolve_model_signatures(llama_get_model(ctx));
+                params.sampling.gen_phase_tokens = gen_tokens;
+
+                if (gen_tokens.id_call != LLAMA_TOKEN_NULL) {
+                    SRV_INF("gen-phase: state machine enabled (call=%d, thought=%d, end=%d)\n",
+                            gen_tokens.id_call, gen_tokens.id_thought, gen_tokens.id_end);
+                } else {
+                    SRV_INF("gen-phase: no markers found, state machine disabled (pass-through)\n");
+                }
+            }
         }
 
         routes.update_meta(ctx_server);

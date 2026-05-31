@@ -114,6 +114,7 @@ struct common_sampler {
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
+    struct llama_sampler * gen_phase;
 
     ring_buffer<llama_token> prev;
 
@@ -193,9 +194,20 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * gen_phase = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
+
+    // R4: Gen-phase state machine sampler — MUST be first in chain.
+    // It masks <|call|> tokens before any distribution-transform samplers.
+    // R6: If no markers found, sampler_gen_phase_init returns a no-op pass-through.
+    if (params.gen_phase_tokens.id_call != LLAMA_TOKEN_NULL || params.gen_phase_tokens.id_thought != LLAMA_TOKEN_NULL) {
+        gen_phase = sampler_gen_phase_init(vocab, params.gen_phase_tokens, params.tool_call_grammar_str);
+        if (gen_phase) {
+            samplers.push_back(gen_phase);
+        }
+    }
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
     if (grammar_str.compare(0, 11, "%llguidance") == 0) {
@@ -399,10 +411,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
+        /* .params    = */ params,
+        /* .grmr      = */ grmr,
+        /* .rbudget   = */ rbudget,
+        /* .chain     = */ chain,
+        /* .gen_phase = */ gen_phase,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
@@ -418,6 +431,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
 
     llama_sampler_free(gsmpl->grmr);
     llama_sampler_free(gsmpl->rbudget);
+    llama_sampler_free(gsmpl->gen_phase);
     llama_sampler_free(gsmpl->chain);
 
     delete gsmpl;
@@ -467,17 +481,31 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     }
 
     gsmpl->reset();
+
+    // R3: Reset gen_phase state machine to TEXT when sampler is reset.
+    // This handles slot reuse across requests.
+    if (gsmpl->gen_phase) {
+        sampler_gen_phase_reset(gsmpl->gen_phase);
+    }
+}
+
+void common_sampler_reset_phase(struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->gen_phase) {
+        return;
+    }
+    sampler_gen_phase_reset(gsmpl->gen_phase);
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params    = */ gsmpl->params,
+        /* .grmr      = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget   = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain     = */ llama_sampler_clone(gsmpl->chain),
+        /* .gen_phase = */ nullptr,  // gen_phase is not cloned (server-only feature for tool-call isolation)
+        /* .prev      = */ gsmpl->prev,
+        /* .cur       = */ gsmpl->cur,
+        /* .cur_p     = */ gsmpl->cur_p,
     };
 }
 

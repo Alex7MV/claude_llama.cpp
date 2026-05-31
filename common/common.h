@@ -6,6 +6,7 @@
 
 #include "ggml-opt.h"
 #include "ggml.h"
+#include "gen_phase.h"
 
 #include <set>
 #include <sstream>
@@ -279,6 +280,11 @@ struct common_params_sampling {
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
 
     bool backend_sampling = false;
+
+    // Generation phase state machine
+    std::string              model_type          = "auto";  // deepseek | kimi | auto
+    llama_gen_phase_tokens   gen_phase_tokens;              // resolved at load time
+    std::string              tool_call_grammar_str;           // GBNF grammar for tools, compiled lazily
 
     bool has_logit_bias() const {
         return !logit_bias.empty();

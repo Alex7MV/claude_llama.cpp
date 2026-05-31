@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <mutex>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -210,6 +211,12 @@ struct server_slot {
         task.reset();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+
+        // R3: Reset gen_phase state machine to TEXT when slot is reset.
+        // This handles slot reuse, interruption, and n_predict limit.
+        if (smpl) {
+            common_sampler_reset_phase(smpl.get());
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -703,6 +710,12 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+
+    // GBNF compilation cache: json_schema -> GBNF grammar string.
+    // Avoids re-compiling identical schemas (common for MCP repeated tool calls).
+    // R2: Thread-safe access via mutex (server runs multiple slots concurrently).
+    std::unordered_map<std::string, std::string> gbnf_cache;
+    std::mutex                                    gbnf_cache_mtx;
 
     void destroy() {
         spec.reset();

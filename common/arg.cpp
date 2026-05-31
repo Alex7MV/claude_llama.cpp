@@ -3181,6 +3181,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK"));
     add_opt(common_arg(
+        {"--model-type"}, "TYPE",
+        "Model architecture for generation phase state machine token resolution:\n"
+        "  deepseek  — <|thought|>, <|call|> markers\n"
+        "  kimi      — alternative marker tokens\n"
+        "  auto      — probe vocab for known markers (default)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.model_type = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODEL_TYPE"));
+    add_opt(common_arg(
         {"-rea", "--reasoning"}, "[on|off|auto]",
         "Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))",
         [](common_params & params, const std::string & value) {

@@ -400,13 +400,27 @@ task_params server_task::params_from_json_cmpl(
             // grammar_type key is set by the server when converting chat template grammars
             std::string grammar_type = json_value(data, "grammar_type", std::string());
             if (grammar_type == "tool_calls") {
-                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
+                // Tool-call grammar is NOT initialized at init time.
+                // Stored for lazy compilation by the gen_phase sampler when <|call|> is detected.
+                params.sampling.tool_call_grammar_str = std::move(grammar_str);
+                params.sampling.grammar = {COMMON_GRAMMAR_TYPE_NONE, ""};
+                SRV_DBG("Tool-call grammar stored for lazy gen_phase compilation\n");
             } else {
                 // explicit grammar from the user (API field "grammar")
                 params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
+                SRV_DBG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(params.sampling.grammar).c_str());
             }
-            SRV_DBG("Grammar (%s): %s\n", grammar_type.c_str(), common_grammar_value(params.sampling.grammar).c_str());
         }
+
+        // Check for tool_call_grammar passed as metadata (from server-common.cpp)
+        if (params.sampling.tool_call_grammar_str.empty()) {
+            std::string tool_grammar = json_value(data, "tool_call_grammar", std::string());
+            if (!tool_grammar.empty()) {
+                params.sampling.tool_call_grammar_str = std::move(tool_grammar);
+                SRV_DBG("Tool-call grammar from metadata stored for lazy compilation\n");
+            }
+        }
+
         params.sampling.grammar_lazy = json_value(data, "grammar_lazy", defaults.sampling.grammar_lazy);
         SRV_DBG("Grammar lazy: %s\n", params.sampling.grammar_lazy ? "true" : "false");
     }
