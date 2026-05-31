@@ -6,9 +6,16 @@ Usage:
 """
 
 import argparse
-import html
+import subprocess
+import json
 import os
 import sys
+
+# Add project root to path so `from tools.regression.*` imports work
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))  # tools/regression/../.. = project root
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 from pathlib import Path
 
 REPORT_DIR = Path(__file__).parent / "report"
