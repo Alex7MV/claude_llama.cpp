@@ -1,7 +1,6 @@
 // Self-contained Q8_0 vec_dot benchmark for AVX-512 VNNI.
 // Compile with AOCC: clang -O3 -mavx512f -mavx512vnni -mavx512bf16 -mfma -o bench-q8_0 tools/regression/bench-q8_0.c
 // Compile with AVX2:  clang -O3 -mavx2 -mfma -o bench-q8_0_avx2 tools/regression/bench-q8_0.c
-// Compile with GCC:   gcc -O3 -mavx512f -mavx512vnni -o bench-q8_0 tools/regression/bench-q8_0.c
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +55,7 @@ static float vec_dot_scalar(const block_q8_0 *x, const block_q8_0 *y, int nb) {
 }
 
 // ---------------------------------------------------------------
-// AVX2: sign_epi8 trick + maddubs
+// AVX2: sign_epi8 trick + maddubs (matches ggml exactly)
 // ---------------------------------------------------------------
 #if defined(__AVX2__)
 static inline __m256 sum_i16_pairs_float(const __m256i x) {
@@ -87,19 +86,19 @@ static float vec_dot_avx2(const block_q8_0 *x, const block_q8_0 *y, int nb) {
         const __m256 q = mul_sum_i8_pairs_float(qx, qy);
         acc = _mm256_fmadd_ps(d, q, acc);
     }
-    __m128i hi = _mm256_extractf128_si256(_mm256_castps_si256(acc), 1);
-    __m128i lo = _mm256_castsi256_si128(_mm256_castps_si256(acc));
-    __m128i s = _mm_add_epi32(lo, hi);
-    s = _mm_hadd_epi32(s, s);
-    s = _mm_hadd_epi32(s, s);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
     float result;
-    _mm_store_ss(&result, _mm_castsi128_ps(s));
+    _mm_store_ss(&result, s);
     return result;
 }
 #endif
 
 // ---------------------------------------------------------------
-// AVX-512 VNNI: XOR-0x80 trick, fixed correction bias
+// AVX-512 VNNI: XOR-0x80 trick, corrected bias
 // ---------------------------------------------------------------
 #if defined(__AVX512VNNI__)
 static int hsum_i32_8_ymm(__m256i v) {
@@ -124,21 +123,19 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
         __m256i sy_hi = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
         __m512i sy = _mm512_inserti64x4(_mm512_castsi256_si512(sy_lo), sy_hi, 1);
 
-        // XOR sign bit: signed INT8 -> unsigned with 128 offset
         __m512i xor_mask = _mm512_set1_epi8((int8_t)0x80);
         __m512i ux = _mm512_xor_si512(sx, xor_mask);
 
-        // VNNI: 16 int32 from groups of 4 pairs
         __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, sy);
 
-        // Compute sy_gsum = Σ(y[i] + 128) per dword group via sy ^ 0x80 + maddubs + madd
         __m512i ones = _mm512_set1_epi8(1);
         __m512i sy_u = _mm512_xor_si512(sy, xor_mask);
         __m512i sy_psum = _mm512_maddubs_epi16(sy_u, ones);
         __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
 
-        // correction = 128 * sy_gsum = 128 * (Σy + 512) = 128*Σy + 65536
-        // dot = Σ(x+128)*y - correction = (Σx*y + 128*Σy) - (128*Σy + 65536) = Σx*y - 65536
+        // sy_gsum = Σ(y[i] + 128) per dword = Σy + 512
+        // correction = 128 * sy_gsum = 128*Σy + 65536
+        // dot = (Σx*y + 128*Σy) - (128*Σy + 65536) = Σx*y - 65536
         // Fix: add back 65536 per dword
         __m512i correction = _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128));
         dot = _mm512_sub_epi32(dot, correction);
@@ -152,7 +149,6 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
 
         float d0 = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
         float d1 = fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d);
-
         total += d0 * (float)sum0 + d1 * (float)sum1;
     }
 
@@ -195,7 +191,6 @@ static void bench(const char *name, vec_dot_fn fn,
                   const block_q8_0 *x, const block_q8_0 *y, int nb,
                   float expected, int *all_pass) {
     float result;
-    double best_us = 1e100;
 
     // Validate
     result = fn(x, y, nb);
@@ -205,26 +200,32 @@ static void bench(const char *name, vec_dot_fn fn,
     int correct = rel_err < 1e-3f;
     if (!correct) *all_pass = 0;
 
-    // Warmup
-    for (int i = 0; i < 50; i++) fn(x, y, nb);
+    // Warmup: call with varying pointers to prevent CSE
+    for (int i = 0; i < 50; i++) {
+        volatile float sink = fn(x + (i % 2), y + (i % 2), nb - (i % 2));
+        (void)sink;
+    }
 
-    // Benchmark: 5 rounds, take the best
+    // Benchmark: process sliding window of data so each call is unique
+    double best_us = 1e100;
     for (int round = 0; round < 5; round++) {
         volatile float sink = 0.0f;
         double start = now_sec();
         int64_t count = 0;
         double elapsed;
         do {
-            for (int i = 0; i < 64; i++) {
-                sink += fn(x, y, nb);
+            // Slide a window of size min(64, nb) across the data
+            // so each call has unique inputs (prevents CSE)
+            int window = nb < 64 ? nb : 64;
+            for (int off = 0; off + window <= nb; off += window) {
+                sink += fn(x + off, y + off, window);
             }
-            count += 64;
+            count += nb / window;
             elapsed = now_sec() - start;
-        } while (elapsed < 0.3);
+        } while (elapsed < 0.5);
         double us = elapsed / (double)count * 1e6;
         if (us < best_us) best_us = us;
-        // Use sink to prevent dead-code elimination
-        if (sink == 0.0f) { /* prevent optimizer from removing sink */ }
+        (void)sink;
     }
 
     double ops = 2.0 * nb * QK8_0;
