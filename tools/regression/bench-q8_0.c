@@ -178,7 +178,7 @@ static float vec_dot_avx2_ggml(const block_q8_0 *x, const block_q8_0 *y, int nb)
 #endif
 
 // ---------------------------------------------------------------
-// AVX-512 VNNI: XOR-0x80 trick, corrected bias
+// AVX-512 VNNI: dpbssd (signed × signed), no XOR/correction
 // ---------------------------------------------------------------
 #if defined(__AVX512VNNI__)
 static int hsum_i32_8(__m256i v) {
@@ -204,17 +204,7 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
         __m256i sy_hi = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
         __m512i sy = _mm512_inserti64x4(_mm512_castsi256_si512(sy_lo), sy_hi, 1);
 
-        __m512i xor_mask = _mm512_set1_epi8((int8_t)0x80);
-        __m512i ux = _mm512_xor_si512(sx, xor_mask);
-        __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, sy);
-
-        __m512i sy_u = _mm512_xor_si512(sy, xor_mask);
-        __m512i sy_psum = _mm512_maddubs_epi16(sy_u, _mm512_set1_epi8(1));
-        __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
-
-        __m512i corr = _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128));
-        dot = _mm512_sub_epi32(dot, corr);
-        dot = _mm512_add_epi32(dot, _mm512_set1_epi32(65536));
+        __m512i dot = _mm512_dpbssd_epi32(_mm512_setzero_si512(), sx, sy);
 
         int sum0 = hsum_i32_8(_mm512_castsi512_si256(dot));
         int sum1 = hsum_i32_8(_mm512_extracti64x4_epi64(dot, 1));
