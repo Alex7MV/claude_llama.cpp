@@ -178,7 +178,8 @@ static float vec_dot_avx2_ggml(const block_q8_0 *x, const block_q8_0 *y, int nb)
 #endif
 
 // ---------------------------------------------------------------
-// AVX-512 VNNI: dpbssd (signed × signed), no XOR/correction
+// AVX-512 VNNI: dpbusd + XOR-0x80 + direct Σ y correction
+// (no XOR of y, no 65536 bias; AOCC 5.2 lacks dpbssd intrinsic)
 // ---------------------------------------------------------------
 #if defined(__AVX512VNNI__)
 static int hsum_i32_8(__m256i v) {
@@ -204,7 +205,15 @@ static float vec_dot_avx512_vnni(const block_q8_0 *x, const block_q8_0 *y, int n
         __m256i sy_hi = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
         __m512i sy = _mm512_inserti64x4(_mm512_castsi256_si512(sy_lo), sy_hi, 1);
 
-        __m512i dot = _mm512_dpbssd_epi32(_mm512_setzero_si512(), sx, sy);
+        // XOR-0x80: signed x -> unsigned (adds 128 bias per byte)
+        __m512i ux = _mm512_xor_si512(sx, _mm512_set1_epi8((int8_t)0x80));
+        __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ux, sy);
+
+        // Σ y per dword: maddubs sums adjacent signed bytes -> int16,
+        // then madd sums int16 pairs -> int32 per dword
+        __m512i sy_psum = _mm512_maddubs_epi16(_mm512_set1_epi8(1), sy);
+        __m512i sy_gsum = _mm512_madd_epi16(sy_psum, _mm512_set1_epi16(1));
+        dot = _mm512_sub_epi32(dot, _mm512_mullo_epi32(sy_gsum, _mm512_set1_epi32(128)));
 
         int sum0 = hsum_i32_8(_mm512_castsi512_si256(dot));
         int sum1 = hsum_i32_8(_mm512_extracti64x4_epi64(dot, 1));
