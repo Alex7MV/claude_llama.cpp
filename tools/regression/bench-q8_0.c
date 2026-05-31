@@ -348,37 +348,41 @@ static int self_test(void) {
     }
 #endif
 
-    // Test with y=-128 to expose sign_epi8 overflow bug
+    // Stress test with y=-128 to expose sign_epi8 overflow bug
     printf("\n  Stress test (y=-128, x<0):\n");
     xb.d = 0x3c00; yb.d = 0x3c00;
-    memset(xb.qs, -105, QK8_0); // all x < 0
-    memset(yb.qs, -128, QK8_0); // all y = -128
+    memset(xb.qs, -105, QK8_0);
+    memset(yb.qs, -128, QK8_0);
     float str_expected = vec_dot_scalar(&xb, &yb, 1);
-    printf("    scalar ref:          %f\n", str_expected);
+    printf("    scalar ref:           %13.1f\n", str_expected);
+    int str_ok = 1;
 #if defined(__AVX2__)
+    // ggml-sign is known-buggy for y=-128, shown for reference only
     {
     float r = vec_dot_avx2_ggml(&xb, &yb, 1);
     float d = fabsf(r - str_expected);
-    printf("    AVX2 (ggml sign):     %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (d < 1e-3f);
+    printf("    AVX2 (ggml sign):      %13.1f  (diff=%g)  %s  %s\n",
+           r, d, d < 1e-3f ? "PASS" : "FAIL",
+           d > 1e-3f ? "(known bug: sign_epi8 -128 overflow)" : "");
     }
     {
     float r = vec_dot_avx2_signext(&xb, &yb, 1);
     float d = fabsf(r - str_expected);
-    printf("    AVX2 (sign-extension):%f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (d < 1e-3f);
+    printf("    AVX2 (sign-extension): %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    str_ok = str_ok && (d < 1e-3f);
     }
 #endif
 #if defined(__AVX512VNNI__)
     {
     float r = vec_dot_avx512_vnni(&xb, &yb, 1);
     float d = fabsf(r - str_expected);
-    printf("    AVX-512 VNNI:         %f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
-    ok = ok && (d < 1e-3f);
+    printf("    AVX-512 VNNI:          %13.1f  (diff=%g)  %s\n", r, d, d < 1e-3f ? "PASS" : "FAIL");
+    str_ok = str_ok && (d < 1e-3f);
     }
 #endif
+    printf("    Stress test: %s\n", str_ok ? "PASS" : "FAIL");
     printf("\n");
-    return ok ? 0 : 1;
+    return (ok && str_ok) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------
