@@ -125,6 +125,18 @@ static GEN_PHASE_ALWAYS_INLINE void gen_phase_apply(
 // R1: Zero allocations in accept(). Integer comparisons only.
 // R3: Guarantees grmr is freed on every exit from TOOL_INVOCATION.
 // R5: Grammar-is-finished is primary exit; brace-depth is fallback.
+// Helper to lazily create inner grammar on TOOL_INVOCATION entry
+static GEN_PHASE_ALWAYS_INLINE void gen_phase_enter_tool(struct gen_phase_sampler_context * ctx) {
+    ctx->phase = llama_gen_phase::TOOL_INVOCATION;
+    if (!ctx->grmr && !ctx->tool_call_grammar_str.empty()) {
+        ctx->grmr = llama_sampler_init_grammar(
+            ctx->vocab,
+            ctx->tool_call_grammar_str.c_str(),
+            "root");
+    }
+    ctx->brace_depth = 0;
+}
+
 static GEN_PHASE_ALWAYS_INLINE void gen_phase_accept(
     struct llama_sampler *        smpl,
     llama_token                   token)
@@ -136,28 +148,13 @@ static GEN_PHASE_ALWAYS_INLINE void gen_phase_accept(
             if (token == ctx->tokens.id_thought) {
                 ctx->phase = llama_gen_phase::REASONING;
             } else if (token == ctx->tokens.id_call) {
-                ctx->phase = llama_gen_phase::TOOL_INVOCATION;
-                // Lazy grammar creation on first call token
-                if (!ctx->grmr && !ctx->tool_call_grammar_str.empty()) {
-                    ctx->grmr = llama_sampler_init_grammar(
-                        ctx->vocab,
-                        ctx->tool_call_grammar_str.c_str(),
-                        "root");
-                }
-                ctx->brace_depth = 0;
+                gen_phase_enter_tool(ctx);
             }
             break;
         }
         case llama_gen_phase::REASONING: {
             if (token == ctx->tokens.id_call) {
-                ctx->phase = llama_gen_phase::TOOL_INVOCATION;
-                if (!ctx->grmr && !ctx->tool_call_grammar_str.empty()) {
-                    ctx->grmr = llama_sampler_init_grammar(
-                        ctx->vocab,
-                        ctx->tool_call_grammar_str.c_str(),
-                        "root");
-                }
-                ctx->brace_depth = 0;
+                gen_phase_enter_tool(ctx);
             } else if (token == ctx->tokens.id_end) {
                 ctx->phase = llama_gen_phase::TEXT;
             }

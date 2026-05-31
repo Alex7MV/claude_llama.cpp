@@ -18,7 +18,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <mutex>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -710,12 +709,6 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
-
-    // GBNF compilation cache: json_schema -> GBNF grammar string.
-    // Avoids re-compiling identical schemas (common for MCP repeated tool calls).
-    // R2: Thread-safe access via mutex (server runs multiple slots concurrently).
-    std::unordered_map<std::string, std::string> gbnf_cache;
-    std::mutex                                    gbnf_cache_mtx;
 
     void destroy() {
         spec.reset();

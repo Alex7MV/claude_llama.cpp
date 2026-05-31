@@ -410,6 +410,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    if (gen_phase && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with gen_phase state machine, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
     auto * result = new common_sampler {
         /* .params    = */ params,
         /* .grmr      = */ grmr,

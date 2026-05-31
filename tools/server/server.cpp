@@ -307,14 +307,17 @@ int llama_server(int argc, char ** argv) {
         {
             auto * ctx = ctx_server.get_llama_context();
             if (ctx) {
-                auto gen_tokens = resolve_model_signatures(llama_get_model(ctx));
-                params.sampling.gen_phase_tokens = gen_tokens;
+                auto * model = llama_get_model(ctx);
+                if (model) {
+                    auto gen_tokens = resolve_model_signatures(model);
+                    params.sampling.gen_phase_tokens = gen_tokens;
 
-                if (gen_tokens.id_call != LLAMA_TOKEN_NULL) {
-                    SRV_INF("gen-phase: state machine enabled (call=%d, thought=%d, end=%d)\n",
-                            gen_tokens.id_call, gen_tokens.id_thought, gen_tokens.id_end);
-                } else {
-                    SRV_INF("%s", "gen-phase: no markers found, state machine disabled (pass-through)\n");
+                    if (gen_tokens.id_call != LLAMA_TOKEN_NULL) {
+                        SRV_INF("gen-phase: state machine enabled (call=%d, thought=%d, end=%d)\n",
+                                gen_tokens.id_call, gen_tokens.id_thought, gen_tokens.id_end);
+                    } else {
+                        SRV_INF("%s", "gen-phase: no markers found, state machine disabled (pass-through)\n");
+                    }
                 }
             }
         }

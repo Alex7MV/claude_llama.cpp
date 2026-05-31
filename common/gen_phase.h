@@ -3,7 +3,6 @@
 #include "llama.h"
 
 #include <string>
-#include <unordered_map>
 
 enum class llama_gen_phase {
     TEXT,             // Free text generation, grammar inactive, <|call|> masked
