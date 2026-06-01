@@ -52,10 +52,16 @@ struct hybrid_orchestrator {
     } draft;
 
     struct {
-        uint32_t accepted    = 0;
-        uint32_t rejected_at = UINT32_MAX;
-        uint32_t n_draft     = 0;
+        uint32_t accepted         = 0;
+        uint32_t rejected_at      = UINT32_MAX;
+        uint32_t n_draft          = 0;
+        uint32_t total_attempts   = 0;
+        uint32_t total_accepted   = 0;
     } verify;
+
+    uint32_t max_draft        = 6;
+    uint32_t current_draft    = 6;
+    float    accept_rate_ema  = 0.0f;
 
     bool init(
         uint32_t n_layers,
@@ -64,7 +70,8 @@ struct hybrid_orchestrator {
         uint32_t max_lookahead,
         ggml_backend_dev_t device,
         void * compute_stream,
-        void * draft_stream);
+        void * draft_stream,
+        uint32_t max_draft = 6);
 
     void free_all();
 

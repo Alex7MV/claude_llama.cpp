@@ -1067,7 +1067,10 @@ private:
                         params_base.speculative.draft.n_max,
                         gpu_dev,
                         nullptr,
-                        nullptr))
+                        nullptr,
+                        params_base.speculative.draft.n_max > 0
+                            ? (uint32_t)params_base.speculative.draft.n_max
+                            : 6))
                 {
                     hybrid = std::move(h);
                     llama_set_hybrid_orch(ctx_tgt, hybrid.get());

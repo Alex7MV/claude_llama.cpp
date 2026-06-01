@@ -426,14 +426,23 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
+        // Fast path for tail rollback (speculative decode): p1 is max → removing tail
+        if (p1 >= std::numeric_limits<llama_pos>::max()) {
+            // scan from end — typical draft length is 1-6 tokens
+            for (uint32_t i = cells.size(); i > 0; --i) {
+                uint32_t idx = i - 1;
+                if (cells.pos_in(idx, p0, p1) && cells.seq_has(idx, seq_id)) {
+                    cells.seq_rm(idx, seq_id);
+                    new_head = idx;
+                } else if (new_head < cells.size()) {
+                    break; // gap after removed range → done
+                }
             }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+        } else {
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) { continue; }
+                if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+                    if (new_head == cells.size()) { new_head = i; }
                 }
             }
         }

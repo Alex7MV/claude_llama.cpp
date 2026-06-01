@@ -12,12 +12,15 @@ bool hybrid_orchestrator::init(
     uint32_t max_lookahead,
     ggml_backend_dev_t device,
     void * compute_stream,
-    void * draft_stream_)
+    void * draft_stream_,
+    uint32_t max_draft_)
 {
     n_layers       = n_layers_;
     kv_lora_rank   = kv_lora_rank_;
     gpu_compute_stream = compute_stream;
     draft_stream        = draft_stream_;
+    max_draft = max_draft_ > 0 ? max_draft_ : 6;
+    current_draft = max_draft;
 
     if (!pool.init(n_layers_, n_ctx_max, kv_lora_rank_, max_lookahead, device)) {
         fprintf(stderr, "hybrid_orchestrator: VRAM pool init failed\n");
@@ -70,21 +73,19 @@ void hybrid_orchestrator::on_tma_enqueued(uint32_t layer) {
 }
 
 bool hybrid_orchestrator::wait_tma_event() {
+    // Make the GPU compute stream wait for the oldest TMA transfer.
+    // CPU returns immediately — no blocking.
+    // The stream will not execute flash_attn until TMA data arrives.
     if (tma_head < 2) return true; // nothing to wait for yet
     cudaEvent_t ev = reinterpret_cast<cudaEvent_t>(tma_events[(tma_head - 2) & 1]);
-    // non-blocking probe
-    for (int spin = 0; spin < 64; spin++) {
-        cudaError_t err = cudaEventQuery(ev);
-        if (err == cudaSuccess) return true;
-        if (err != cudaErrorNotReady) return false;
-        __builtin_ia32_pause();
-    }
-    // fallback to blocking sync
-    cudaError_t err = cudaEventSynchronize(ev);
+    cudaError_t err = cudaStreamWaitEvent(
+        (cudaStream_t)gpu_compute_stream, ev, 0);
     return err == cudaSuccess;
 }
 
 void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
+    // Non-blocking: CPU enqueues wait dependency on GPU stream,
+    // then immediately returns to compute MoE FFN on CPU.
     wait_tma_event();
     stages[layer].phase = hybrid_phase::GPU_ATTN_DONE;
 }
@@ -132,7 +133,8 @@ void hybrid_orchestrator::patch_graph_for_mla(
 
 bool hybrid_orchestrator::init(
     uint32_t, uint32_t, uint32_t, uint32_t,
-    ggml_backend_dev_t, void *, void *)
+    ggml_backend_dev_t, void *, void *,
+    uint32_t)
 {
     fprintf(stderr, "hybrid_orchestrator: CUDA not available\n");
     return false;
@@ -190,6 +192,8 @@ uint32_t hybrid_orchestrator::verify_and_rollback(
     verify.accepted    = n_match;
     verify.rejected_at = n_match;
     verify.n_draft     = static_cast<uint32_t>(draft.lookahead_buffer.size());
+    verify.total_attempts++;
+    verify.total_accepted += n_match;
 
     if (n_match < draft.lookahead_buffer.size()) {
         llama_memory_seq_rm(
@@ -197,6 +201,17 @@ uint32_t hybrid_orchestrator::verify_and_rollback(
             0,
             static_cast<llama_pos>(current_token + n_match + 1),
             -1);
+    }
+
+    // Adaptive lookahead: EMA-based acceptance rate tracking
+    float step_rate = draft.lookahead_buffer.size() > 0
+        ? (float)n_match / (float)draft.lookahead_buffer.size()
+        : 1.0f;
+    accept_rate_ema = 0.9f * accept_rate_ema + 0.1f * step_rate;
+    if (accept_rate_ema > 0.60f && current_draft < max_draft) {
+        current_draft = max_draft;
+    } else if (accept_rate_ema < 0.30f && current_draft > 3) {
+        current_draft = 3;
     }
 
     draft.lookahead_buffer.erase(
