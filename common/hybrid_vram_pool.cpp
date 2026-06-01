@@ -1,15 +1,32 @@
 #include "hybrid_vram_pool.h"
 #include <cstdio>
 
+#ifdef GGML_USE_CUDA
+
 static constexpr uint32_t FP8_BYTES = 1;
 
 hybrid_vram_pool::~hybrid_vram_pool() { free_all(); }
 
 bool hybrid_vram_pool::init(
-    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_dev_t)
+    uint32_t n_layers,
+    uint32_t n_ctx_max,
+    uint32_t kv_lora_rank,
+    uint32_t max_lookahead,
+    ggml_backend_dev_t device)
 {
-    return false;
-}
+    m_n_layers     = n_layers;
+    m_n_ctx_max    = n_ctx_max;
+    m_kv_lora_rank = kv_lora_rank;
+    m_device       = device;
+
+    uint32_t n_slots = n_ctx_max + 2 * max_lookahead;
+    m_stride = static_cast<uint64_t>(n_slots) * kv_lora_rank * FP8_BYTES;
+    m_total_bytes = static_cast<uint64_t>(m_n_layers) * m_stride;
+
+    if (!device) {
+        fprintf(stderr, "hybrid_vram_pool: device is null\n");
+        return false;
+    }
 
     m_dev_buffer = ggml_backend_buft_alloc_buffer(
         ggml_backend_dev_buffer_type(device), m_total_bytes);
@@ -49,3 +66,18 @@ float * hybrid_vram_pool::slot_ptr(uint32_t layer, uint32_t seq_pos) const {
         + static_cast<uint64_t>(layer) * m_stride
         + static_cast<uint64_t>(seq_pos) * m_kv_lora_rank * FP8_BYTES);
 }
+
+#else // !GGML_USE_CUDA
+
+hybrid_vram_pool::~hybrid_vram_pool() {}
+
+bool hybrid_vram_pool::init(
+    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_dev_t)
+{
+    return false;
+}
+
+void hybrid_vram_pool::free_all() {}
+float * hybrid_vram_pool::slot_ptr(uint32_t, uint32_t) const { return nullptr; }
+
+#endif // GGML_USE_CUDA
