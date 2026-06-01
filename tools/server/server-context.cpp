@@ -13,6 +13,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "hybrid_stage.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -63,6 +64,9 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+
+    // hybrid speculative engine
+    hybrid_orchestrator * hybrid = nullptr;
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -678,6 +682,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    std::unique_ptr<hybrid_orchestrator> hybrid;
 
     bool add_bos_token = true;
 
@@ -1047,6 +1052,32 @@ private:
             }
         }
 
+        // init hybrid speculative engine (VRAM KV-cache + async staging)
+        if (params_base.hybrid_pipeline && ctx_tgt) {
+            try {
+                auto h = std::make_unique<hybrid_orchestrator>();
+                // kv_lora_rank = 512 for MLA models (DeepSeek-V3, Kimi-k2.6);
+                // detect via model hparams when API is available, default to 512
+                uint32_t kv_lora_rank = 512;
+                if (h->init(
+                        llama_n_layer(ctx_tgt),
+                        llama_n_ctx(ctx_tgt),
+                        kv_lora_rank,
+                        params_base.speculative.draft.n_max,
+                        nullptr,
+                        nullptr,
+                        nullptr))
+                {
+                    hybrid = std::move(h);
+                    SRV_INF("%s", "hybrid speculative engine initialized\n");
+                } else {
+                    SRV_WRN("%s", "hybrid speculative engine init failed\n");
+                }
+            } catch (const std::exception & e) {
+                SRV_WRN("hybrid speculative engine init exception: %s\n", e.what());
+            }
+        }
+
         if (spec) {
             SRV_INF("%s", "speculative decoding context initialized\n");
         } else {
@@ -1060,6 +1091,7 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
             slot.spec    = spec.get();
+            slot.hybrid  = hybrid.get();
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
@@ -3360,7 +3392,15 @@ private:
                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    std::vector<llama_token> accepted;
+                    if (slot.hybrid) {
+                        accepted = common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            false, slot.hybrid);
+                    } else {
+                        accepted = common_sampler_sample_and_accept_n(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    }
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);

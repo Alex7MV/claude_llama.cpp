@@ -1,8 +1,11 @@
 #pragma once
 #include <cstdint>
-#include <cuda_runtime.h>
 #include "ggml.h"
 #include "ggml-backend.h"
+
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 struct hybrid_vram_pool {
     hybrid_vram_pool() = default;
