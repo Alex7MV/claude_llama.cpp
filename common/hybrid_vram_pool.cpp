@@ -6,29 +6,13 @@ static constexpr uint32_t FP8_BYTES = 1;
 hybrid_vram_pool::~hybrid_vram_pool() { free_all(); }
 
 bool hybrid_vram_pool::init(
-    uint32_t n_layers,
-    uint32_t n_ctx_max,
-    uint32_t kv_lora_rank,
-    uint32_t max_lookahead,
-    ggml_backend_t backend)
+    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_dev_t)
 {
-    m_n_layers     = n_layers;
-    m_n_ctx_max    = n_ctx_max;
-    m_kv_lora_rank = kv_lora_rank;
-    m_backend      = backend;
-
-    uint32_t n_slots = n_ctx_max + 2 * max_lookahead;
-    m_stride = static_cast<uint64_t>(n_slots) * kv_lora_rank * FP8_BYTES;
-    m_total_bytes = static_cast<uint64_t>(m_n_layers) * m_stride;
-
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (!dev) {
-        fprintf(stderr, "hybrid_vram_pool: backend has no device\n");
-        return false;
-    }
+    return false;
+}
 
     m_dev_buffer = ggml_backend_buft_alloc_buffer(
-        ggml_backend_dev_buffer_type(dev), m_total_bytes);
+        ggml_backend_dev_buffer_type(device), m_total_bytes);
     if (!m_dev_buffer) {
         fprintf(stderr, "hybrid_vram_pool: ggml_backend_buft_alloc_buffer(%llu) failed\n",
                 (unsigned long long)m_total_bytes);

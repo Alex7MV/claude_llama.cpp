@@ -1059,12 +1059,13 @@ private:
                 // kv_lora_rank = 512 for MLA models (DeepSeek-V3, Kimi-k2.6);
                 // detect via model hparams when API is available, default to 512
                 uint32_t kv_lora_rank = 512;
+                ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
                 if (h->init(
                         llama_model_n_layer(llama_get_model(ctx_tgt)),
                         llama_n_ctx(ctx_tgt),
                         kv_lora_rank,
                         params_base.speculative.draft.n_max,
-                        nullptr,
+                        gpu_dev,
                         nullptr,
                         nullptr))
                 {

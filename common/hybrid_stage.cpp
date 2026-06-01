@@ -10,7 +10,7 @@ bool hybrid_orchestrator::init(
     uint32_t n_ctx_max,
     uint32_t kv_lora_rank_,
     uint32_t max_lookahead,
-    ggml_backend_t backend,
+    ggml_backend_dev_t device,
     void * compute_stream,
     void * draft_stream_)
 {
@@ -19,7 +19,7 @@ bool hybrid_orchestrator::init(
     gpu_compute_stream = compute_stream;
     draft_stream        = draft_stream_;
 
-    if (!pool.init(n_layers_, n_ctx_max, kv_lora_rank_, max_lookahead, backend)) {
+    if (!pool.init(n_layers_, n_ctx_max, kv_lora_rank_, max_lookahead, device)) {
         fprintf(stderr, "hybrid_orchestrator: VRAM pool init failed\n");
         return false;
     }
@@ -81,7 +81,7 @@ void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
 
 bool hybrid_orchestrator::init(
     uint32_t, uint32_t, uint32_t, uint32_t,
-    ggml_backend_t, void *, void *)
+    ggml_backend_dev_t, void *, void *)
 {
     fprintf(stderr, "hybrid_orchestrator: CUDA not available\n");
     return false;

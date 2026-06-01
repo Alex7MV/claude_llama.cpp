@@ -62,7 +62,7 @@ struct hybrid_orchestrator {
         uint32_t n_ctx_max,
         uint32_t kv_lora_rank,
         uint32_t max_lookahead,
-        ggml_backend_t backend,
+        ggml_backend_dev_t device,
         void * compute_stream,
         void * draft_stream);
 

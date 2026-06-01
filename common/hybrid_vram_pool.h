@@ -15,7 +15,7 @@ struct hybrid_vram_pool {
         uint32_t n_ctx_max,
         uint32_t kv_lora_rank,
         uint32_t max_lookahead,
-        ggml_backend_t backend);
+        ggml_backend_dev_t device);
 
     void free_all();
 
@@ -32,5 +32,5 @@ private:
     uint32_t m_stride       = 0;
 
     ggml_backend_buffer_t m_dev_buffer = nullptr;
-    ggml_backend_t        m_backend    = nullptr;
+    ggml_backend_dev_t    m_device     = nullptr;
 };
