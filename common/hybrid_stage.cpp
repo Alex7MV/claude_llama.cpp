@@ -107,6 +107,27 @@ void hybrid_orchestrator::trace_tma_verify(uint32_t layer) {
         (int)s.phase);
 }
 
+void hybrid_orchestrator::patch_graph_for_mla(
+    ggml_cgraph * gf,
+    ggml_backend_sched_t sched,
+    ggml_backend_t gpu_backend)
+{
+    if (!gf || !sched || !gpu_backend) return;
+    int patched = 0;
+    for (int i = 0; i < gf->n_nodes; i++) {
+        ggml_tensor * node = gf->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT &&
+            ggml_backend_supports_op(gpu_backend, node))
+        {
+            ggml_backend_sched_set_tensor_backend(sched, node, gpu_backend);
+            patched++;
+        }
+    }
+    if (patched > 0) {
+        fprintf(stderr, "hybrid: patched %d flash-attn ops → GPU\n", patched);
+    }
+}
+
 #else // !GGML_USE_CUDA
 
 bool hybrid_orchestrator::init(
@@ -122,6 +143,7 @@ void hybrid_orchestrator::on_tma_enqueued(uint32_t) {}
 bool hybrid_orchestrator::wait_tma_event() { return true; }
 void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
 void hybrid_orchestrator::trace_tma_verify(uint32_t) {}
+void hybrid_orchestrator::patch_graph_for_mla(ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t) {}
 
 #endif // GGML_USE_CUDA
 

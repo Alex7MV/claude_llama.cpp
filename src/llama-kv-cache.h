@@ -112,6 +112,14 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
+    // Reallocate K (and V for non-MLA) tensors for layers [il_start, il_end)
+    // into an externally managed backend buffer.
+    // Returns false on failure (e.g. buffer too small, layer out of range).
+    bool register_external_buft(
+            ggml_backend_buffer_t    vram_buffer,
+                      uint32_t       il_start,
+                      uint32_t       il_end);
+
     ~llama_kv_cache() = default;
 
     //

@@ -333,6 +333,68 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+bool llama_kv_cache::register_external_buft(
+    ggml_backend_buffer_t vram_buffer,
+    uint32_t il_start,
+    uint32_t il_end)
+{
+    if (!vram_buffer) return false;
+
+    const bool is_mla = hparams.is_mla();
+    char * base = (char *)ggml_backend_buffer_get_base(vram_buffer);
+    size_t buf_size = ggml_backend_buffer_get_size(vram_buffer);
+
+    for (uint32_t il = il_start; il < il_end && il < hparams.n_layer; il++) {
+        auto it = map_layer_ids.find(il);
+        if (it == map_layer_ids.end()) continue;
+        auto & l = layers[it->second];
+        if (!l.k) continue;
+
+        size_t nbytes_k = ggml_nbytes(l.k);
+
+        // find an unused region in vram_buffer for this tensor
+        // simple layout: pack layers consecutively
+        size_t offset = (size_t)(il - il_start) * (buf_size / (il_end - il_start));
+
+        if (offset + nbytes_k > buf_size) {
+            fprintf(stderr, "%s: VRAM buffer too small for layer %u "
+                    "(need %llu, have %llu)\n", __func__, il,
+                    (unsigned long long)(offset + nbytes_k),
+                    (unsigned long long)buf_size);
+            return false;
+        }
+
+        // detach tensor from its current buffer (null out old pointers
+        // to prevent accidental use; the old buffer still owns the memory)
+        l.k->buffer = nullptr;
+        l.k->data   = nullptr;
+
+        // attach to the VRAM buffer at the calculated offset
+        enum ggml_status st = ggml_backend_tensor_alloc(
+            vram_buffer, l.k, base + offset);
+        if (st != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: ggml_backend_tensor_alloc failed for layer %u\n",
+                    __func__, il);
+            return false;
+        }
+
+        offset += nbytes_k;
+
+        // also remap V cache (non-MLA only)
+        if (l.v) {
+            size_t nbytes_v = ggml_nbytes(l.v);
+            l.v->buffer = nullptr;
+            l.v->data   = nullptr;
+            st = ggml_backend_tensor_alloc(vram_buffer, l.v, base + offset);
+            if (st != GGML_STATUS_SUCCESS) return false;
+            offset += nbytes_v;
+        }
+
+    }
+
+    return true;
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();

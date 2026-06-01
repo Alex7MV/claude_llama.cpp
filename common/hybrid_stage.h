@@ -78,6 +78,13 @@ struct hybrid_orchestrator {
 
     void advance_token();
 
+    // Walk the full cgraph and reassign GGML_OP_FLASH_ATTN_EXT to GPU backend.
+    // The scheduler will auto-copy Q/K/V/mask from CPU to GPU before compute.
+    static void patch_graph_for_mla(
+        struct ggml_cgraph * gf,
+        ggml_backend_sched_t sched,
+        ggml_backend_t gpu_backend);
+
     uint32_t verify_and_rollback(
         llama_context * ctx_tgt,
         const llama_tokens & target_tokens);
