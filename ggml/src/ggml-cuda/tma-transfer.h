@@ -36,4 +36,44 @@ void ggml_tma_free_transfer(ggml_tma_transfer_t transfer);
 
 #ifdef __cplusplus
 }
+
+// C++ convenience wrapper: enqueue a 1D H2D transfer from pinned CPU to VRAM.
+// Returns true if TMA was launched; false => caller should use cudaMemcpyAsync.
+inline bool ggml_tma_enqueue_h2d_1d(
+    void *       dst_vram,
+    const void * src_pinned,
+    size_t       num_bytes,
+    void *       stream,
+    void *       cuda_event_out = nullptr)
+{
+    if (!ggml_cuda_tma_supported()) {
+        cudaError_t err = cudaMemcpyAsync(
+            dst_vram, src_pinned, num_bytes,
+            cudaMemcpyHostToDevice, (cudaStream_t)stream);
+        if (err == cudaSuccess && cuda_event_out) {
+            cudaEventRecord((cudaEvent_t)cuda_event_out, (cudaStream_t)stream);
+        }
+        return err == cudaSuccess;
+    }
+
+    ggml_tma_transfer_t tma_desc = nullptr;
+    if (!ggml_tma_init_transfer(
+            &tma_desc,
+            const_cast<void *>(src_pinned),
+            dst_vram,
+            num_bytes,
+            1,
+            stream))
+    {
+        return false;
+    }
+
+    ggml_tma_launch_transfer(tma_desc);
+    if (cuda_event_out) {
+        cudaEventRecord((cudaEvent_t)cuda_event_out, (cudaStream_t)stream);
+    }
+    ggml_tma_free_transfer(tma_desc);
+    return true;
+}
+
 #endif
