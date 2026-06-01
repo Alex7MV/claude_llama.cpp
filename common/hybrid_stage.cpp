@@ -121,7 +121,7 @@ uint32_t hybrid_orchestrator::verify_and_rollback(
 
     if (n_match < draft.lookahead_buffer.size()) {
         llama_memory_seq_rm(
-            llama_context_get_memory(ctx_tgt),
+            llama_get_memory(ctx_tgt),
             0,
             static_cast<llama_pos>(current_token + n_match + 1),
             -1);

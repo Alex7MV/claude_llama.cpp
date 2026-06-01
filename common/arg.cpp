@@ -2054,6 +2054,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--hybrid-pipeline"},
+        {"--no-hybrid-pipeline"},
+        string_format("enable hybrid CPU/GPU speculative pipeline (default: %s)", params.hybrid_pipeline ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.hybrid_pipeline = value;
+        }
+    ).set_env("LLAMA_ARG_HYBRID_PIPELINE"));
+    add_opt(common_arg(
+        {"--kv-vram"},
+        {"--no-kv-vram"},
+        string_format("store target model KV-cache in VRAM (default: %s)", params.kv_vram ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_vram = value;
+        }
+    ).set_env("LLAMA_ARG_KV_VRAM"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

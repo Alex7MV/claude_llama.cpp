@@ -77,6 +77,10 @@ add_library(${TARGET}
     fit.h
     gen_phase.cpp
     gen_phase.h
+    hybrid_stage.cpp
+    hybrid_stage.h
+    hybrid_vram_pool.cpp
+    hybrid_vram_pool.h
     hf-cache.cpp
     hf-cache.h
     http.h
