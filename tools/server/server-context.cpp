@@ -1060,7 +1060,7 @@ private:
                 // detect via model hparams when API is available, default to 512
                 uint32_t kv_lora_rank = 512;
                 if (h->init(
-                        llama_n_layer(ctx_tgt),
+                        llama_model_n_layer(llama_get_model(ctx_tgt)),
                         llama_n_ctx(ctx_tgt),
                         kv_lora_rank,
                         params_base.speculative.draft.n_max,
