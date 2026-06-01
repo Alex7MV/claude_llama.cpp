@@ -90,6 +90,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// Hybrid speculative path: passes orchestrator for VRAM KV-cache rollback
+struct hybrid_orchestrator;
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+    struct common_sampler *    gsmpl,
+    struct llama_context *     ctx,
+    const std::vector<int> &   idxs,
+    const llama_tokens &       draft,
+    bool                       grammar_first,
+    struct hybrid_orchestrator * hybrid);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // helpers

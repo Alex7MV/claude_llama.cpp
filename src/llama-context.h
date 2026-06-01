@@ -345,6 +345,7 @@ private:
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
+    void *              hybrid_orch         = nullptr; // hybrid_orchestrator * for speculative pipeline
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 

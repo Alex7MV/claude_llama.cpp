@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "fit.h"
+#include "hybrid_stage.h"
 #include "log.h"
 #include "reasoning-budget.h"
 
@@ -689,6 +690,53 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+    struct common_sampler *    gsmpl,
+    struct llama_context *     ctx,
+    const std::vector<int> &   idxs,
+    const llama_tokens &       draft,
+    bool                       grammar_first,
+    struct hybrid_orchestrator * hybrid)
+{
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    size_t i = 0;
+    for (; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        if (draft[i] != id) {
+            break;
+        }
+    }
+
+    if (hybrid) {
+        hybrid->verify.accepted    = (uint32_t)i;
+        hybrid->verify.rejected_at = (i < draft.size()) ? (uint32_t)i : UINT32_MAX;
+        hybrid->verify.n_draft     = (uint32_t)draft.size();
+    }
+
+    if (i < draft.size()) {
+        // Rollback KV-cache at first non-matching position
+        common_context_seq_rm(ctx, 0, (llama_pos)(idxs[0] + i + 1), -1);
+    } else {
+        // All draft accepted — sample one more token
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+    }
+
+    if (hybrid) {
+        hybrid->draft.lookahead_buffer.clear();
+        hybrid->draft.in_flight = false;
+    }
+
+    return result;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
