@@ -66,7 +66,7 @@ void hybrid_orchestrator::on_tma_enqueued(uint32_t layer) {
 
     s.tma.enqueued = true;
     tma_head++;
-    s.phase.store(hybrid_phase::TMA_ENQUEUED);
+    s.phase = hybrid_phase::TMA_ENQUEUED;
 }
 
 void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
@@ -74,7 +74,7 @@ void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
         cudaEventSynchronize(
             reinterpret_cast<cudaEvent_t>(tma_events[(tma_head - 2) & 1]));
     }
-    stages[layer].phase.store(hybrid_phase::GPU_ATTN_DONE);
+    stages[layer].phase = hybrid_phase::GPU_ATTN_DONE;
 }
 
 #else // !GGML_USE_CUDA
@@ -95,7 +95,7 @@ void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
 
 void hybrid_orchestrator::on_norm_done(uint32_t layer, const int32_t expert_ids[2]) {
     auto & s = stages[layer];
-    s.phase.store(hybrid_phase::NORM_DONE);
+    s.phase = hybrid_phase::NORM_DONE;
 
     s.prefetch.expert_ids[0] = expert_ids[0];
     s.prefetch.expert_ids[1] = expert_ids[1];
@@ -104,7 +104,7 @@ void hybrid_orchestrator::on_norm_done(uint32_t layer, const int32_t expert_ids[
 
 void hybrid_orchestrator::on_kv_compressed(uint32_t layer, const float * c_tkv_cpu) {
     auto & s = stages[layer];
-    s.phase.store(hybrid_phase::KV_COMPRESSED);
+    s.phase = hybrid_phase::KV_COMPRESSED;
 
     s.tma.cpu_src  = c_tkv_cpu;
     s.tma.bytes    = static_cast<uint64_t>(kv_lora_rank) * 1;
@@ -112,7 +112,7 @@ void hybrid_orchestrator::on_kv_compressed(uint32_t layer, const float * c_tkv_c
 }
 
 void hybrid_orchestrator::on_merge_done(uint32_t layer) {
-    stages[layer].phase.store(hybrid_phase::MERGE_DONE);
+    stages[layer].phase = hybrid_phase::MERGE_DONE;
 }
 
 void hybrid_orchestrator::advance_token() {

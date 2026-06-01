@@ -21,7 +21,7 @@ struct hybrid_vram_pool {
 
     float * slot_ptr(uint32_t layer, uint32_t seq_pos) const;
     uint64_t total_bytes() const { return m_total_bytes; }
-    ggml_backend_buffer_t backend_buffer() const { return m_backend_buffer; }
+    ggml_backend_buffer_t backend_buffer() const { return m_dev_buffer; }
 
 private:
     float *  m_device_ptr   = nullptr;
@@ -31,6 +31,6 @@ private:
     uint32_t m_kv_lora_rank = 0;
     uint32_t m_stride       = 0;
 
-    ggml_backend_buffer_t m_backend_buffer = nullptr;
-    ggml_backend_t        m_backend        = nullptr;
+    ggml_backend_buffer_t m_dev_buffer = nullptr;
+    ggml_backend_t        m_backend    = nullptr;
 };

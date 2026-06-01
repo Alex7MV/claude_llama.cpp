@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <atomic>
 #include <vector>
 #include <functional>
 #include "llama.h"
@@ -17,7 +16,7 @@ enum class hybrid_phase : uint8_t {
 };
 
 struct hybrid_layer_stage {
-    std::atomic<hybrid_phase> phase = hybrid_phase::IDLE;
+    hybrid_phase phase = hybrid_phase::IDLE;
 
     struct {
         const float * cpu_src   = nullptr;

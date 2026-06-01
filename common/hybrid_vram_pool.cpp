@@ -1,9 +1,6 @@
 #include "hybrid_vram_pool.h"
 #include <cstdio>
 
-#ifdef GGML_USE_CUDA
-#include <cuda_runtime.h>
-
 static constexpr uint32_t FP8_BYTES = 1;
 
 hybrid_vram_pool::~hybrid_vram_pool() { free_all(); }
@@ -24,20 +21,29 @@ bool hybrid_vram_pool::init(
     m_stride = static_cast<uint64_t>(n_slots) * kv_lora_rank * FP8_BYTES;
     m_total_bytes = static_cast<uint64_t>(m_n_layers) * m_stride;
 
-    cudaError_t err = cudaMalloc(&m_device_ptr, m_total_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "hybrid_vram_pool: cudaMalloc(%llu) failed: %s\n",
-                (unsigned long long)m_total_bytes, cudaGetErrorString(err));
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (!dev) {
+        fprintf(stderr, "hybrid_vram_pool: backend has no device\n");
         return false;
     }
 
-    m_backend_buffer = ggml_backend_cuda_buffer_type(backend)->alloc_buffer(
-        backend, m_total_bytes);
-    if (!m_backend_buffer) {
-        fprintf(stderr, "hybrid_vram_pool: warning — could not register with ggml-alloc\n");
+    m_dev_buffer = ggml_backend_buft_alloc_buffer(
+        ggml_backend_dev_buffer_type(dev), m_total_bytes);
+    if (!m_dev_buffer) {
+        fprintf(stderr, "hybrid_vram_pool: ggml_backend_buft_alloc_buffer(%llu) failed\n",
+                (unsigned long long)m_total_bytes);
+        return false;
     }
 
-    cudaMemset(m_device_ptr, 0, m_total_bytes);
+    m_device_ptr = reinterpret_cast<float *>(ggml_backend_buffer_get_base(m_dev_buffer));
+    if (!m_device_ptr) {
+        ggml_backend_buffer_free(m_dev_buffer);
+        m_dev_buffer = nullptr;
+        fprintf(stderr, "hybrid_vram_pool: buffer has nil base\n");
+        return false;
+    }
+
+    ggml_backend_buffer_clear(m_dev_buffer, 0);
 
     fprintf(stderr, "hybrid_vram_pool: allocated %.2f GB VRAM (%u layers, %u ctx, rank=%u)\n",
             m_total_bytes / (double)(1ull << 30), n_layers, n_ctx_max, kv_lora_rank);
@@ -45,14 +51,11 @@ bool hybrid_vram_pool::init(
 }
 
 void hybrid_vram_pool::free_all() {
-    if (m_backend_buffer) {
-        ggml_backend_buffer_free(m_backend_buffer);
-        m_backend_buffer = nullptr;
+    if (m_dev_buffer) {
+        ggml_backend_buffer_free(m_dev_buffer);
+        m_dev_buffer = nullptr;
     }
-    if (m_device_ptr) {
-        cudaFree(m_device_ptr);
-        m_device_ptr = nullptr;
-    }
+    m_device_ptr = nullptr;
     m_total_bytes = 0;
 }
 
@@ -62,18 +65,3 @@ float * hybrid_vram_pool::slot_ptr(uint32_t layer, uint32_t seq_pos) const {
         + static_cast<uint64_t>(layer) * m_stride
         + static_cast<uint64_t>(seq_pos) * m_kv_lora_rank * FP8_BYTES);
 }
-
-#else // !GGML_USE_CUDA
-
-hybrid_vram_pool::~hybrid_vram_pool() {}
-
-bool hybrid_vram_pool::init(
-    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_t)
-{
-    return false;
-}
-
-void hybrid_vram_pool::free_all() {}
-float * hybrid_vram_pool::slot_ptr(uint32_t, uint32_t) const { return nullptr; }
-
-#endif // GGML_USE_CUDA
