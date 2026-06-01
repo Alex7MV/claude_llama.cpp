@@ -2420,7 +2420,18 @@ private:
                 n_keep = std::min(slot.n_ctx - 4, n_keep);
 
                 const int n_left    = slot.prompt.n_tokens() - n_keep;
-                const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : (n_left / 2);
+                // Gentle shift: discard 15% of non-keep content (vs 50%)
+                const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : std::max(1, n_left * 15 / 100);
+
+                // [KV] Save pre-shift KV state to prompt cache for recovery
+                // on the next request, minimizing cold prefill after shift.
+                if (slot.prompt.n_tokens() > 0) {
+                    const int64_t t_start = ggml_time_us();
+                    slot.prompt_save(*prompt_cache);
+                    prompt_cache->update();
+                    SLT_INF(slot, "saved pre-shift snapshot (%zu tokens, %.1f ms)\n",
+                            slot.prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0);
+                }
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
                 {
