@@ -236,6 +236,8 @@ public:
 
     // hybrid speculative orchestrator (set by server/main)
     void set_hybrid_orch(void * orch) { hybrid_orch = orch; }
+    void set_hybrid_stream(void * stream) { hybrid_compute_stream = stream; }
+    void set_hybrid_vram_buffer(ggml_backend_buffer_t buf) { hybrid_vram_buffer = buf; }
     void set_patch_graph_fn(void (*fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t)) { patch_graph_fn = fn; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -349,7 +351,9 @@ private:
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
-    void *              hybrid_orch         = nullptr; // hybrid_orchestrator * for speculative pipeline
+    void *              hybrid_orch              = nullptr; // hybrid_orchestrator * for speculative pipeline
+    void *              hybrid_compute_stream    = nullptr; // CUDA stream for GPU compute
+    ggml_backend_buffer_t hybrid_vram_buffer     = nullptr; // VRAM pool buffer for K/V
     void (*patch_graph_fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t) = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;

@@ -9,6 +9,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-kv-cache.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
@@ -1352,6 +1353,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
             }
             patch_graph_fn(gf, sched.get(), gpu);
+        }
+
+        // hybrid: register K/V tensors into VRAM pool buffer
+        if (hybrid_orch && hybrid_vram_buffer && mctx) {
+            auto * kvctx = dynamic_cast<llama_kv_cache_context *>(mctx);
+            if (kvctx) {
+                llama_kv_cache * kv = kvctx->get_raw();
+                if (kv) {
+                    kv->register_external_buft(hybrid_vram_buffer, 0, kv->get_size());
+                    LLAMA_LOG_INFO("%s: registered VRAM buffer for KV cache\n", __func__);
+                }
+            }
         }
 
         if (!gf) {
@@ -3588,6 +3601,14 @@ void llama_set_hybrid_orch(llama_context * ctx, void * orch) {
 
 void llama_set_patch_graph_fn(llama_context * ctx, void (*fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t)) {
     ctx->set_patch_graph_fn(fn);
+}
+
+void llama_set_hybrid_stream(llama_context * ctx, void * stream) {
+    ctx->set_hybrid_stream(stream);
+}
+
+void llama_set_hybrid_vram_buffer(llama_context * ctx, ggml_backend_buffer_t buf) {
+    ctx->set_hybrid_vram_buffer(buf);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

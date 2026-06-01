@@ -371,6 +371,7 @@ bool llama_kv_cache::register_external_buft(
                     __func__, il);
             return false;
         }
+        l.k->flags |= GGML_TENSOR_FLAG_EXT_BUF;
 
         offset += alloc_k;
 
@@ -386,6 +387,7 @@ bool llama_kv_cache::register_external_buft(
             l.v->data   = nullptr;
             st = ggml_backend_tensor_alloc(vram_buffer, l.v, base + offset);
             if (st != GGML_STATUS_SUCCESS) return false;
+            l.v->flags |= GGML_TENSOR_FLAG_EXT_BUF;
             offset += alloc_v;
         }
 

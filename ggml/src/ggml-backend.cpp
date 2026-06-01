@@ -1281,7 +1281,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if ((src->flags & GGML_TENSOR_FLAG_EXT_BUF) == 0 &&
+                    src_backend_id != cur_backend_id &&
+                    !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
                             break;
                         }

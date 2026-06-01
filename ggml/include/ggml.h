@@ -646,6 +646,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_EXT_BUF = 32, // ...data resides in an externally managed buffer (skip scheduler copy)
     };
 
     enum ggml_tri_type {

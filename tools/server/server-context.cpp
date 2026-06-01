@@ -1071,6 +1071,8 @@ private:
                 {
                     hybrid = std::move(h);
                     llama_set_hybrid_orch(ctx_tgt, hybrid.get());
+                    llama_set_hybrid_vram_buffer(ctx_tgt, hybrid->pool.backend_buffer());
+                    llama_set_hybrid_stream(ctx_tgt, hybrid->gpu_compute_stream);
                     llama_set_patch_graph_fn(ctx_tgt, hybrid_orchestrator::patch_graph_for_mla);
                     SRV_INF("%s", "hybrid speculative engine initialized\n");
                 } else {

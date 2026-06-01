@@ -397,6 +397,9 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // Access the underlying raw KV cache for external buffer registration.
+    llama_kv_cache * get_raw() const { return kv; }
+
 private:
     llama_memory_status status;
 

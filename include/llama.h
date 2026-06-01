@@ -984,6 +984,8 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
     LLAMA_API void llama_set_hybrid_orch(struct llama_context * ctx, void * orch);
+    LLAMA_API void llama_set_hybrid_stream(struct llama_context * ctx, void * stream);
+    LLAMA_API void llama_set_hybrid_vram_buffer(struct llama_context * ctx, ggml_backend_buffer_t buf);
     LLAMA_API void llama_set_patch_graph_fn(struct llama_context * ctx, void (*fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t));
 
     // Wait until all computations are finished
