@@ -168,13 +168,23 @@ MLA compression (512 elements FP8 per layer per token) is sent to VRAM via TMA d
 ## Error Handling
 
 | Failure mode | Response |
-|---|---|
+|---|---|---|
 | TMA enqueue fails (NACK) | Fall back to `cudaMemcpyAsync` |
 | VRAM pool exhausted | Log warning, stall until GPU frees a slot |
 | Draft model OOM | Disable speculative mode, fall back to target-only |
 | Expert prefetch misses | CPU stalls waiting for DDR5 (penalty ~100 ns, acceptable) |
 | `llama_kv_cache_seq_rm` failure (OOM) | Reload from checkpoint (unlikely with O(1) metadata op) |
 | Tool-call token in draft lookahead | `sampler_gen_phase` masks it; verification fails → rollback to last non-tool token |
+| VRAM pool / `ggml-alloc` conflict | Pre-allocate MLA KV-cache pool on a separate CUDA memory arena, registered as an external backend buffer in `ggml-alloc` via `ggml_backend_alloc_buffer()`. This ensures ggml-alloc tracks the pool and never double-allocates. |
+
+## VRAM Pool Isolation from ggml-alloc
+
+The MLA KV-cache pool must not conflict with ggml-alloc's dynamic device allocations:
+
+1. **Separate arena:** Allocate pool via `cudaMalloc` directly (not through ggml-alloc), then register it as an external `ggml_backend_buffer` via `ggml_backend_cuda_buffer_type()` + `ggml_backend_alloc_buffer()`. This gives ggml-alloc full visibility of the reserved region without surrendering control over its layout.
+2. **Pin at context init:** Pool size computed at `llama_init_from_model()` time: `(n_ctx_max + 2 * max_lookahead) * n_layers * kv_lora_rank * sizeof(fp8)`. Allocated once, never resized.
+3. **Sub-allocation:** The orchestrator manages its own freelist of `(layer, seq_pos)` slots within the pool. No interaction with ggml-alloc's general allocation path during decode.
+4. **Reserved region:** Blackwell TMA descriptors reference GPU virtual addresses within this pool. Register the VA range with CUDA to prevent TLB conflicts with ggml-alloc's allocations.
 
 ## Files Changed
 
@@ -192,6 +202,7 @@ MLA compression (512 elements FP8 per layer per token) is sent to VRAM via TMA d
 | `ggml/src/ggml-cuda/tma-transfer.h` | Add `tma_enqueue_1d` H2D API |
 | `common/common.h` | Param flags: `--hybrid-pipeline`, `--kv-vram` |
 | `common/common.cpp` | Parse new flags |
+| `ggml-alloc` / `ggml-backend` | Register external MLA KV-cache pool buffer; ensure no double-alloc with ggml-alloc's dynamic pool |
 
 ## Testing Strategy
 
