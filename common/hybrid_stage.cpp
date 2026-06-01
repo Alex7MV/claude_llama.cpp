@@ -114,8 +114,8 @@ void hybrid_orchestrator::patch_graph_for_mla(
 {
     if (!gf || !sched || !gpu_backend) return;
     int patched = 0;
-    for (int i = 0; i < gf->n_nodes; i++) {
-        ggml_tensor * node = gf->nodes[i];
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
         if (node->op == GGML_OP_FLASH_ATTN_EXT &&
             ggml_backend_supports_op(gpu_backend, node))
         {
