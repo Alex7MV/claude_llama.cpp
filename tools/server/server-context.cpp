@@ -2429,7 +2429,7 @@ private:
                     const int64_t t_start = ggml_time_us();
                     slot.prompt_save(*prompt_cache);
                     prompt_cache->update();
-                    SLT_INF(slot, "saved pre-shift snapshot (%zu tokens, %.1f ms)\n",
+                    SLT_INF(slot, "saved pre-shift snapshot (%d tokens, %.1f ms)\n",
                             slot.prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0);
                 }
 
