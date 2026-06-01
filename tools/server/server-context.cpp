@@ -2472,43 +2472,80 @@ private:
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
-                const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-                const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-
-                const int n_draft_max = slot.get_n_draft_max();
-
-                if (n_draft_max > 0) {
-                    GGML_ASSERT(slot.can_speculate());
-
-                    if (!slot.spec_draft.empty()) {
-                        // we have a previous (partial) draft to reuse
-                        if (use_ckpt_tgt) {
-                            GGML_ASSERT(!slot.spec_ckpt.empty());
-                        }
-                    } else {
-                        GGML_ASSERT(slot.spec_i_batch.empty());
-
+                if (slot.hybrid) {
+                    // Hybrid speculative draft: run draft model directly via orchestrator
+                    if (slot.spec_draft.empty()) {
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        slot.hybrid->start_draft_batch([this, &slot]() {
+                            // Copy target context state to draft model
+                            std::vector<uint8_t> tmp;
+                            const size_t sz = llama_state_seq_get_size_ext(
+                                ctx_tgt, slot.id,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            if (sz > 0) {
+                                tmp.resize(sz);
+                                llama_state_seq_get_data_ext(
+                                    ctx_tgt, tmp.data(), sz, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                                llama_state_seq_set_data_ext(
+                                    ctx_dft.get(), tmp.data(), sz, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            }
+
+                            for (uint32_t i = 0; i < slot.hybrid->current_draft; i++) {
+                                llama_token token = common_sampler_sample(
+                                    slot.smpl.get(), ctx_dft.get(), 0);
+                                slot.hybrid->draft.lookahead_buffer.push_back(token);
+                                if (llama_decode(ctx_dft.get(), llama_batch_get_one(&token, 1))) break;
+                            }
+                        });
+
+                        slot.spec_draft = slot.hybrid->draft.lookahead_buffer;
+                        slot.n_draft_total += slot.spec_draft.size();
+                    }
+                } else {
+                    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                    const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+                    const int n_draft_max = slot.get_n_draft_max();
+
+                    if (n_draft_max > 0) {
+                        GGML_ASSERT(slot.can_speculate());
+
+                        if (!slot.spec_draft.empty()) {
+                            // we have a previous (partial) draft to reuse
+                            if (use_ckpt_tgt) {
+                                GGML_ASSERT(!slot.spec_ckpt.empty());
+                            }
+                        } else {
+                            GGML_ASSERT(slot.spec_i_batch.empty());
+
+                            slot.spec_ckpt.update_pos(
+                                    slot.prompt.n_tokens(),
+                                    llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                            if (use_ckpt_dft) {
+                                slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            }
+
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+
+                            common_speculative_get_draft_params(spec.get(), slot.id) = {
+                                /* .drafting = */ true,
+                                /* .n_max    = */ n_draft_max,
+                                /* .n_past   = */ slot.prompt.n_tokens(),
+                                /* .id_last  = */ slot.sampled,
+                                /* .prompt   = */ &slot.spec_prompt,
+                                /* .result   = */ &slot.spec_draft,
+                            };
+
+                            drafting.push_back(&slot);
                         }
-
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
-
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                        };
-
-                        drafting.push_back(&slot);
                     }
                 }
             }
