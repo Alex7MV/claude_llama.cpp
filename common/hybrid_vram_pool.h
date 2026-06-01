@@ -16,7 +16,8 @@ struct hybrid_vram_pool {
         uint32_t kv_lora_rank,
         uint32_t max_lookahead,
         ggml_backend_dev_t device,
-        uint32_t key_dim = 0);
+        ggml_type   cache_type_k = GGML_TYPE_F16,
+        uint32_t    key_dim      = 0);
 
     void free_all();
 
@@ -25,13 +26,13 @@ struct hybrid_vram_pool {
     ggml_backend_buffer_t backend_buffer() const { return m_dev_buffer; }
 
 private:
-    float *  m_device_ptr      = nullptr;
-    uint64_t m_total_bytes     = 0;
-    uint32_t m_n_layers        = 0;
-    uint32_t m_n_ctx_max       = 0;
-    uint32_t m_kv_lora_rank    = 0;
-    uint32_t m_stride_elements = 0;
-    uint32_t m_stride          = 0;
+    float *  m_device_ptr    = nullptr;
+    uint64_t m_total_bytes   = 0;
+    uint32_t m_n_layers      = 0;
+    uint32_t m_n_ctx_max     = 0;
+    uint32_t m_kv_lora_rank  = 0;
+    uint32_t m_per_slot_bytes = 0;
+    uint32_t m_stride         = 0;
 
     ggml_backend_buffer_t m_dev_buffer = nullptr;
     ggml_backend_dev_t    m_device     = nullptr;

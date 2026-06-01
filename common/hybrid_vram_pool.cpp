@@ -3,8 +3,6 @@
 
 #ifdef GGML_USE_CUDA
 
-static constexpr uint32_t FP8_BYTES = 1;
-
 hybrid_vram_pool::~hybrid_vram_pool() { free_all(); }
 
 bool hybrid_vram_pool::init(
@@ -13,16 +11,21 @@ bool hybrid_vram_pool::init(
     uint32_t kv_lora_rank,
     uint32_t max_lookahead,
     ggml_backend_dev_t device,
-    uint32_t key_dim)
+    ggml_type   cache_type_k,
+    uint32_t    key_dim)
 {
-    m_n_layers        = n_layers;
-    m_n_ctx_max       = n_ctx_max;
-    m_kv_lora_rank    = kv_lora_rank;
-    m_stride_elements = key_dim > 0 ? key_dim : kv_lora_rank;
-    m_device          = device;
+    m_n_layers      = n_layers;
+    m_n_ctx_max     = n_ctx_max;
+    m_kv_lora_rank  = kv_lora_rank;
+    m_device        = device;
 
+    uint32_t ne     = key_dim > 0 ? key_dim : kv_lora_rank;
+    m_per_slot_bytes = (uint32_t)ggml_row_size(cache_type_k, ne);
+
+    // n_slots may exceed kv_size due to lookahead — the extra slots
+    // provide headroom for CUDA's MATRIX_ROW_PADDING (512) alignment
     uint32_t n_slots = n_ctx_max + 2 * max_lookahead;
-    m_stride = static_cast<uint64_t>(n_slots) * m_stride_elements * FP8_BYTES;
+    m_stride = static_cast<uint64_t>(n_slots) * m_per_slot_bytes;
     m_total_bytes = static_cast<uint64_t>(m_n_layers) * m_stride;
 
     if (!device) {
@@ -48,8 +51,8 @@ bool hybrid_vram_pool::init(
 
     ggml_backend_buffer_clear(m_dev_buffer, 0);
 
-    fprintf(stderr, "hybrid_vram_pool: allocated %.2f GB VRAM (%u layers, %u ctx, rank=%u, stride_el=%u)\n",
-            m_total_bytes / (double)(1ull << 30), n_layers, n_ctx_max, kv_lora_rank, m_stride_elements);
+    fprintf(stderr, "hybrid_vram_pool: allocated %.2f GB VRAM (%u layers, %u ctx, rank=%u, slot_bytes=%u)\n",
+            m_total_bytes / (double)(1ull << 30), n_layers, n_ctx_max, kv_lora_rank, m_per_slot_bytes);
     return true;
 }
 
@@ -66,7 +69,7 @@ float * hybrid_vram_pool::slot_ptr(uint32_t layer, uint32_t seq_pos) const {
     return reinterpret_cast<float *>(
         reinterpret_cast<uint8_t *>(m_device_ptr)
         + static_cast<uint64_t>(layer) * m_stride
-        + static_cast<uint64_t>(seq_pos) * m_stride_elements * FP8_BYTES);
+        + static_cast<uint64_t>(seq_pos) * m_per_slot_bytes);
 }
 
 #else // !GGML_USE_CUDA
@@ -74,7 +77,7 @@ float * hybrid_vram_pool::slot_ptr(uint32_t layer, uint32_t seq_pos) const {
 hybrid_vram_pool::~hybrid_vram_pool() {}
 
 bool hybrid_vram_pool::init(
-    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_dev_t)
+    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_dev_t, ggml_type, uint32_t)
 {
     return false;
 }

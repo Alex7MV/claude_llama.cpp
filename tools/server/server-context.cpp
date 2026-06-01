@@ -1088,6 +1088,7 @@ private:
                         params_base.speculative.draft.n_max > 0
                             ? (uint32_t)params_base.speculative.draft.n_max
                             : 6,
+                        params_base.cache_type_k,
                         key_dim))
                 {
                     hybrid = std::move(h);

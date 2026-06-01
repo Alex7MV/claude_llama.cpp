@@ -14,7 +14,8 @@ bool hybrid_orchestrator::init(
     void * compute_stream,
     void * draft_stream_,
     uint32_t max_draft_,
-    uint32_t key_dim)
+    ggml_type  cache_type_k,
+    uint32_t   key_dim)
 {
     n_layers       = n_layers_;
     kv_lora_rank   = kv_lora_rank_;
@@ -23,7 +24,7 @@ bool hybrid_orchestrator::init(
     max_draft = max_draft_ > 0 ? max_draft_ : 6;
     current_draft = max_draft;
 
-    if (!pool.init(n_layers_, n_ctx_max, kv_lora_rank_, max_lookahead, device, key_dim)) {
+    if (!pool.init(n_layers_, n_ctx_max, kv_lora_rank_, max_lookahead, device, cache_type_k, key_dim)) {
         fprintf(stderr, "hybrid_orchestrator: VRAM pool init failed\n");
         return false;
     }
@@ -135,7 +136,7 @@ void hybrid_orchestrator::patch_graph_for_mla(
 bool hybrid_orchestrator::init(
     uint32_t, uint32_t, uint32_t, uint32_t,
     ggml_backend_dev_t, void *, void *,
-    uint32_t, uint32_t)
+    uint32_t, ggml_type, uint32_t)
 {
     fprintf(stderr, "hybrid_orchestrator: CUDA not available\n");
     return false;

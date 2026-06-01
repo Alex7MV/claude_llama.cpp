@@ -72,7 +72,8 @@ struct hybrid_orchestrator {
         void * compute_stream,
         void * draft_stream,
         uint32_t max_draft = 6,
-        uint32_t key_dim = 0);
+        ggml_type  cache_type_k = GGML_TYPE_F16,
+        uint32_t   key_dim      = 0);
 
     void free_all();
 
