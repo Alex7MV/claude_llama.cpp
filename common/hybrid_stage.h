@@ -4,6 +4,7 @@
 #include <vector>
 #include <functional>
 #include "llama.h"
+#include "common.h"
 #include "hybrid_vram_pool.h"
 
 enum class hybrid_phase : uint8_t {
