@@ -2715,6 +2715,50 @@ private:
                                     kv_trace(slot, KV_TRACE_PREFIX_MISMATCH, buf);
                                 }
 
+                                // [KV] PREFIX_REPAIR — guard against spurious n_past reset.
+                                // When get_common_prefix returns 0 or a partial match for a slot
+                                // that has cached tokens, it means state was cleared between
+                                // requests (e.g., idle-slot eviction, chat template divergence).
+                                // Verify the actual cached prefix and force n_past if valid.
+                                if (slot.prompt.n_tokens() > 0 && n_past < (int)slot.prompt.n_tokens()) {
+                                    const size_t limit = std::min(slot.prompt.n_tokens(), input_tokens.size());
+                                    // Log exact divergence point
+                                    const size_t d = (n_past > 0 && (size_t)n_past < limit) ? (size_t)n_past : 0;
+                                    if (d < limit) {
+                                        std::string pc = common_token_to_piece(ctx_tgt, slot.prompt.tokens[d]);
+                                        std::string pt = common_token_to_piece(ctx_tgt, input_tokens[d]);
+                                        SLT_WRN(slot, "Mismatch at token pos %zu: Cache has ID %d '%s', Task has ID %d '%s'\n",
+                                                d, slot.prompt.tokens[d], pc.c_str(), input_tokens[d], pt.c_str());
+                                    }
+                                    // Verify the full cached prefix actually matches the new input
+                                    bool full_match = true;
+                                    const size_t check_end = std::min(slot.prompt.n_tokens(), input_tokens.size());
+                                    for (size_t i = 0; i < check_end; i++) {
+                                        if (slot.prompt.tokens[i] != input_tokens[i]) {
+                                            full_match = false;
+                                            const size_t nearby_l = (i > 3) ? i - 3 : 0;
+                                            const size_t nearby_r = std::min(check_end, i + 4);
+                                            for (size_t j = nearby_l; j < nearby_r; j++) {
+                                                if (j == i) {
+                                                    SLT_WRN(slot, "  ---> DIVERGENCE at pos %zu: cache=%d task=%d\n",
+                                                            j, slot.prompt.tokens[j], input_tokens[j]);
+                                                } else {
+                                                    std::string pc2 = common_token_to_piece(ctx_tgt, slot.prompt.tokens[j]);
+                                                    std::string pt2 = common_token_to_piece(ctx_tgt, input_tokens[j]);
+                                                    SLT_DBG(slot, "  pos %zu: cache='%s' (%d)  task='%s' (%d)\n",
+                                                            j, pc2.c_str(), slot.prompt.tokens[j], pt2.c_str(), input_tokens[j]);
+                                                }
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    if (full_match) {
+                                        SLT_INF(slot, "PREFIX_REPAIR: forcing n_past from %d to %zu\n",
+                                                n_past, slot.prompt.n_tokens());
+                                        n_past = (int)slot.prompt.n_tokens();
+                                    }
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -3218,9 +3262,9 @@ private:
                 int n_ops = 0;
                 const char * ops = ggml_backend_cuda_get_trace_ops(nullptr, &n_ops);
                 if (n_ops > 0) {
-                    SRV_WRN("[KV][CUDA] ngl=%d n_ops=%d ops=%s\n",
-                            params_base.n_gpu_layers, n_ops, ops ? ops : "");
-                    ggml_backend_cuda_reset_trace_ops(nullptr);
+                    SRV_ERR("[KV][CUDA] CRITICAL: ngl=%d but %d CUDA ops leaked — permanently disabling GPU trace\n",
+                            params_base.n_gpu_layers, n_ops);
+                    ggml_backend_cuda_set_trace_ops(nullptr, false);
                 }
             }
 
