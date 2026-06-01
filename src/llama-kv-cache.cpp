@@ -340,9 +340,9 @@ bool llama_kv_cache::register_external_buft(
 {
     if (!vram_buffer) return false;
 
-    const bool is_mla = hparams.is_mla();
     char * base = (char *)ggml_backend_buffer_get_base(vram_buffer);
     size_t buf_size = ggml_backend_buffer_get_size(vram_buffer);
+    size_t offset = 0;
 
     for (uint32_t il = il_start; il < il_end && il < hparams.n_layer; il++) {
         auto it = map_layer_ids.find(il);
@@ -350,26 +350,20 @@ bool llama_kv_cache::register_external_buft(
         auto & l = layers[it->second];
         if (!l.k) continue;
 
-        size_t nbytes_k = ggml_nbytes(l.k);
+        size_t alloc_k = ggml_backend_buffer_get_alloc_size(vram_buffer, l.k);
+        if (!alloc_k) alloc_k = ggml_nbytes(l.k);
 
-        // find an unused region in vram_buffer for this tensor
-        // simple layout: pack layers consecutively
-        size_t offset = (size_t)(il - il_start) * (buf_size / (il_end - il_start));
-
-        if (offset + nbytes_k > buf_size) {
+        if (offset + alloc_k > buf_size) {
             fprintf(stderr, "%s: VRAM buffer too small for layer %u "
                     "(need %llu, have %llu)\n", __func__, il,
-                    (unsigned long long)(offset + nbytes_k),
+                    (unsigned long long)(offset + alloc_k),
                     (unsigned long long)buf_size);
             return false;
         }
 
-        // detach tensor from its current buffer (null out old pointers
-        // to prevent accidental use; the old buffer still owns the memory)
         l.k->buffer = nullptr;
         l.k->data   = nullptr;
 
-        // attach to the VRAM buffer at the calculated offset
         enum ggml_status st = ggml_backend_tensor_alloc(
             vram_buffer, l.k, base + offset);
         if (st != GGML_STATUS_SUCCESS) {
@@ -378,16 +372,21 @@ bool llama_kv_cache::register_external_buft(
             return false;
         }
 
-        offset += nbytes_k;
+        offset += alloc_k;
 
-        // also remap V cache (non-MLA only)
         if (l.v) {
-            size_t nbytes_v = ggml_nbytes(l.v);
+            size_t alloc_v = ggml_backend_buffer_get_alloc_size(vram_buffer, l.v);
+            if (!alloc_v) alloc_v = ggml_nbytes(l.v);
+            if (offset + alloc_v > buf_size) {
+                fprintf(stderr, "%s: VRAM buffer too small for layer %u V cache\n",
+                        __func__, il);
+                return false;
+            }
             l.v->buffer = nullptr;
             l.v->data   = nullptr;
             st = ggml_backend_tensor_alloc(vram_buffer, l.v, base + offset);
             if (st != GGML_STATUS_SUCCESS) return false;
-            offset += nbytes_v;
+            offset += alloc_v;
         }
 
     }

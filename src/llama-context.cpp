@@ -12,7 +12,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
-#include "hybrid_stage.h"
+#include "../common/hybrid_stage.h"
 
 #include <cinttypes>
 #include <cmath>
