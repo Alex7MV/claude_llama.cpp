@@ -1344,8 +1344,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // hybrid: assign flash-attn ops to GPU backend via callback
         if (hybrid_orch && patch_graph_fn) {
             ggml_backend_t gpu = nullptr;
-            for (size_t _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
-                auto * _b = ggml_backend_sched_get_backend(sched.get(), (int)_bi);
+            for (int _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
+                auto * _b = ggml_backend_sched_get_backend(sched.get(), _bi);
                 auto * _dev = ggml_backend_get_device(_b);
                 if (_dev && ggml_backend_dev_type(_dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                     gpu = _b; break;
