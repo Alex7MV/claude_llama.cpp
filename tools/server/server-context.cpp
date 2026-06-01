@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -1062,11 +1063,17 @@ private:
                 // For MLA models: key_dim = key_length (kv_lora_rank + qk_rope_head_dim) * n_head_kv(1)
                 uint32_t key_dim = 0;
                 {
-                    char buf[32];
+                    char buf[64];
                     int32_t ret = llama_model_meta_val_str(
-                        llama_get_model(ctx_tgt), "llama.key_length", buf, sizeof(buf));
+                        llama_get_model(ctx_tgt), "general.architecture", buf, sizeof(buf));
                     if (ret > 0) {
-                        key_dim = (uint32_t)std::atoi(buf);
+                        char key_buf[128];
+                        snprintf(key_buf, sizeof(key_buf), "%s.attention.key_length", buf);
+                        ret = llama_model_meta_val_str(
+                            llama_get_model(ctx_tgt), key_buf, buf, sizeof(buf));
+                        if (ret > 0) {
+                            key_dim = (uint32_t)std::atoi(buf);
+                        }
                     }
                 }
                 ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
