@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -1056,9 +1057,18 @@ private:
         if (params_base.hybrid_pipeline && ctx_tgt) {
             try {
                 auto h = std::make_unique<hybrid_orchestrator>();
-                // kv_lora_rank = 512 for MLA models (DeepSeek-V3, Kimi-k2.6);
-                // detect via model hparams when API is available, default to 512
                 uint32_t kv_lora_rank = 512;
+                // key_dim = n_embd_k_gqa = n_embd_head_k_full * n_head_kv
+                // For MLA models: key_dim = key_length (kv_lora_rank + qk_rope_head_dim) * n_head_kv(1)
+                uint32_t key_dim = 0;
+                {
+                    char buf[32];
+                    int32_t ret = llama_model_meta_val_str(
+                        llama_get_model(ctx_tgt), "llama.key_length", buf, sizeof(buf));
+                    if (ret > 0) {
+                        key_dim = (uint32_t)std::atoi(buf);
+                    }
+                }
                 ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
                 if (h->init(
                         llama_model_n_layer(llama_get_model(ctx_tgt)),
@@ -1070,7 +1080,8 @@ private:
                         nullptr,
                         params_base.speculative.draft.n_max > 0
                             ? (uint32_t)params_base.speculative.draft.n_max
-                            : 6))
+                            : 6,
+                        key_dim))
                 {
                     hybrid = std::move(h);
                     llama_set_hybrid_orch(ctx_tgt, hybrid.get());

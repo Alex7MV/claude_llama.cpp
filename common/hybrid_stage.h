@@ -71,7 +71,8 @@ struct hybrid_orchestrator {
         ggml_backend_dev_t device,
         void * compute_stream,
         void * draft_stream,
-        uint32_t max_draft = 6);
+        uint32_t max_draft = 6,
+        uint32_t key_dim = 0);
 
     void free_all();
 
