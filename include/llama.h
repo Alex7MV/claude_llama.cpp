@@ -983,6 +983,7 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+    LLAMA_API void llama_set_hybrid_orch(struct llama_context * ctx, void * orch);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

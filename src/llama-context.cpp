@@ -12,6 +12,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "hybrid_stage.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -1339,6 +1340,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        // hybrid: assign flash-attn ops to GPU backend
+        if (hybrid_orch) {
+            ggml_backend_t gpu = nullptr;
+            for (size_t _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
+                auto * _b = ggml_backend_sched_get_backend(sched.get(), (int)_bi);
+                auto * _dev = ggml_backend_get_device(_b);
+                if (_dev && ggml_backend_dev_type(_dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu = _b; break;
+                }
+            }
+            hybrid_orchestrator::patch_graph_for_mla(gf, sched.get(), gpu);
+        }
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -3566,6 +3580,10 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_hybrid_orch(llama_context * ctx, void * orch) {
+    ctx->set_hybrid_orch(orch);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

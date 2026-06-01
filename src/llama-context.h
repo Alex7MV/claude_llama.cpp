@@ -234,6 +234,9 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // hybrid speculative orchestrator (set by server/main)
+    void set_hybrid_orch(void * orch) { hybrid_orch = orch; }
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 

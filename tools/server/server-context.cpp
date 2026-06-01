@@ -1070,6 +1070,7 @@ private:
                         nullptr))
                 {
                     hybrid = std::move(h);
+                    llama_set_hybrid_orch(ctx_tgt, hybrid.get());
                     SRV_INF("%s", "hybrid speculative engine initialized\n");
                 } else {
                     SRV_WRN("%s", "hybrid speculative engine init failed\n");
