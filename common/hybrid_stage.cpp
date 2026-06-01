@@ -3,7 +3,7 @@
 
 #ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
-#include "ggml/src/ggml-cuda/tma-transfer.h"
+#include "ggml-cuda/tma-transfer.h"
 
 bool hybrid_orchestrator::init(
     uint32_t n_layers_,
