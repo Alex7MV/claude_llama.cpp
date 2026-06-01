@@ -1,5 +1,7 @@
 #include "hybrid_vram_pool.h"
 #include <cstdio>
+
+#ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
 
 static constexpr uint32_t FP8_BYTES = 1;
@@ -60,3 +62,18 @@ float * hybrid_vram_pool::slot_ptr(uint32_t layer, uint32_t seq_pos) const {
         + static_cast<uint64_t>(layer) * m_stride
         + static_cast<uint64_t>(seq_pos) * m_kv_lora_rank * FP8_BYTES);
 }
+
+#else // !GGML_USE_CUDA
+
+hybrid_vram_pool::~hybrid_vram_pool() {}
+
+bool hybrid_vram_pool::init(
+    uint32_t, uint32_t, uint32_t, uint32_t, ggml_backend_t)
+{
+    return false;
+}
+
+void hybrid_vram_pool::free_all() {}
+float * hybrid_vram_pool::slot_ptr(uint32_t, uint32_t) const { return nullptr; }
+
+#endif // GGML_USE_CUDA

@@ -1,5 +1,7 @@
 #include "hybrid_stage.h"
 #include <cstdio>
+
+#ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
 #include "ggml/src/ggml-cuda/tma-transfer.h"
 
@@ -46,24 +48,6 @@ void hybrid_orchestrator::free_all() {
     stages.clear();
 }
 
-void hybrid_orchestrator::on_norm_done(uint32_t layer, const int32_t expert_ids[2]) {
-    auto & s = stages[layer];
-    s.phase.store(hybrid_phase::NORM_DONE);
-
-    s.prefetch.expert_ids[0] = expert_ids[0];
-    s.prefetch.expert_ids[1] = expert_ids[1];
-    s.prefetch.prefetched    = true;
-}
-
-void hybrid_orchestrator::on_kv_compressed(uint32_t layer, const float * c_tkv_cpu) {
-    auto & s = stages[layer];
-    s.phase.store(hybrid_phase::KV_COMPRESSED);
-
-    s.tma.cpu_src  = c_tkv_cpu;
-    s.tma.bytes    = static_cast<uint64_t>(kv_lora_rank) * 1;
-    s.tma.enqueued = false;
-}
-
 void hybrid_orchestrator::on_tma_enqueued(uint32_t layer) {
     auto & s = stages[layer];
 
@@ -91,6 +75,40 @@ void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
             reinterpret_cast<cudaEvent_t>(tma_events[(tma_head - 2) & 1]));
     }
     stages[layer].phase.store(hybrid_phase::GPU_ATTN_DONE);
+}
+
+#else // !GGML_USE_CUDA
+
+bool hybrid_orchestrator::init(
+    uint32_t, uint32_t, uint32_t, uint32_t,
+    ggml_backend_t, void *, void *)
+{
+    fprintf(stderr, "hybrid_orchestrator: CUDA not available\n");
+    return false;
+}
+
+void hybrid_orchestrator::free_all() { stages.clear(); }
+void hybrid_orchestrator::on_tma_enqueued(uint32_t) {}
+void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
+
+#endif // GGML_USE_CUDA
+
+void hybrid_orchestrator::on_norm_done(uint32_t layer, const int32_t expert_ids[2]) {
+    auto & s = stages[layer];
+    s.phase.store(hybrid_phase::NORM_DONE);
+
+    s.prefetch.expert_ids[0] = expert_ids[0];
+    s.prefetch.expert_ids[1] = expert_ids[1];
+    s.prefetch.prefetched    = true;
+}
+
+void hybrid_orchestrator::on_kv_compressed(uint32_t layer, const float * c_tkv_cpu) {
+    auto & s = stages[layer];
+    s.phase.store(hybrid_phase::KV_COMPRESSED);
+
+    s.tma.cpu_src  = c_tkv_cpu;
+    s.tma.bytes    = static_cast<uint64_t>(kv_lora_rank) * 1;
+    s.tma.enqueued = false;
 }
 
 void hybrid_orchestrator::on_merge_done(uint32_t layer) {

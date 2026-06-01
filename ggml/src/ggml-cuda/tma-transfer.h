@@ -37,6 +37,9 @@ void ggml_tma_free_transfer(ggml_tma_transfer_t transfer);
 #ifdef __cplusplus
 }
 
+#ifdef GGML_USE_CUDA
+#include <cuda_runtime.h>
+
 // C++ convenience wrapper: enqueue a 1D H2D transfer from pinned CPU to VRAM.
 // Returns true if TMA was launched; false => caller should use cudaMemcpyAsync.
 inline bool ggml_tma_enqueue_h2d_1d(
@@ -75,5 +78,6 @@ inline bool ggml_tma_enqueue_h2d_1d(
     ggml_tma_free_transfer(tma_desc);
     return true;
 }
+#endif // GGML_USE_CUDA
 
-#endif
+#endif // __cplusplus
