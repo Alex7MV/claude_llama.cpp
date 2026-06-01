@@ -69,12 +69,42 @@ void hybrid_orchestrator::on_tma_enqueued(uint32_t layer) {
     s.phase = hybrid_phase::TMA_ENQUEUED;
 }
 
-void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
-    if (tma_head >= 2) {
-        cudaEventSynchronize(
-            reinterpret_cast<cudaEvent_t>(tma_events[(tma_head - 2) & 1]));
+bool hybrid_orchestrator::wait_tma_event() {
+    if (tma_head < 2) return true; // nothing to wait for yet
+    cudaEvent_t ev = reinterpret_cast<cudaEvent_t>(tma_events[(tma_head - 2) & 1]);
+    // non-blocking probe
+    for (int spin = 0; spin < 64; spin++) {
+        cudaError_t err = cudaEventQuery(ev);
+        if (err == cudaSuccess) return true;
+        if (err != cudaErrorNotReady) return false;
+        __builtin_ia32_pause();
     }
+    // fallback to blocking sync
+    cudaError_t err = cudaEventSynchronize(ev);
+    return err == cudaSuccess;
+}
+
+void hybrid_orchestrator::on_gpu_attn_done(uint32_t layer) {
+    wait_tma_event();
     stages[layer].phase = hybrid_phase::GPU_ATTN_DONE;
+}
+
+void hybrid_orchestrator::trace_tma_verify(uint32_t layer) {
+    auto & s = stages[layer];
+    float * dst = pool.slot_ptr(layer, current_token + layer);
+
+    float readback[4];
+    cudaMemcpy(readback, dst, sizeof(readback), cudaMemcpyDeviceToHost);
+
+    fprintf(stderr,
+        "hybrid[TMA] layer=%u pos=%u head=%d src=%p dst=%p "
+        "bytes=%llu enq=%d rb=[%f %f %f %f] phase=%d\n",
+        layer, current_token + layer, tma_head,
+        (void*)s.tma.cpu_src, (void*)dst,
+        (unsigned long long)s.tma.bytes,
+        (int)s.tma.enqueued,
+        readback[0], readback[1], readback[2], readback[3],
+        (int)s.phase);
 }
 
 #else // !GGML_USE_CUDA
@@ -89,7 +119,9 @@ bool hybrid_orchestrator::init(
 
 void hybrid_orchestrator::free_all() { stages.clear(); }
 void hybrid_orchestrator::on_tma_enqueued(uint32_t) {}
+bool hybrid_orchestrator::wait_tma_event() { return true; }
 void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
+void hybrid_orchestrator::trace_tma_verify(uint32_t) {}
 
 #endif // GGML_USE_CUDA
 

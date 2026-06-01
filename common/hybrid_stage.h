@@ -71,8 +71,10 @@ struct hybrid_orchestrator {
     void on_norm_done(uint32_t layer, const int32_t expert_ids[2]);
     void on_kv_compressed(uint32_t layer, const float * c_tkv_cpu);
     void on_tma_enqueued(uint32_t layer);
+    bool wait_tma_event();
     void on_gpu_attn_done(uint32_t layer);
     void on_merge_done(uint32_t layer);
+    void trace_tma_verify(uint32_t layer);
 
     void advance_token();
 
