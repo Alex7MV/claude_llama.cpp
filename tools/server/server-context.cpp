@@ -2721,7 +2721,7 @@ private:
                                 // requests (e.g., idle-slot eviction, chat template divergence).
                                 // Verify the actual cached prefix and force n_past if valid.
                                 if (slot.prompt.n_tokens() > 0 && n_past < (int)slot.prompt.n_tokens()) {
-                                    const size_t limit = std::min(slot.prompt.n_tokens(), input_tokens.size());
+                                    const size_t limit = std::min((size_t)slot.prompt.n_tokens(), input_tokens.size());
                                     // Log exact divergence point
                                     const size_t d = (n_past > 0 && (size_t)n_past < limit) ? (size_t)n_past : 0;
                                     if (d < limit) {
@@ -2732,7 +2732,7 @@ private:
                                     }
                                     // Verify the full cached prefix actually matches the new input
                                     bool full_match = true;
-                                    const size_t check_end = std::min(slot.prompt.n_tokens(), input_tokens.size());
+                                    const size_t check_end = std::min((size_t)slot.prompt.n_tokens(), input_tokens.size());
                                     for (size_t i = 0; i < check_end; i++) {
                                         if (slot.prompt.tokens[i] != input_tokens[i]) {
                                             full_match = false;
@@ -2753,8 +2753,8 @@ private:
                                         }
                                     }
                                     if (full_match) {
-                                        SLT_INF(slot, "PREFIX_REPAIR: forcing n_past from %d to %zu\n",
-                                                n_past, slot.prompt.n_tokens());
+                                        SLT_INF(slot, "PREFIX_REPAIR: forcing n_past from %d to %d\n",
+                                                n_past, (int)slot.prompt.n_tokens());
                                         n_past = (int)slot.prompt.n_tokens();
                                     }
                                 }
@@ -3260,7 +3260,7 @@ private:
             // [KV][CUDA] per-decode op trace (ngl=0 leak detection)
             if (ret == 0 && params_base.n_gpu_layers == 0) {
                 int n_ops = 0;
-                const char * ops = ggml_backend_cuda_get_trace_ops(nullptr, &n_ops);
+                ggml_backend_cuda_get_trace_ops(nullptr, &n_ops);
                 if (n_ops > 0) {
                     SRV_ERR("[KV][CUDA] CRITICAL: ngl=%d but %d CUDA ops leaked — permanently disabling GPU trace\n",
                             params_base.n_gpu_layers, n_ops);
