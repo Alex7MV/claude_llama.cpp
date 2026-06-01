@@ -773,8 +773,10 @@ private:
         kv_trace(slot, KV_TRACE_SLOT_CACHED, "");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
-        slot.prompt_clear(false);
         prompt_cache->update();
+        // Note: do NOT prompt_clear() here — the slot retains its tokens
+        // and KV cache entries for fast reuse on the next matching request.
+        // When KV cache pressure arises, try_clear_idle_slots() handles eviction.
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -2893,10 +2895,12 @@ private:
                         }
 
                         // [TAG_PROMPT_LOGITS]
+                        // llama_decode() requires at least 1 token per batch.
+                        // When the entire prompt is already cached, we still eval the
+                        // last token to produce logits for sampling. This is ~1 token
+                        // of waste per fully-cached request — acceptable vs. cold start.
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
                             n_past--;
-                            SLT_WRN(slot, "n_past was set to %d\n", n_past);
                             {
                                 char buf[128];
                                 snprintf(buf, sizeof(buf), "was=%d now=%d", n_past + 1, n_past);
