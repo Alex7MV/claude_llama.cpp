@@ -2491,7 +2491,7 @@ private:
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
-                if (slot.hybrid) {
+                if (slot.hybrid && ctx_dft) {
                     // Hybrid speculative draft: run draft model directly via orchestrator
                     if (slot.spec_draft.empty()) {
                         slot.spec_ckpt.update_pos(
