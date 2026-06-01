@@ -236,6 +236,7 @@ public:
 
     // hybrid speculative orchestrator (set by server/main)
     void set_hybrid_orch(void * orch) { hybrid_orch = orch; }
+    void set_patch_graph_fn(void (*fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t)) { patch_graph_fn = fn; }
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
@@ -349,6 +350,7 @@ private:
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
     void *              hybrid_orch         = nullptr; // hybrid_orchestrator * for speculative pipeline
+    void (*patch_graph_fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t) = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 

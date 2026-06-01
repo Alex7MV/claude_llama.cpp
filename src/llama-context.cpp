@@ -12,7 +12,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
-#include "../common/hybrid_stage.h"
+
 
 #include <cinttypes>
 #include <cmath>
@@ -1341,8 +1341,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
-        // hybrid: assign flash-attn ops to GPU backend
-        if (hybrid_orch) {
+        // hybrid: assign flash-attn ops to GPU backend via callback
+        if (hybrid_orch && patch_graph_fn) {
             ggml_backend_t gpu = nullptr;
             for (size_t _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
                 auto * _b = ggml_backend_sched_get_backend(sched.get(), (int)_bi);
@@ -1351,7 +1351,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     gpu = _b; break;
                 }
             }
-            hybrid_orchestrator::patch_graph_for_mla(gf, sched.get(), gpu);
+            patch_graph_fn(gf, sched.get(), gpu);
         }
 
         if (!gf) {
@@ -3584,6 +3584,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_hybrid_orch(llama_context * ctx, void * orch) {
     ctx->set_hybrid_orch(orch);
+}
+
+void llama_set_patch_graph_fn(llama_context * ctx, void (*fn)(struct ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t)) {
+    ctx->set_patch_graph_fn(fn);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
