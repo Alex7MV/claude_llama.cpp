@@ -1397,6 +1397,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // hybrid: fence for async flash_attn — ensures GPU output is visible to CPU
+    if (hybrid_orch) {
+        hybrid_orch->hybrid_gpu_fence();
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;

@@ -6,6 +6,15 @@
 #include "common.h"
 #include "hybrid_vram_pool.h"
 
+// Thread-local pointer set by process_ubatch before graph compute.
+// Read by the CUDA flash_attn_ext handler to detect async mode.
+// Defined in hybrid_stage.cpp.
+#ifndef HYBRID_STAGE_H_
+#define HYBRID_STAGE_H_
+struct hybrid_orchestrator;
+extern thread_local hybrid_orchestrator * g_hybrid_ctx;
+#endif
+
 enum class hybrid_phase : uint8_t {
     IDLE,
     NORM_DONE,
@@ -43,6 +52,13 @@ struct hybrid_orchestrator {
     void * gpu_compute_stream = nullptr;
     void * draft_stream       = nullptr;
 
+    // --- Async flash_attn (separate stream, pinned output, event fence) ---
+    void * attn_stream = nullptr;   // separate cudaStream_t for async flash_attn
+    void * attn_event  = nullptr;   // cudaEvent_t recorded after attn completes
+
+    // Per-layer pinned CPU buffers for flash_attn output (F32, kq_head_dim elements)
+    std::vector<void *> attn_pinned;
+
     void * tma_events[2] = {};
     int    tma_head      = 0;
 
@@ -62,6 +78,8 @@ struct hybrid_orchestrator {
     uint32_t max_draft        = 6;
     uint32_t current_draft    = 6;
     float    accept_rate_ema  = 0.0f;
+
+    ~hybrid_orchestrator() { free_all(); }
 
     bool init(
         uint32_t n_layers,
@@ -93,6 +111,10 @@ struct hybrid_orchestrator {
         struct ggml_cgraph * gf,
         ggml_backend_sched_t sched,
         ggml_backend_t gpu_backend);
+
+    // CPU fence: blocks until the orchestrator's attn_event signals.
+    // Call before any CPU operation that reads the pinned attn output buffer.
+    void hybrid_gpu_fence();
 
     uint32_t verify_and_rollback(
         llama_context * ctx_tgt,

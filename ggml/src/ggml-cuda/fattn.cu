@@ -6,6 +6,13 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+// Set by hybrid_orchestrator before graph compute.
+// attn_global_event is the fence event — recorded on backend stream after
+// flash_attn, synchronised by hybrid_orchestrator::hybrid_gpu_fence().
+// attn_global_stream is an optional separate stream for future async D→H copies.
+cudaStream_t attn_global_stream   = nullptr;
+cudaEvent_t  attn_global_event    = nullptr;
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -539,6 +546,33 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    static bool _logged = false; if (!_logged) { _logged = true; fprintf(stderr, "DEBUG: Flash-Attn executing on [GPU]\n"); }
+
+    // --- Async mode: separate-stream flash_attn with deferred fence. ---
+    // op_params[4] set to non-zero by hybrid_orchestrator::patch_graph_for_mla.
+    // Slot 4 is free (op_params[0]=scale, [1]=max_bias, [2]=logit_softcap, [3]=prec).
+    bool is_async = dst->op_params[4] != 0;
+    if (is_async && attn_global_event) {
+        cudaStream_t be = ctx.stream();
+        // 1. Flash-attn kernel on BACKEND stream (output = GPU memory)
+        switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+            case BEST_FATTN_KERNEL_NONE:    GGML_ABORT("fatal error");
+            case BEST_FATTN_KERNEL_TILE:    ggml_cuda_flash_attn_ext_tile(ctx, dst); break;
+            case BEST_FATTN_KERNEL_VEC:     ggml_cuda_flash_attn_ext_vec(ctx, dst); break;
+            case BEST_FATTN_KERNEL_WMMA_F16: ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst); break;
+            case BEST_FATTN_KERNEL_MMA_F16: ggml_cuda_flash_attn_ext_mma_f16(ctx, dst); break;
+        }
+        // 2. Record event on backend stream for cache coherence at fence time.
+        //    The event is synced in process_ubatch via hybrid_gpu_fence().
+        //    Note: the scheduler already syncs the backend stream at the split
+        //    boundary (ggml_backend_synchronize, line 1667), so this event is
+        //    already complete by fence time.  We keep it as infrastructure for
+        //    future orchestrator-stream D→H copies (pinned buffer path).
+        cudaEventRecord(attn_global_event, be);
+        // Return — kernel was dispatched async on the backend stream
+        return;
+    }
+
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

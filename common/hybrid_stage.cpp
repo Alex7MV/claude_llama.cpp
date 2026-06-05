@@ -1,9 +1,13 @@
 #include "hybrid_stage.h"
 #include <cstdio>
 
+// Thread-local pointer read by the CUDA flash_attn_ext handler
+thread_local hybrid_orchestrator * g_hybrid_ctx = nullptr;
+
 #ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
 #include "ggml-cuda/tma-transfer.h"
+#include "ggml-cuda/fattn.cuh"
 
 bool hybrid_orchestrator::init(
     uint32_t n_layers_,
@@ -37,19 +41,53 @@ bool hybrid_orchestrator::init(
             cudaEventDisableTiming);
     }
 
-    fprintf(stderr, "hybrid_orchestrator: ready (%u layers, rank=%u)\n",
-            n_layers_, kv_lora_rank_);
+    // Create a separate CUDA stream for async flash_attn
+    cudaStreamCreateWithFlags(
+        reinterpret_cast<cudaStream_t *>(&attn_stream),
+        cudaStreamNonBlocking);
+    cudaEventCreateWithFlags(
+        reinterpret_cast<cudaEvent_t *>(&attn_event),
+        cudaEventDisableTiming);
+
+    // Register with the global fattn module so the CUDA backend can redirect
+    ggml_cuda_attn_set_async_ctx(
+        reinterpret_cast<cudaStream_t>(attn_stream),
+        reinterpret_cast<cudaEvent_t>(attn_event));
+
+    // Pre-allocate pinned CPU buffers for flash_attn output (one per layer)
+    // Size: head_dim * sizeof(float) = 128 * 4 = 512 bytes per slot
+    attn_pinned.resize(n_layers_, nullptr);
+    for (uint32_t i = 0; i < n_layers_; i++) {
+        cudaHostAlloc(&attn_pinned[i], 512, cudaHostAllocDefault);
+    }
+
+    fprintf(stderr, "hybrid_orchestrator: ready (%u layers, rank=%u, attn-stream=%p)\n",
+            n_layers_, kv_lora_rank_, (void*)attn_stream);
     return true;
 }
 
 void hybrid_orchestrator::free_all() {
     pool.free_all();
+    // Unregister from the fattn module
+    ggml_cuda_attn_set_async_ctx(nullptr, nullptr);
     for (int i = 0; i < 2; i++) {
         if (tma_events[i]) {
             cudaEventDestroy(reinterpret_cast<cudaEvent_t>(tma_events[i]));
             tma_events[i] = nullptr;
         }
     }
+    if (attn_stream) {
+        cudaStreamDestroy(reinterpret_cast<cudaStream_t>(attn_stream));
+        attn_stream = nullptr;
+    }
+    if (attn_event) {
+        cudaEventDestroy(reinterpret_cast<cudaEvent_t>(attn_event));
+        attn_event = nullptr;
+    }
+    for (auto * buf : attn_pinned) {
+        if (buf) cudaFreeHost(buf);
+    }
+    attn_pinned.clear();
     stages.clear();
 }
 
@@ -116,18 +154,44 @@ void hybrid_orchestrator::patch_graph_for_mla(
     ggml_backend_t gpu_backend)
 {
     if (!gf || !sched || !gpu_backend) return;
-    int patched = 0;
+    int patched_attn = 0;
+    int patched_cpy  = 0;
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         ggml_tensor * node = ggml_graph_node(gf, i);
         if (node->op == GGML_OP_FLASH_ATTN_EXT &&
             ggml_backend_supports_op(gpu_backend, node))
         {
             ggml_backend_sched_set_tensor_backend(sched, node, gpu_backend);
-            patched++;
+
+            // Mark for async execution: op_params[4] = 1 signals the CUDA
+            // flash_attn handler to record a fence event and return
+            // immediately.  Slot 4 is free (0=scale, 1=max_bias,
+            // 2=logit_softcap, 3=precision).
+            node->op_params[4] = 1;
+
+            patched_attn++;
+        }
+        // Move KV-cache write ops (cpy_k) to GPU — K cache is in VRAM,
+        // CPU backend cannot write to it.  Tensor name patterns:
+        //   DeepSeek-V3:  blk.N.k_cache_latent
+        //   Kimi-k2.6:    blk.N.k_cache_latent (MLA), blk.N.v_cache_compressed (KDA)
+        if (node->op == GGML_OP_CPY &&
+            node->dst &&
+            (strstr(node->dst->name, "k_cache_latent") ||
+             strstr(node->dst->name, "v_cache_compressed")) &&
+            ggml_backend_supports_op(gpu_backend, node))
+        {
+            ggml_backend_sched_set_tensor_backend(sched, node, gpu_backend);
+            patched_cpy++;
         }
     }
-    if (patched > 0) {
-        fprintf(stderr, "hybrid: patched %d flash-attn ops → GPU\n", patched);
+    fprintf(stderr, "hybrid: patched %d flash-attn + %d cpy_k ops → GPU\n",
+            patched_attn, patched_cpy);
+}
+
+void hybrid_orchestrator::hybrid_gpu_fence() {
+    if (attn_event) {
+        cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(attn_event));
     }
 }
 
@@ -148,6 +212,7 @@ bool hybrid_orchestrator::wait_tma_event() { return true; }
 void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
 void hybrid_orchestrator::trace_tma_verify(uint32_t) {}
 void hybrid_orchestrator::patch_graph_for_mla(ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t) {}
+void hybrid_orchestrator::hybrid_gpu_fence() {}
 
 #endif // GGML_USE_CUDA
 
