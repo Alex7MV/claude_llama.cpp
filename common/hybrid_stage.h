@@ -2,9 +2,19 @@
 #include <cstdint>
 #include <vector>
 #include <functional>
+#include <atomic>
+#include <thread>
+#include <memory>
 #include "llama.h"
+#include <mutex>
 #include "common.h"
 #include "hybrid_vram_pool.h"
+
+// Shared mutex for draft context (ctx_dft) access serialization.
+// Declared in hybrid_stage.cpp.
+extern std::mutex g_dft_mutex;
+
+struct common_sampler;
 
 // Thread-local pointer set by process_ubatch before graph compute.
 // Read by the CUDA flash_attn_ext handler to detect async mode.
@@ -78,6 +88,52 @@ struct hybrid_orchestrator {
     uint32_t max_draft        = 6;
     uint32_t current_draft    = 6;
     float    accept_rate_ema  = 0.0f;
+
+    // --- Async pre-generation (GPU/CPU overlap for speculative decoding) ---
+    //
+    // Pre-generates the next draft batch on GPU DURING the CPU MoE FFN of the
+    // current verification step.  Uses greedy (temperature=0) sampling so the
+    // pre-generated tokens are deterministically identical to what a fresh
+    // generation from the same state would produce.  After verification accepts
+    // k tokens, the suffix [k..N] of the pre-generated batch is a valid next
+    // draft (same tokens, correct prefix).
+    struct {
+        std::vector<uint8_t> state_buf;     // captured target state (the pre-verification position)
+        llama_seq_id         seq_id   = 0;
+        std::thread          thread;         // background worker
+        std::atomic<bool>    done{false};    // set by worker when tokens ready
+        std::vector<llama_token> tokens;     // the generated draft
+        uint32_t             n_draft  = 0;
+    } pregen;
+
+    // Capture the target state buffer (call BEFORE verification, e.g. inside
+    // the draft-generation lambda).  The buffer is used later by start_pregen().
+    void capture_pregen_state(std::vector<uint8_t> state_buf, llama_seq_id seq_id);
+
+    // Launch the background pre-generation thread using the captured state.
+    // The thread copies target state -> draft model, then decodes n_draft
+    // tokens with deterministic (greedy) sampling.
+    // Call this just before llama_decode(ctx_tgt, ...) so the GPU draft-gen
+    // overlaps with the CPU MoE FFN of the target verification.
+    bool start_pregen(
+        llama_context * ctx_dft,
+        struct common_sampler * smpl,
+        llama_seq_id seq_id,
+        uint32_t n_draft);
+
+    // Wait for the background thread and return the suffix starting at index
+    // n_accepted (i.e. the tokens that continue from the last verified
+    // position).  If n_accepted >= pre-gen length, returns empty (all rejected).
+    // Also generates extra tokens on ctx_dft if the suffix is shorter than
+    // n_draft_target, extending the draft to the desired length.
+    // trim_pos: if >= 0, truncates ctx_dft to this position (safe because
+    // the background thread has been joined).
+    std::vector<llama_token> finish_pregen(
+        llama_context * ctx_dft,
+        struct common_sampler * smpl,
+        uint32_t n_accepted,
+        uint32_t n_draft_target,
+        llama_pos trim_pos = -1);
 
     ~hybrid_orchestrator() { free_all(); }
 

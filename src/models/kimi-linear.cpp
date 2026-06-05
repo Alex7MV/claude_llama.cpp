@@ -170,8 +170,8 @@ std::unique_ptr<llm_graph_context> llama_model_kimi_linear::build_arch_graph(con
     return std::make_unique<graph>(*this, params);
 }
 
-// Causal Conv1d function for Q,K,V
-// When qkv is 0, it is Q, 1 is K, 2 is V
+// Causal Conv1d: applies depthwise 1D convolution to Q, K, or V
+// with recurrent state.  qkv=0 → Q, 1 → K, 2 → V.
 static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all, int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w, int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head) {
     const int64_t d_inner = head_dim * n_head;
     const int64_t conv_state_size = (d_conv - 1) * d_inner;
@@ -192,8 +192,6 @@ static ggml_tensor * causal_conv1d(ggml_cgraph * gf, ggml_context * ctx0, ggml_t
         n_embd_r_total * ggml_element_size(conv_state_all),  // nb2: stride between seqs
         qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-// Causal Conv1d function for Q,K,V
-// When qkv is 0, it is Q, 1 is K, 2 is V
     // Step 1: Q, K, V projections -> [d_inner, n_tokens]
     ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
 
@@ -336,7 +334,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             Qcur = ggml_l2_norm(ctx0, Qcur, eps_norm);
             Kcur = ggml_l2_norm(ctx0, Kcur, eps_norm);
 
-            // Choose between build_delta_net_chunking and build_delta_net_recurrent based on n_tokens
+            // build_delta_net internally dispatches: n_seq_tokens==1 → autoregressive, >1 → chunking
             auto attn_out = build_delta_net(Qcur, Kcur, Vcur, g1, beta, state, il);
 
             ggml_tensor * output = ggml_cont(ctx0, attn_out.first);

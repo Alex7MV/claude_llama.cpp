@@ -70,6 +70,23 @@ struct server_slot {
     // hybrid speculative engine
     hybrid_orchestrator * hybrid = nullptr;
 
+    // Non-blocking initial draft generation.
+    // The first draft for a slot is generated asynchronously on a background
+    // thread so that other slots' network processing is not delayed.
+    // Subsequent drafts use the async pre-generation overlap (start_pregen /
+    // finish_pregen).
+    struct init_draft_state {
+        bool in_flight = false;
+        std::thread thread;
+        std::vector<llama_token> tokens;
+        std::atomic<bool> done{false};
+        ~init_draft_state() {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } init_draft;
+
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
@@ -198,6 +215,16 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+
+        // Clean up async initial draft generation
+        if (init_draft.in_flight) {
+            if (init_draft.thread.joinable()) {
+                init_draft.thread.join();
+            }
+            init_draft.in_flight = false;
+            init_draft.tokens.clear();
+            init_draft.done.store(false);
+        }
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -2492,40 +2519,92 @@ private:
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 if (slot.hybrid && ctx_dft) {
-                    // Hybrid speculative draft: run draft model directly via orchestrator
-                    if (slot.spec_draft.empty()) {
-                        slot.spec_ckpt.update_pos(
-                                slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
-
-                        slot.hybrid->start_draft_batch([this, &slot]() {
-                            // Copy target context state to draft model
-                            std::vector<uint8_t> tmp;
-                            const size_t sz = llama_state_seq_get_size_ext(
-                                ctx_tgt, slot.id,
-                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                            if (sz > 0) {
-                                tmp.resize(sz);
-                                llama_state_seq_get_data_ext(
-                                    ctx_tgt, tmp.data(), sz, slot.id,
-                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                                llama_state_seq_set_data_ext(
-                                    ctx_dft.get(), tmp.data(), sz, slot.id,
-                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
-                            }
-
-                            for (uint32_t i = 0; i < slot.hybrid->current_draft; i++) {
-                                llama_token token = common_sampler_sample(
-                                    slot.smpl.get(), ctx_dft.get(), 0);
-                                slot.hybrid->draft.lookahead_buffer.push_back(token);
-                                if (llama_decode(ctx_dft.get(), llama_batch_get_one(&token, 1))) break;
-                            }
-                        });
-
-                        slot.spec_draft = slot.hybrid->draft.lookahead_buffer;
+                    if (!slot.spec_draft.empty()) {
+                        // spec_draft was populated by finish_pregen from a
+                        // previous async pre-generation cycle.  Nothing to do
+                        // here — the slot will participate in speculative
+                        // decoding with its existing draft.
+                    } else if (slot.init_draft.done.load()) {
+                        // Async initial draft generation completed.
+                        // Join the background thread, consume the result.
+                        if (slot.init_draft.thread.joinable()) {
+                            slot.init_draft.thread.join();
+                        }
+                        slot.spec_draft = std::move(slot.init_draft.tokens);
                         slot.n_draft_total += slot.spec_draft.size();
+                        slot.init_draft.in_flight = false;
+                        slot.init_draft.done.store(false);
+
+                        SLT_DBG(slot, "async initial draft ready: %zu tokens\n",
+                                slot.spec_draft.size());
+                    } else if (!slot.init_draft.in_flight) {
+                        // Need an initial draft.  Capture the target state
+                        // synchronously (fast buffer copy) and spawn a
+                        // background thread that loads it into ctx_dft and
+                        // generates greedy tokens.  Other slots are NOT
+                        // blocked — this slot falls back to non-speculative
+                        // generation for one tick while the draft is computed.
+                        std::vector<uint8_t> tmp;
+                        const size_t sz = llama_state_seq_get_size_ext(
+                            ctx_tgt, slot.id,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        if (sz > 0) {
+                            tmp.resize(sz);
+                            llama_state_seq_get_data_ext(
+                                ctx_tgt, tmp.data(), sz, slot.id,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        }
+
+                        // Save for async pre-generation overlap (used by
+                        // start_pregen in the decode loop).
+                        slot.hybrid->capture_pregen_state(tmp, slot.id);
+
+                        // Clone the main-thread sampler for the background
+                        // worker (owns its own copy — no data race).
+                        common_sampler_ptr clone(
+                            common_sampler_clone(slot.smpl.get()));
+                        common_sampler * cloned_raw = clone.release();
+
+                        // Move state buffer and launch
+                        std::vector<uint8_t> state_copy = std::move(tmp);
+                        const uint32_t n_dft = slot.hybrid->current_draft;
+                        llama_context * dft = ctx_dft.get();
+                        auto * init_ptr = &slot.init_draft;
+
+                        slot.init_draft.in_flight = true;
+                        slot.init_draft.thread = std::thread(
+                            [dft, cloned_raw,
+                             seq_id = slot.id,
+                             n_dft,
+                             state = std::move(state_copy),
+                             init_ptr]()
+                        {
+                            common_sampler_ptr smpl_owned(cloned_raw);
+                            std::lock_guard<std::mutex> lock(g_dft_mutex);
+
+                            // Load captured target state into draft context
+                            if (!state.empty()) {
+                                llama_state_seq_set_data_ext(
+                                    dft, state.data(), state.size(), seq_id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
+                                        LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                            }
+
+                            // Generate draft tokens (deterministic greedy)
+                            for (uint32_t i = 0; i < n_dft; i++) {
+                                llama_token token = common_sampler_sample(
+                                    smpl_owned.get(), dft, 0);
+                                init_ptr->tokens.push_back(token);
+                                if (llama_decode(
+                                        dft,
+                                        llama_batch_get_one(&token, 1)))
+                                    break;
+                            }
+                            init_ptr->done.store(true);
+                        });
                     }
+                    // else: init_draft.in_flight but not yet done — fall
+                    // through with empty spec_draft (non-speculative this tick)
                 } else {
                     const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                     const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3218,6 +3297,23 @@ private:
                 batch.logits   + i,
             };
 
+            // Hybrid: start async pre-generation for the NEXT draft batch on GPU
+            // while the CPU processes the MoE FFN for the CURRENT verification.
+            // Pre-generation runs on a background thread; the GPU draft-gen kernel
+            // overlaps with the CPU MoE FFN.
+            for (auto & pre_slot : slots) {
+                if (pre_slot.state == SLOT_STATE_GENERATING && pre_slot.hybrid && ctx_dft && !pre_slot.spec_draft.empty()) {
+                    if (pre_slot.hybrid->pregen.state_buf.empty()) {
+                        // The draft was just generated without a state capture (e.g. from
+                        // a previous iteration before the overlap was enabled).  Ignore.
+                        continue;
+                    }
+                    pre_slot.hybrid->start_pregen(
+                        ctx_dft.get(), pre_slot.smpl.get(), pre_slot.id,
+                        pre_slot.hybrid->current_draft);
+                }
+            }
+
             const int ret = llama_decode(ctx_tgt, batch_view);
 
             metrics.on_decoded(slots);
@@ -3437,6 +3533,22 @@ private:
                 }
 
                 slot.print_timings_tg();
+
+                // Hybrid: recapture target state after a non-speculative step
+                // so the async pre-generation (start_pregen) has an up-to-date
+                // state buffer for the next iteration.
+                if (slot.hybrid && ctx_dft && slot.init_draft.in_flight) {
+                    const size_t sz2 = llama_state_seq_get_size_ext(
+                        ctx_tgt, slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    if (sz2 > 0) {
+                        std::vector<uint8_t> tmp2(sz2);
+                        llama_state_seq_get_data_ext(
+                            ctx_tgt, tmp2.data(), sz2, slot.id,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        slot.hybrid->capture_pregen_state(std::move(tmp2), slot.id);
+                    }
+                }
             }
 
             // speculative decoding - main model sample and accept
@@ -3534,8 +3646,44 @@ private:
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
                 common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
-                if (slot.ctx_dft) {
+                if (slot.ctx_dft && !slot.hybrid) {
+                    // ctx_dft trim is deferred to finish_pregen when hybrid
+                    // pre-generation is active, to avoid a data race with the
+                    // background thread running on ctx_dft.
                     common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                }
+
+                // Hybrid: finish async pre-generation and inject the
+                // pre-generated continuation as the NEXT draft batch.
+                // The suffix [n_accepted .. N] was deterministically generated
+                // from the same state, so it is a valid continuation.
+                if (slot.hybrid && ctx_dft) {
+                    const uint32_t n_accepted_dft = (uint32_t)(ids.size() - 1);
+                    auto next = slot.hybrid->finish_pregen(
+                        ctx_dft.get(), slot.smpl.get(), n_accepted_dft,
+                        slot.hybrid->current_draft,
+                        (llama_pos)(slot.prompt.tokens.pos_next()));
+                    if (!next.empty()) {
+                        slot.spec_draft = std::move(next);
+                        slot.n_draft_total += slot.spec_draft.size();
+                    }
+                }
+
+                // Recapture target state at the accepted position so the
+                // next pre-generation starts from the correct position.
+                // Must happen AFTER finish_pregen (which joins the background thread).
+                if (slot.hybrid && ctx_dft) {
+                    std::vector<uint8_t> tmp;
+                    const size_t sz = llama_state_seq_get_size_ext(
+                        ctx_tgt, slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                    if (sz > 0) {
+                        tmp.resize(sz);
+                        llama_state_seq_get_data_ext(
+                            ctx_tgt, tmp.data(), sz, slot.id,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        slot.hybrid->capture_pregen_state(std::move(tmp), slot.id);
+                    }
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {

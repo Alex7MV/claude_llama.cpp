@@ -1,8 +1,15 @@
 #include "hybrid_stage.h"
 #include <cstdio>
+#include <mutex>
+#include "sampling.h"
 
 // Thread-local pointer read by the CUDA flash_attn_ext handler
 thread_local hybrid_orchestrator * g_hybrid_ctx = nullptr;
+
+// Shared mutex serializing background-thread access to the shared ctx_dft.
+// Multiple slots' pre-generation threads may run concurrently; ctx_dft is NOT
+// thread-safe for concurrent decode calls.
+std::mutex g_dft_mutex;
 
 #ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
@@ -67,6 +74,10 @@ bool hybrid_orchestrator::init(
 }
 
 void hybrid_orchestrator::free_all() {
+    // Join any running pre-generation thread
+    if (pregen.thread.joinable()) {
+        pregen.thread.join();
+    }
     pool.free_all();
     // Unregister from the fattn module
     ggml_cuda_attn_set_async_ctx(nullptr, nullptr);
@@ -195,6 +206,145 @@ void hybrid_orchestrator::hybrid_gpu_fence() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async pre-generation (GPU/CPU overlap)
+// ---------------------------------------------------------------------------
+
+void hybrid_orchestrator::capture_pregen_state(std::vector<uint8_t> buf, llama_seq_id seq_id) {
+    if (pregen.thread.joinable()) {
+        pregen.thread.join();
+    }
+    pregen.state_buf = std::move(buf);
+    pregen.seq_id    = seq_id;
+    pregen.done.store(false);
+    pregen.tokens.clear();
+    pregen.n_draft = 0;
+}
+
+bool hybrid_orchestrator::start_pregen(
+    llama_context * ctx_dft,
+    common_sampler * smpl,
+    llama_seq_id seq_id,
+    uint32_t n_draft)
+{
+    if (pregen.thread.joinable()) {
+        fprintf(stderr, "hybrid: pregen thread still running, joining\n");
+        pregen.thread.join();
+    }
+
+    if (pregen.state_buf.empty()) {
+        return false;
+    }
+
+    pregen.seq_id   = seq_id;
+    pregen.n_draft  = n_draft;
+    pregen.done.store(false);
+    pregen.tokens.clear();
+    pregen.tokens.reserve(n_draft);
+
+    // Clone the sampler so the background thread has its own instance,
+    // avoiding data races with the main thread's acceptance sampling.
+    common_sampler_ptr clone(common_sampler_clone(smpl));
+    common_sampler * cloned_raw = clone.release();
+
+    // State buffer copy for the background thread (ownership transferred)
+    std::vector<uint8_t> state_copy = pregen.state_buf;
+
+    pregen.thread = std::thread(
+        [ctx_dft, cloned_raw, seq_id, n_draft,
+         state_buf = std::move(state_copy),
+         done = &pregen.done,
+         out = &pregen.tokens]()
+    {
+        // Own the cloned sampler for the lifetime of this thread
+        common_sampler_ptr smpl_owned(cloned_raw);
+
+        // ctx_dft is shared across all slots and NOT thread-safe;
+        // serialize access to prevent races between background threads.
+        std::lock_guard<std::mutex> lock(g_dft_mutex);
+
+        // Load the captured state into the draft model
+        if (!state_buf.empty()) {
+            llama_state_seq_set_data_ext(
+                ctx_dft, state_buf.data(), state_buf.size(), seq_id,
+                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        }
+
+        // Generate n_draft tokens (deterministic with greedy/argmax sampling)
+        for (uint32_t i = 0; i < n_draft; i++) {
+            llama_token token = common_sampler_sample(smpl_owned.get(), ctx_dft, 0);
+            out->push_back(token);
+            if (llama_decode(ctx_dft, llama_batch_get_one(&token, 1))) {
+                break;
+            }
+        }
+
+        done->store(true);
+    });
+
+    return true;
+}
+
+std::vector<llama_token> hybrid_orchestrator::finish_pregen(
+    llama_context * ctx_dft,
+    common_sampler * smpl,
+    uint32_t n_accepted,
+    uint32_t n_draft_target,
+    llama_pos trim_pos)
+{
+    // Join the background thread (now safe to access ctx_dft on main thread)
+    if (pregen.thread.joinable()) {
+        pregen.thread.join();
+    }
+
+    // Protect ctx_dft access with the shared mutex: another slot's background
+    // thread may be running concurrently.  Lock covers both the trim and any
+    // extension decode calls (both run on the main thread after join).
+    std::lock_guard<std::mutex> lock(g_dft_mutex);
+
+    // Trim ctx_dft to the accepted position (deferred from the acceptance loop
+    // to avoid a data race with the background thread).
+    if (trim_pos >= 0 && ctx_dft) {
+        llama_memory_seq_rm(
+            llama_get_memory(ctx_dft),
+            pregen.seq_id,
+            trim_pos,
+            -1);
+    }
+
+    if (pregen.tokens.empty()) {
+        return {};
+    }
+
+    const uint32_t n_pre = (uint32_t)pregen.tokens.size();
+
+    if (n_accepted >= n_pre) {
+        return {};
+    }
+
+    // Suffix starting from the first non-accepted position
+    uint32_t n_suffix = n_pre - n_accepted;
+    std::vector<llama_token> result(
+        pregen.tokens.begin() + n_accepted,
+        pregen.tokens.end());
+
+    // Extend the draft on the draft model if we haven't reached the target length.
+    // The draft model's KV cache already has the suffix positions populated
+    // from pre-generation.  Decoding additional tokens extends them.
+    if (n_suffix < n_draft_target) {
+        uint32_t n_extra = n_draft_target - n_suffix;
+        for (uint32_t i = 0; i < n_extra; i++) {
+            llama_token token = common_sampler_sample(smpl, ctx_dft, 0);
+            result.push_back(token);
+            if (llama_decode(ctx_dft, llama_batch_get_one(&token, 1))) {
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 #else // !GGML_USE_CUDA
 
 bool hybrid_orchestrator::init(
@@ -213,6 +363,9 @@ void hybrid_orchestrator::on_gpu_attn_done(uint32_t) {}
 void hybrid_orchestrator::trace_tma_verify(uint32_t) {}
 void hybrid_orchestrator::patch_graph_for_mla(ggml_cgraph *, ggml_backend_sched_t, ggml_backend_t) {}
 void hybrid_orchestrator::hybrid_gpu_fence() {}
+void hybrid_orchestrator::capture_pregen_state(std::vector<uint8_t>, llama_seq_id) {}
+bool hybrid_orchestrator::start_pregen(llama_context *, common_sampler *, llama_seq_id, uint32_t) { return false; }
+std::vector<llama_token> hybrid_orchestrator::finish_pregen(llama_context *, common_sampler *, uint32_t, uint32_t, llama_pos) { return {}; }
 
 #endif // GGML_USE_CUDA
 
