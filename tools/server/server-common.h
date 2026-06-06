@@ -6,7 +6,6 @@
 #include "chat.h"
 #include "mtmd.h"
 
-#define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -14,6 +13,17 @@
 #include <cinttypes>
 
 using json = nlohmann::ordered_json;
+
+// Suppress -Wgnu-zero-variadic-macro-arguments: the ##__VA_ARGS__ idiom is
+// required for C++17 compatibility (__VA_OPT__ is C++20) and supported by
+// GCC, Clang, and MSVC.
+#if defined(__clang__)
+_Pragma("clang diagnostic push")
+_Pragma("clang diagnostic ignored \"-Wgnu-zero-variadic-macro-arguments\"")
+#elif defined(__GNUC__) || defined(__GNUG__)
+_Pragma("GCC diagnostic push")
+_Pragma("GCC diagnostic ignored \"-Wgnu-zero-variadic-macro-arguments\"")
+#endif
 
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), ##__VA_ARGS__)
 #define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), ##__VA_ARGS__)
@@ -28,6 +38,12 @@ using json = nlohmann::ordered_json;
 #define SRV_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, __func__, ##__VA_ARGS__)
 #define SRV_ERR(fmt, ...) LOG_ERR("srv  %12.*s: " fmt, 12, __func__, ##__VA_ARGS__)
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               ##__VA_ARGS__)
+
+#if defined(__clang__)
+_Pragma("clang diagnostic pop")
+#elif defined(__GNUC__) || defined(__GNUG__)
+_Pragma("GCC diagnostic pop")
+#endif
 
 using raw_buffer = std::vector<uint8_t>;
 
