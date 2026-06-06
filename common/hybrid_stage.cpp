@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <mutex>
 #include "sampling.h"
+#include <cstring>
 
 // Thread-local pointer read by the CUDA flash_attn_ext handler
 thread_local hybrid_orchestrator * g_hybrid_ctx = nullptr;
@@ -14,7 +15,11 @@ std::mutex g_dft_mutex;
 #ifdef GGML_USE_CUDA
 #include <cuda_runtime.h>
 #include "ggml-cuda/tma-transfer.h"
-#include "ggml-cuda/fattn.cuh"
+
+// fattn.cuh cannot be included here — it includes common.cuh (CUDA device code)
+// and this file is compiled with the host C++ compiler, not nvcc.
+extern cudaStream_t attn_global_stream;
+extern cudaEvent_t  attn_global_event;
 
 bool hybrid_orchestrator::init(
     uint32_t n_layers_,
@@ -57,9 +62,8 @@ bool hybrid_orchestrator::init(
         cudaEventDisableTiming);
 
     // Register with the global fattn module so the CUDA backend can redirect
-    ggml_cuda_attn_set_async_ctx(
-        reinterpret_cast<cudaStream_t>(attn_stream),
-        reinterpret_cast<cudaEvent_t>(attn_event));
+    attn_global_stream = reinterpret_cast<cudaStream_t>(attn_stream);
+    attn_global_event  = reinterpret_cast<cudaEvent_t>(attn_event);
 
     // Pre-allocate pinned CPU buffers for flash_attn output (one per layer)
     // Size: head_dim * sizeof(float) = 128 * 4 = 512 bytes per slot
@@ -80,7 +84,8 @@ void hybrid_orchestrator::free_all() {
     }
     pool.free_all();
     // Unregister from the fattn module
-    ggml_cuda_attn_set_async_ctx(nullptr, nullptr);
+    attn_global_stream = nullptr;
+    attn_global_event  = nullptr;
     for (int i = 0; i < 2; i++) {
         if (tma_events[i]) {
             cudaEventDestroy(reinterpret_cast<cudaEvent_t>(tma_events[i]));
@@ -187,9 +192,8 @@ void hybrid_orchestrator::patch_graph_for_mla(
         //   DeepSeek-V3:  blk.N.k_cache_latent
         //   Kimi-k2.6:    blk.N.k_cache_latent (MLA), blk.N.v_cache_compressed (KDA)
         if (node->op == GGML_OP_CPY &&
-            node->dst &&
-            (strstr(node->dst->name, "k_cache_latent") ||
-             strstr(node->dst->name, "v_cache_compressed")) &&
+            (strstr(node->name, "k_cache_latent") ||
+             strstr(node->name, "v_cache_compressed")) &&
             ggml_backend_supports_op(gpu_backend, node))
         {
             ggml_backend_sched_set_tensor_backend(sched, node, gpu_backend);

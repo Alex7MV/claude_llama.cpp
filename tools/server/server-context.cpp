@@ -80,6 +80,29 @@ struct server_slot {
         std::thread thread;
         std::vector<llama_token> tokens;
         std::atomic<bool> done{false};
+
+        init_draft_state() = default;
+
+        init_draft_state(init_draft_state && other) noexcept
+            : in_flight(std::exchange(other.in_flight, false))
+            , thread(std::move(other.thread))
+            , tokens(std::move(other.tokens))
+            , done(other.done.load())
+        {}
+
+        init_draft_state & operator=(init_draft_state && other) noexcept {
+            if (this != &other) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+                in_flight = std::exchange(other.in_flight, false);
+                thread    = std::move(other.thread);
+                tokens    = std::move(other.tokens);
+                done.store(other.done.load());
+            }
+            return *this;
+        }
+
         ~init_draft_state() {
             if (thread.joinable()) {
                 thread.join();
