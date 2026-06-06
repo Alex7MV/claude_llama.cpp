@@ -56,6 +56,7 @@ llama_model_jais::graph::graph(const llama_model & model, const llm_graph_params
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+    GGML_ASSERT(n_embd_head > 0);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;

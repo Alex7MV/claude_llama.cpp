@@ -280,6 +280,7 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         for (int i = 0; i < n_altup - 1; ++i) {
             cur = ggml_add(ctx0, cur, ggml_view_2d_slice(ctx0, altup_unembd, i));
         }
+        GGML_ASSERT(n_altup > 0);
         cur = ggml_scale(ctx0, cur, 1.0f / float(n_altup));  // [n_embd, n_tokens]
         cb(cur, "unembd_merged", -1);
     }
@@ -385,6 +386,7 @@ ggml_tensor * llama_model_gemma3n::graph::laurel(ggml_tensor * cur, int il) {
 // input x shape: [n_embd, n_tokens]
 // output  shape: [n_embd, n_tokens]
 ggml_tensor * llama_model_gemma3n::graph::gaussian_topk(ggml_tensor * x) {
+    GGML_ASSERT(x->ne[0] > 1);
     ggml_tensor * mean = ggml_mean(ctx0, x);
     ggml_tensor * std  = ggml_sqrt(ctx0, ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, ggml_sub(ctx0, x, mean))),
                                                     1.0f / (float) (x->ne[0] - 1)));
@@ -400,6 +402,7 @@ ggml_tensor * llama_model_gemma3n::graph::gaussian_topk(ggml_tensor * x) {
 // input x shape: [n_embd,  n_tokens]
 // output  shape: [n_altup, n_tokens]
 ggml_tensor * llama_model_gemma3n::graph::altup_compute_router_modalities(ggml_tensor * x, int il) {
+    GGML_ASSERT(n_embd > 0);
     ggml_tensor * router_inputs = build_norm(x, model.layers[il].altup_router_norm, NULL, LLM_NORM_RMS, il);
 
     // router_input_scale

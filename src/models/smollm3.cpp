@@ -66,7 +66,8 @@ llama_model_smollm3::graph::graph(const llama_model & model, const llm_graph_par
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
-        const bool use_rope = (il + 1) % hparams.n_no_rope_layer_step != 0;
+        const bool use_rope = hparams.n_no_rope_layer_step > 0 &&
+                              (il + 1) % hparams.n_no_rope_layer_step != 0;
 
         // norm
         cur = build_norm(inpL,

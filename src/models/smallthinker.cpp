@@ -105,8 +105,9 @@ llama_model_smallthinker::graph<iswa>::graph(const llama_model & model, const ll
         ggml_tensor * inpSA  = inpL;
 
         // This overlaps with SWA layers in current models, so get_rope_freq_base/scale may be superfluous
-        const bool use_rope = hparams.n_no_rope_layer_step == n_layer ||
-                              il % hparams.n_no_rope_layer_step != 0;
+        const bool use_rope = hparams.n_no_rope_layer_step > 0 &&
+                              (hparams.n_no_rope_layer_step == n_layer ||
+                               il % hparams.n_no_rope_layer_step != 0);
 
         ggml_tensor * probs = build_lora_mm(model.layers[il].ffn_gate_inp, inpL);  // [n_expert, n_tokens]
         cb(probs, "ffn_moe_logits", il);

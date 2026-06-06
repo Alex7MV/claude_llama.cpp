@@ -46,6 +46,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                             (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
+    if (n_expert_used == 0) {
+        throw std::runtime_error(arch_name() + " model cannot have zero experts used");
+    }
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
     // output

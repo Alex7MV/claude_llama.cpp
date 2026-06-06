@@ -191,7 +191,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
+    uint32_t effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
     for (int il = 0; il < effective_n_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -201,7 +201,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
 
         // self_attention
         if (is_ocr) {
-            const int n_embed_head = hparams.n_embd / hparams.n_head();
+            const uint32_t n_embed_head = hparams.n_embd / hparams.n_head();
             const int ocr_rope_type = GGML_ROPE_TYPE_NEOX;
             GGML_ASSERT(n_embed_head == n_embd_head_k && n_embed_head == n_embd_head_v);
 

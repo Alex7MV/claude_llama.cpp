@@ -264,6 +264,7 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
     const int64_t d_inner  = hparams.ssm_d_inner;
     const int64_t d_state  = hparams.ssm_d_state;
     const int64_t n_heads  = hparams.ssm_dt_rank;
+    GGML_ASSERT(n_heads != 0);
     const int64_t head_dim = d_inner / n_heads;
     const int64_t n_group  = hparams.ssm_n_group;
     const int64_t n_seqs   = ubatch.n_seqs;

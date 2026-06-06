@@ -134,9 +134,9 @@ llama_model_rwkv7::graph::graph(const llama_model & model, const llm_graph_param
 
     auto * rs_inp = build_rs_inp();
 
-    const auto n_embd       = hparams.n_embd;
-    const auto n_seq_tokens = ubatch.n_seq_tokens;
-    const auto n_seqs       = ubatch.n_seqs;
+    const int64_t n_embd       = hparams.n_embd;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seqs       = ubatch.n_seqs;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 

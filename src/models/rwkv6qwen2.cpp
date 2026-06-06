@@ -35,6 +35,7 @@ void llama_model_rwkv6qwen2::load_arch_tensors(llama_model_loader &) {
     const int time_mix_extra_dim = hparams.time_mix_extra_dim;
     const int time_decay_extra_dim = hparams.time_decay_extra_dim;
     const int head_size = hparams.wkv_head_size;
+    GGML_ASSERT(head_size != 0);
     const int attn_hidden_size = n_embd;
     int attn_key_value_size;
     if (n_head_kv == 0 || attn_hidden_size / head_size == n_head_kv) {
@@ -91,9 +92,9 @@ llama_model_rwkv6qwen2::graph::graph(const llama_model & model, const llm_graph_
 
     auto * rs_inp = build_rs_inp();
 
-    const auto n_embd = hparams.n_embd;
-    const auto n_seq_tokens = ubatch.n_seq_tokens;
-    const auto n_seqs = ubatch.n_seqs;
+    const int64_t n_embd = hparams.n_embd;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seqs = ubatch.n_seqs;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 

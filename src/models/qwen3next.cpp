@@ -34,6 +34,9 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader &) {
     if (n_expert == 0) {
         throw std::runtime_error(arch_name() + " model cannot have zero experts");
     }
+    if (n_expert_used == 0) {
+        throw std::runtime_error(arch_name() + " model cannot have zero experts used");
+    }
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 

@@ -35,12 +35,13 @@ ggml_tensor * llm_build_rwkv7_base::build_rwkv7_time_mix(llm_graph_input_rs * in
                                                          int                  il) const {
     const auto * mctx_cur = static_cast<const llama_memory_recurrent_context *>(mctx);
 
-    const auto n_tokens     = ubatch.n_tokens;
-    const auto n_seqs       = ubatch.n_seqs;
-    const auto n_embd       = hparams.n_embd;
-    const auto head_size    = hparams.wkv_head_size;
-    const auto head_count   = n_embd / head_size;
-    const auto n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_tokens     = ubatch.n_tokens;
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_embd       = hparams.n_embd;
+    const int64_t head_size    = hparams.wkv_head_size;
+    GGML_ASSERT(head_size != 0);
+    const int64_t head_count   = n_embd / head_size;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     const auto kv_head = mctx_cur->get_head();
 

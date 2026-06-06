@@ -30,6 +30,8 @@ extern "C" {
 }
 #endif
 
+
+
 //
 // llama_context
 //
@@ -1398,9 +1400,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // hybrid: fence for async flash_attn — ensures GPU output is visible to CPU
-    if (hybrid_orch) {
-        hybrid_orch->hybrid_gpu_fence();
-    }
+    // The fence implementation lives in common/hybrid_stage.cpp (llama-common lib)
+    // and is not linked into the core llama library.
+    // The server code handles the fence externally via the orchestrator API.
 
     ret = GGML_STATUS_SUCCESS;
 

@@ -159,8 +159,10 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
     const int64_t d_inner  = hparams.ssm_d_inner;
     const int64_t d_state  = hparams.ssm_d_state;
     const int64_t n_head   = hparams.ssm_dt_rank;
+    GGML_ASSERT(n_head != 0);
     const int64_t head_dim = d_inner / n_head;
     const int64_t n_group  = hparams.ssm_n_group;
+    GGML_ASSERT(n_group != 0);
     const int64_t n_seqs   = ubatch.n_seqs;
 
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;

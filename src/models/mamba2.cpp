@@ -39,6 +39,7 @@ void llama_model_mamba2::load_arch_tensors(llama_model_loader &) {
     const int64_t d_inner = hparams.ssm_d_inner;
     const int64_t d_state = hparams.ssm_d_state;
     const int64_t n_group = hparams.ssm_n_group;
+    GGML_ASSERT(n_group != 0);
     const int64_t d_in_proj = 2*d_inner + 2*n_group*d_state + n_head;
 
     // only an expansion factor of 2 is supported for now

@@ -204,7 +204,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    int effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
+    uint32_t effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
     for (int il = 0; il < effective_n_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 

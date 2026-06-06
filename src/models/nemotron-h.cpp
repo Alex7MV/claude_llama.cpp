@@ -89,6 +89,7 @@ void llama_model_nemotron_h::load_arch_tensors(llama_model_loader &) {
             layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
         }  else {
             if (n_expert != 0) {
+                GGML_ASSERT(n_expert_used != 0);
                 const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
                 const int64_t n_ff_shexp = hparams.n_ff_shexp;
 
