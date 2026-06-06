@@ -9,6 +9,8 @@ add_library(mtmd
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
+            mtmd-miniaudio-impl.cpp
+            mtmd-stb-image-impl.cpp
             clip.cpp
             clip.h
             clip-impl.h

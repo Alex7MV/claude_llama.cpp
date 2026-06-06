@@ -13,23 +13,13 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <vector>
 
 //#define MTMD_AUDIO_DEBUG
-
-#define MINIAUDIO_IMPLEMENTATION
-#ifndef MTMD_AUDIO_DEBUG
-#   define MA_NO_ENCODING
-#endif
-#define MA_NO_DEVICE_IO
-#define MA_NO_RESOURCE_MANAGER
-#define MA_NO_NODE_GRAPH
-#define MA_NO_ENGINE
-#define MA_NO_GENERATION
-#define MA_API static
+// MINIAUDIO_IMPLEMENTATION and STB_IMAGE_IMPLEMENTATION are in
+// mtmd-miniaudio-impl.cpp and mtmd-stb-image-impl.cpp respectively.
 #include "miniaudio/miniaudio.h"
-
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb/stb_image.h"
 
 #ifdef MTMD_INTERNAL_HEADER
