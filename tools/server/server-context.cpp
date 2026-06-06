@@ -768,6 +768,31 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Join slot init_draft background threads before freeing their context references
+        for (auto & slot : slots) {
+            if (slot.init_draft.thread.joinable()) {
+                slot.init_draft.thread.join();
+            }
+            slot.init_draft.in_flight = false;
+            slot.init_draft.tokens.clear();
+            slot.init_draft.done.store(false);
+        }
+
+        // Destroy hybrid orchestrator (joins pregen.thread via ~hybrid_orchestrator() -> free_all())
+        hybrid.reset();
+
+        // Clear slot dangling pointers to contexts that are about to be freed
+        for (auto & slot : slots) {
+            slot.ctx_dft = nullptr;
+            slot.ctx_tgt = nullptr;
+            slot.spec   = nullptr;
+            slot.hybrid = nullptr;
+            slot.mctx   = nullptr;
+        }
+
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
