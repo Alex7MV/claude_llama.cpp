@@ -85,10 +85,7 @@ install(TARGETS mtmd LIBRARY PUBLIC_HEADER)
 if (NOT MSVC)
     # for stb_image.h and miniaudio.h
     target_compile_options(mtmd PRIVATE -Wno-cast-qual)
-endif()
-
-if (ANDROID)
-    # miniaudio.h defines ma_android_sdk_version() without a prior prototype
+    # miniaudio.h implementation defines many functions without prior prototypes
     target_compile_options(mtmd PRIVATE -Wno-missing-prototypes)
 endif()
 
