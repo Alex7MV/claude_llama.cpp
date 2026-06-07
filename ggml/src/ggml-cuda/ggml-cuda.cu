@@ -724,6 +724,8 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dev_ptr;
 }
 
+static inline void ggml_cuda_adaptive_wait_per_thread(int device);
+
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
@@ -739,14 +741,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+            ggml_cuda_adaptive_wait_per_thread(ctx->device);
         }
     }
     return GGML_STATUS_SUCCESS;
 }
-
-// Forward declaration for buffer-level sync helper
-static inline void ggml_cuda_adaptive_wait_per_thread(int device);
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
@@ -3349,6 +3349,26 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     return true;
 }
 
+// Per-thread per-device pool of reusable timing events for adaptive wait.
+// Avoids ~5-15us cudaEventCreate/Destroy overhead on the hot path.
+// One event per device per thread — safe for multi-GPU + multi-thread.
+static bool ggml_cuda_adaptive_wait_ensure_event(int device, cudaEvent_t * out_event) {
+    static const int max_devices = GGML_CUDA_MAX_DEVICES;
+    thread_local cudaEvent_t s_wait_events[max_devices] = { nullptr };
+
+    if (device < 0 || device >= max_devices) {
+        return false;
+    }
+    if (s_wait_events[device] == nullptr) {
+        cudaError_t err = cudaEventCreateWithFlags(&s_wait_events[device], cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            return false;
+        }
+    }
+    *out_event = s_wait_events[device];
+    return true;
+}
+
 // 3-phase adaptive wait: spin -> backoff -> yield
 // Returns true if wait completed, false if fell back to cudaStreamSynchronize
 bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
@@ -3360,15 +3380,11 @@ bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
         int64_t * out_t_fallback_us,
         uint64_t * out_n_wait_fallback) {
 
-    GGML_UNUSED(device);
-
-    // Create a transient event for querying completion
     cudaEvent_t wait_event;
-    cudaError_t err = cudaEventCreateWithFlags(&wait_event, cudaEventDisableTiming);
-    if (err != cudaSuccess) {
+    if (!ggml_cuda_adaptive_wait_ensure_event(device, &wait_event)) {
         return false; // fallback caller will handle
     }
-    cudaEventRecord(wait_event, stream);
+    cudaError_t err = cudaEventRecord(wait_event, stream);
 
     const int64_t t_start = ggml_time_us();
 
@@ -3383,7 +3399,6 @@ bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
                 if (out_t_wait_us) *out_t_wait_us += t_total;
                 if (out_n_wait_ops) (*out_n_wait_ops)++;
                 if (out_t_phase1_us) *out_t_phase1_us += ggml_time_us() - t_phase1_start;
-                cudaEventDestroy(wait_event);
                 return true;
             }
             if (err != cudaErrorNotReady) {
@@ -3406,7 +3421,6 @@ bool ggml_cuda_adaptive_wait(cudaStream_t stream, int device,
                 if (out_t_wait_us) *out_t_wait_us += t_total;
                 if (out_n_wait_ops) (*out_n_wait_ops)++;
                 if (out_t_phase2_us) *out_t_phase2_us += ggml_time_us() - t_phase2_start;
-                cudaEventDestroy(wait_event);
                 return true;
             }
             if (err != cudaErrorNotReady) {
@@ -3424,7 +3438,6 @@ phase3:
 
         // cudaEventSynchronize uses CUDA's internal OS-aware wait mechanism
         err = cudaEventSynchronize(wait_event);
-        cudaEventDestroy(wait_event);
         if (out_t_phase3_us) *out_t_phase3_us += ggml_time_us() - t_phase3_start;
 
         if (err == cudaSuccess) {
