@@ -47,6 +47,9 @@ struct llama_cparams {
     int32_t pipeline_depth;         // 0 = disabled, 3 = CPU+TMA+GPU
     int32_t pipeline_split_size;    // layers per split group (default 8)
 
+    // DeepSeek per-layer async pipeline (3-phase QKV/Attn/FFN on separate CUDA streams)
+    bool deepseek_pipeline;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

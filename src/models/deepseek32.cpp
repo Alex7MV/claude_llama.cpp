@@ -204,6 +204,13 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // Save pipeline data for external pipeline scheduler
+    m_pipe_inpL         = inpL;
+    m_pipe_inp_pos      = inp_pos;
+    m_pipe_inp_attn_dsa = inp_attn_dsa;
+    m_pipe_inp_out_ids  = inp_out_ids;
+    m_pipe_kq_scale     = kq_scale;
+
     uint32_t effective_n_layers = hparams.n_layer - hparams.nextn_predict_layers;
     for (uint32_t il = 0; il < effective_n_layers; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -499,4 +506,310 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+//
+// Per-layer sub-graph builder for the async pipeline
+//
+// Builds a single layer's computation into the provided graph.
+// The caller manages per-layer graphs and residual tensors.
+//
+
+ggml_cgraph * llama_build_deepseek32_layer(
+        const struct llama_model            & model,
+        struct llm_graph_context            & ctx,
+              struct ggml_context           * ctx0_layer,
+              struct ggml_cgraph            * gf_layer,
+              struct ggml_tensor            * inpL,
+              struct ggml_tensor            * inp_pos,
+              struct llm_graph_input_attn_k_dsa * inp_attn_dsa,
+              struct ggml_tensor            * inp_out_ids,
+              float                           kq_scale,
+              uint32_t                        il) {
+
+    // Save original graph context, temporarily use the per-layer one
+    struct ggml_context * ctx0_saved = ctx.ctx0;
+    struct ggml_cgraph  * gf_saved   = ctx.gf;
+    ctx.ctx0 = ctx0_layer;
+    ctx.gf   = gf_layer;
+
+    // Replicate the per-layer computation from graph::graph constructor (lines 208-487)
+    // with all required hparams values.
+    const int64_t n_embd_head_k = ctx.hparams.n_embd_head_k_mla();
+    const int64_t n_embd_head_v = ctx.hparams.n_embd_head_v_mla();
+    GGML_UNUSED(n_embd_head_v);
+
+    const int64_t n_embd_head_qk_rope = ctx.hparams.n_rot();
+    const int64_t n_embd_head_qk_nope = n_embd_head_k - n_embd_head_qk_rope;
+    const int64_t n_rot              = ctx.n_rot;
+
+    const int64_t n_indexer_head = ctx.hparams.indexer_n_head;
+    const int64_t n_embd_indexer_head = ctx.hparams.indexer_head_size;
+    const int64_t n_embd_indexer_head_rope = ctx.hparams.n_rot();
+    const int64_t n_embd_indexer_head_nope = n_embd_indexer_head - n_embd_indexer_head_rope;
+    const uint32_t n_indexer_top_k = ctx.hparams.indexer_top_k;
+    const uint32_t kv_lora_rank    = ctx.hparams.n_lora_kv;
+
+    const int64_t n_tokens = ctx.n_tokens;
+    const int64_t n_head   = ctx.n_head;
+
+    ggml_tensor * cur;
+    ggml_tensor * inpSA = inpL;
+
+    // norm
+    cur = ctx.build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+    ctx.cb(cur, "attn_norm", il);
+
+    // self_attention
+    {
+        ggml_tensor * qr = ggml_mul_mat(ctx0_layer, model.layers[il].wq_a, cur);
+        ctx.cb(qr, "qr", il);
+
+        qr = ctx.build_norm(qr, model.layers[il].attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        ctx.cb(qr, "qr", il);
+
+        ggml_tensor * top_k = nullptr;
+
+        // lightning indexer
+        {
+            // === DSA indexer query ===
+            ggml_tensor * indexer_q = ggml_mul_mat(ctx0_layer, model.layers[il].indexer_attn_q_b, qr);
+            ctx.cb(indexer_q, "indexer_q", il);
+
+            ggml_tensor * indexer_q_pe =
+                ggml_view_3d(ctx0_layer, indexer_q, n_embd_indexer_head_rope, n_indexer_head, n_tokens,
+                             ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                             ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head, 0);
+            ctx.cb(indexer_q_pe, "indexer_q_pe", il);
+
+            ggml_tensor * indexer_q_nope =
+                ggml_view_3d(ctx0_layer, indexer_q, n_embd_indexer_head_nope, n_indexer_head, n_tokens,
+                             ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                             ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
+                             ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
+            ctx.cb(indexer_q_nope, "indexer_q_nope", il);
+
+            indexer_q_pe = ggml_rope_ext(ctx0_layer, indexer_q_pe, inp_pos, nullptr, n_rot,
+                                 LLAMA_ROPE_TYPE_NEOX, ctx.n_ctx_orig, ctx.freq_base, ctx.freq_scale,
+                                 ctx.ext_factor, ctx.attn_factor, ctx.beta_fast, ctx.beta_slow);
+            ctx.cb(indexer_q_pe, "indexer_q_pe", il);
+
+            indexer_q = ggml_concat(ctx0_layer, indexer_q_pe, indexer_q_nope, 0);
+            ctx.cb(indexer_q, "indexer_q", il);
+
+            ggml_tensor * indexer_k = ggml_mul_mat(ctx0_layer, model.layers[il].indexer_attn_k, cur);
+            ctx.cb(indexer_k, "indexer_k", il);
+
+            indexer_k = ctx.build_norm(indexer_k, model.layers[il].indexer_k_norm, model.layers[il].indexer_k_norm_b, LLM_NORM, il);
+            ctx.cb(indexer_k, "indexer_k", il);
+
+            ggml_tensor * indexer_k_pe =
+                ggml_view_3d(ctx0_layer, indexer_k, n_embd_indexer_head_rope, 1, n_tokens,
+                             ggml_row_size(indexer_k->type, n_embd_indexer_head),
+                             ggml_row_size(indexer_k->type, n_embd_indexer_head) * 1, 0);
+            ctx.cb(indexer_k_pe, "indexer_k_pe", il);
+
+            ggml_tensor * indexer_k_nope =
+                ggml_view_3d(ctx0_layer, indexer_k, n_embd_indexer_head_nope, 1, n_tokens,
+                             ggml_row_size(indexer_k->type, n_embd_indexer_head),
+                             ggml_row_size(indexer_k->type, n_embd_indexer_head) * 1,
+                             ggml_row_size(indexer_k->type, n_embd_indexer_head_nope));
+            ctx.cb(indexer_k_nope, "indexer_k_nope", il);
+
+            indexer_k_pe = ggml_rope_ext(ctx0_layer, indexer_k_pe, inp_pos, nullptr, n_rot,
+                                 LLAMA_ROPE_TYPE_NEOX, ctx.n_ctx_orig, ctx.freq_base, ctx.freq_scale,
+                                 ctx.ext_factor, ctx.attn_factor, ctx.beta_fast, ctx.beta_slow);
+            ctx.cb(indexer_k_pe, "indexer_k_pe", il);
+
+            indexer_k = ggml_concat(ctx0_layer, indexer_k_pe, indexer_k_nope, 0);
+            ctx.cb(indexer_k, "indexer_k", il);
+
+            indexer_q = ggml_mul_mat(ctx0_layer, inp_attn_dsa->self_k_rot_lid, indexer_q);
+            ctx.cb(indexer_q, "indexer_q", il);
+            indexer_k = ggml_mul_mat(ctx0_layer, inp_attn_dsa->self_k_rot_lid, indexer_k);
+            ctx.cb(indexer_k, "indexer_k", il);
+
+            // store indexer keys to KV cache
+            const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();
+            const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
+            ggml_build_forward_expand(gf_layer, mctx_lid->cpy_k(ctx0_layer, indexer_k, k_idxs_lid, il));
+
+            ggml_tensor * indexer_weights = ggml_mul_mat(ctx0_layer, model.layers[il].indexer_proj, cur);
+            ctx.cb(indexer_weights, "indexer_weights", il);
+
+            indexer_k = mctx_lid->get_k(ctx0_layer, il);
+
+            const auto n_stream = indexer_k->ne[3];
+            indexer_q = ggml_view_4d(ctx0_layer, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+            indexer_weights = ggml_view_4d(ctx0_layer, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+
+            indexer_q = ggml_permute(ctx0_layer, indexer_q, 0, 2, 1, 3);
+            ctx.cb(indexer_q, "indexer_q", il);
+            indexer_k = ggml_permute(ctx0_layer, indexer_k, 0, 2, 1, 3);
+            ctx.cb(indexer_k, "indexer_k", il);
+
+            ggml_tensor * indexer_kq = ggml_mul_mat(ctx0_layer, indexer_k, indexer_q);
+            ctx.cb(indexer_kq, "indexer_kq", il);
+
+            indexer_kq = ggml_cont(ctx0_layer, ggml_permute(ctx0_layer, indexer_kq, 2, 1, 0, 3));
+            ctx.cb(indexer_kq, "indexer_kq", il);
+
+            ggml_tensor * indexer_score = ggml_relu(ctx0_layer, indexer_kq);
+            ctx.cb(indexer_score, "indexer_score", il);
+
+            indexer_weights = ggml_scale(ctx0_layer, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
+            ctx.cb(indexer_weights, "indexer_weights", il);
+
+            indexer_score = ggml_mul(ctx0_layer, indexer_score, indexer_weights);
+            ctx.cb(indexer_score, "indexer_score", il);
+
+            indexer_score = ggml_sum_rows(ctx0_layer, indexer_score);
+            ctx.cb(indexer_score, "indexer_score", il);
+
+            indexer_score = ggml_cont(ctx0_layer, ggml_permute(ctx0_layer, indexer_score, 2, 1, 0, 3));
+            ctx.cb(indexer_score, "indexer_score", il);
+
+            ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+            indexer_score = ggml_add(ctx0_layer, indexer_score, indexer_kq_mask);
+            ctx.cb(indexer_score, "indexer_score", il);
+
+            uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
+            top_k = ggml_cont(ctx0_layer, ggml_top_k(ctx0_layer, indexer_score, n_top_k));
+            ctx.cb(top_k, "top_k", il);
+        }
+
+        // Q projection (full head dim)
+        ggml_tensor * q = ggml_mul_mat(ctx0_layer, model.layers[il].wq_b, qr);
+        ctx.cb(q, "q", il);
+
+        ggml_tensor * q_nope =
+            ggml_view_3d(ctx0_layer, q, n_embd_head_qk_nope, n_head, n_tokens, ggml_row_size(q->type, n_embd_head_k),
+                         ggml_row_size(q->type, n_embd_head_k) * n_head, 0);
+        ctx.cb(q_nope, "q_nope", il);
+
+        ggml_tensor * q_pe = ggml_view_3d(
+            ctx0_layer, q, n_embd_head_qk_rope, n_head, n_tokens, ggml_row_size(q->type, n_embd_head_k),
+            ggml_row_size(q->type, n_embd_head_k) * n_head, ggml_row_size(q->type, n_embd_head_qk_nope));
+        ctx.cb(q_pe, "q_pe", il);
+
+        // KV compressed projections (MLA)
+        ggml_tensor * kv_cmpr_pe = ggml_mul_mat(ctx0_layer, model.layers[il].wkv_a_mqa, cur);
+        ctx.cb(kv_cmpr_pe, "kv_cmpr_pe", il);
+
+        ggml_tensor * kv_cmpr =
+            ggml_view_2d(ctx0_layer, kv_cmpr_pe, kv_lora_rank, n_tokens,
+                         ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope), 0);
+        ctx.cb(kv_cmpr, "kv_cmpr", il);
+
+        ggml_tensor * k_pe = ggml_view_3d(ctx0_layer, kv_cmpr_pe, n_embd_head_qk_rope, 1, n_tokens,
+                                          ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+                                          ggml_row_size(kv_cmpr_pe->type, kv_lora_rank + n_embd_head_qk_rope),
+                                          ggml_row_size(kv_cmpr_pe->type, kv_lora_rank));
+        ctx.cb(k_pe, "k_pe", il);
+
+        q_pe = ggml_rope_ext(ctx0_layer, q_pe, inp_pos, nullptr, n_rot, ctx.rope_type, ctx.n_ctx_orig, ctx.freq_base, ctx.freq_scale,
+                             ctx.ext_factor, ctx.attn_factor, ctx.beta_fast, ctx.beta_slow);
+        ctx.cb(q_pe, "q_pe", il);
+
+        k_pe = ggml_rope_ext(ctx0_layer, k_pe, inp_pos, nullptr, n_rot, ctx.rope_type, ctx.n_ctx_orig, ctx.freq_base, ctx.freq_scale,
+                             ctx.ext_factor, ctx.attn_factor, ctx.beta_fast, ctx.beta_slow);
+        ctx.cb(k_pe, "k_pe", il);
+
+        kv_cmpr = ctx.build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
+        ctx.cb(kv_cmpr, "kv_cmpr", il);
+
+        // MLA attention
+        {
+            q_nope = ggml_permute(ctx0_layer, q_nope, 0, 2, 1, 3);
+            ctx.cb(q_nope, "q_nope_perm", il);
+
+            ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0_layer, model.layers[il].wk_b, q_nope);
+            ctx.cb(q_nope_absorbed, "q_nope_absorbed", il);
+
+            q_nope_absorbed = ggml_permute(ctx0_layer, q_nope_absorbed, 0, 2, 1, 3);
+            ctx.cb(q_nope_absorbed, "q_nope_absorbed_perm", il);
+
+            ggml_tensor * Qcur = ggml_concat(ctx0_layer, q_nope_absorbed, q_pe, 0);
+            ctx.cb(Qcur, "Qcur", il);
+
+            kv_cmpr = ggml_reshape_3d(ctx0_layer, kv_cmpr, kv_lora_rank, 1, n_tokens);
+            ctx.cb(kv_cmpr, "kv_cmpr_reshape", il);
+
+            ggml_tensor * Kcur = ggml_concat(ctx0_layer, kv_cmpr, k_pe, 0);
+            ctx.cb(Kcur, "Kcur", il);
+
+            ggml_tensor * Vcur = kv_cmpr;
+            ctx.cb(Vcur, "Vcur", il);
+
+            cur = ctx.build_attn(inp_attn_dsa,
+                    model.layers[il].wo, NULL, model.layers[il].wo_s,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
+        }
+    }
+
+    // Residual + FFN
+    {
+        if (il == ctx.hparams.n_layer - ctx.hparams.nextn_predict_layers - 1 && inp_out_ids) {
+            cur   = ggml_get_rows(ctx0_layer, cur, inp_out_ids);
+            inpSA = ggml_get_rows(ctx0_layer, inpSA, inp_out_ids);
+        }
+        ggml_tensor * ffn_inp = ggml_add(ctx0_layer, cur, inpSA);
+        ctx.cb(ffn_inp, "ffn_inp", il);
+
+        cur = ctx.build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+        ctx.cb(cur, "ffn_norm", il);
+
+        if ((uint32_t) il < ctx.hparams.n_layer_dense_lead) {
+            cur = ctx.build_ffn(cur,
+                model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
+                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            ctx.cb(cur, "ffn_out", il);
+        } else {
+            ggml_tensor * moe_out = ctx.build_moe_ffn(cur,
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                model.layers[il].ffn_exp_probs_b,
+                ctx.n_expert, ctx.n_expert_used,
+                LLM_FFN_SILU, ctx.hparams.expert_weights_norm,
+                ctx.hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) ctx.hparams.expert_gating_func,
+                il,
+                nullptr,
+                model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+            ctx.cb(moe_out, "ffn_moe_out", il);
+
+            // FFN shared expert
+            {
+                ggml_tensor * ffn_shexp =
+                    ctx.build_ffn(cur,
+                        model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+                        model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                        model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+                        NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                ctx.cb(ffn_shexp, "ffn_shexp", il);
+
+                cur = ggml_add(ctx0_layer, moe_out, ffn_shexp);
+                ctx.cb(cur, "ffn_out", il);
+            }
+        }
+        cur = ggml_add(ctx0_layer, cur, ffn_inp);
+
+        cur = ctx.build_cvec(cur, il);
+        ctx.cb(cur, "l_out", il);
+
+        inpL = cur;
+    }
+
+    // Restore original context
+    ctx.ctx0 = ctx0_saved;
+    ctx.gf   = gf_saved;
+
+    return gf_layer;
 }

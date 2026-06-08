@@ -765,6 +765,17 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 // llm_graph_context
 //
 
+// Pipeline scheduler setup data (model-specific, filled by graph builders)
+struct llm_graph_input_attn_k_dsa;
+struct llama_pipeline_setup {
+    struct ggml_tensor                  * inpL           = nullptr;
+    struct ggml_tensor                  * inp_pos        = nullptr;
+    struct llm_graph_input_attn_k_dsa   * inp_attn_dsa   = nullptr;
+    struct ggml_tensor                  * inp_out_ids    = nullptr;
+    float                                 kq_scale       = 0.0f;
+    bool                                  has_value      = false;
+};
+
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
@@ -830,6 +841,9 @@ struct llm_graph_context {
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
+
+    // Pipeline scheduler data (model-specific override, e.g. DeepSeek32)
+    virtual bool get_pipeline_setup(struct llama_pipeline_setup &) const { return false; }
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 

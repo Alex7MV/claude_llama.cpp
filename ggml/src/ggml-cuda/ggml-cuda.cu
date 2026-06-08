@@ -4803,6 +4803,22 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     }
 }
 
+void ggml_backend_cuda_set_stream(ggml_backend_t backend, int stream_id) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    cuda_ctx->curr_stream_no = stream_id;
+}
+
+int ggml_backend_cuda_get_stream(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    return cuda_ctx->curr_stream_no;
+}
+
+void * ggml_backend_cuda_get_stream_ptr(ggml_backend_t backend, int stream_id) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    if (stream_id < 0 || stream_id >= GGML_CUDA_MAX_STREAMS) return nullptr;
+    return (void *)cuda_ctx->streams[cuda_ctx->device][stream_id];
+}
+
 static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 

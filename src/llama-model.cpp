@@ -17,6 +17,10 @@
 
 #include "models/models.h"
 
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+#include "pipeline-sched.h"
+#endif
+
 #include "ggml.h"
 #include "ggml-cpp.h"
 
@@ -2125,8 +2129,46 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
-ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+ggml_cgraph * llama_model::build_graph(const llm_graph_params & params, struct llama_pipeline_setup * pipeline_setup, struct llama_pipeline_sched ** p_pipeline) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    // Extract pipeline scheduler data if requested (before llm is destroyed)
+    if (pipeline_setup) {
+        llm->get_pipeline_setup(*pipeline_setup);
+    }
+
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+    // Initialize DeepSeek pipeline scheduler while the graph context is alive
+    if (p_pipeline) {
+        // Find GPU backend from the scheduler
+        ggml_backend_t gpu = nullptr;
+        for (int _bi = 0; _bi < ggml_backend_sched_get_n_backends(params.sched); _bi++) {
+            auto * _b = ggml_backend_sched_get_backend(params.sched, _bi);
+            auto * _dev = ggml_backend_get_device(_b);
+            if (_dev && ggml_backend_dev_type(_dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                gpu = _b; break;
+            }
+        }
+
+        if (gpu && pipeline_setup && pipeline_setup->has_value) {
+            *p_pipeline = llama_pipeline_sched_init(
+                gpu,
+                params.sched,
+                *this,
+                *llm,
+                pipeline_setup->inpL,
+                pipeline_setup->inp_pos,
+                pipeline_setup->inp_attn_dsa,
+                pipeline_setup->inp_out_ids,
+                pipeline_setup->kq_scale,
+                nullptr, // set_stream
+                nullptr, // get_stream
+                nullptr, // prefetch_fn (set by CUDA caller)
+                nullptr  // prefetch_user_data
+            );
+        }
+    }
+#endif
 
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);

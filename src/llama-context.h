@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 #include "ggml-backend-pipeline.h"
+#include "pipeline-sched.h"
 
 #include <atomic>
 #include <map>
@@ -337,6 +338,10 @@ private:
     // Pipelined prefill scheduler (optional, created when cparams.pipeline_depth > 0)
     ggml_backend_sched_pipelined_t sched_pipeline = nullptr;
     std::atomic<bool> sched_pipeline_init_attempted{false};
+
+    // DeepSeek V3/R1 three-phase async pipeline scheduler
+    // (optional, created when cparams.deepseek_pipeline == true)
+    struct llama_pipeline_sched * deepseek_pipeline = nullptr;
 
     bool sched_need_reserve = true;
 

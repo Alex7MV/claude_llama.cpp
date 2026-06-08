@@ -12,6 +12,8 @@ add_library(llama
             ../include/llama.h
             llama.cpp
             llama-adapter.cpp
+            pipeline-sched.cpp
+            llama-pipeline-cuda.cpp
             llama-arch.cpp
             llama-batch.cpp
             llama-chat.cpp
@@ -48,7 +50,7 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../ggml/include)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

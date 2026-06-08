@@ -1037,10 +1037,43 @@ struct llama_model_deepseek32 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
+
+        // Pipeline scheduler data captured during construction
+        struct ggml_tensor                * m_pipe_inpL         = nullptr;
+        struct ggml_tensor                * m_pipe_inp_pos      = nullptr;
+        struct llm_graph_input_attn_k_dsa * m_pipe_inp_attn_dsa = nullptr;
+        struct ggml_tensor                * m_pipe_inp_out_ids  = nullptr;
+        float                               m_pipe_kq_scale     = 0.0f;
+
+        bool get_pipeline_setup(struct llama_pipeline_setup & ps) const override {
+            ps.inpL         = m_pipe_inpL;
+            ps.inp_pos      = m_pipe_inp_pos;
+            ps.inp_attn_dsa = m_pipe_inp_attn_dsa;
+            ps.inp_out_ids  = m_pipe_inp_out_ids;
+            ps.kq_scale     = m_pipe_kq_scale;
+            ps.has_value    = true;
+            return true;
+        }
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// Build a single layer's computation sub-graph for the per-layer async pipeline.
+// Returns the gf_layer graph with one layer's ops expanded into it.
+// The caller is responsible for managing ctx0_layer/gf_layer allocation and
+// passing the correct inpL residual between layers.
+struct ggml_cgraph * llama_build_deepseek32_layer(
+        const struct llama_model            & model,
+        struct llm_graph_context            & ctx,
+        struct ggml_context                 * ctx0_layer,
+        struct ggml_cgraph                  * gf_layer,
+        struct ggml_tensor                  * inpL,
+        struct ggml_tensor                  * inp_pos,
+        struct llm_graph_input_attn_k_dsa   * inp_attn_dsa,
+        struct ggml_tensor                  * inp_out_ids,
+        float                                 kq_scale,
+        uint32_t                              il);
 
 
 struct llama_model_deepseek2ocr : public llama_model_base {

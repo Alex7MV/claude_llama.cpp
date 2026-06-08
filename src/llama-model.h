@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_pipeline_sched;
 
 // available models
 enum llm_type {
@@ -626,7 +627,7 @@ struct llama_model {
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
-    ggml_cgraph * build_graph(const llm_graph_params & params) const;
+    ggml_cgraph * build_graph(const llm_graph_params & params, struct llama_pipeline_setup * pipeline_setup = nullptr, struct llama_pipeline_sched ** p_pipeline = nullptr) const;
 
     virtual void load_stats  (llama_model_loader & ml) = 0;
     virtual void load_hparams(llama_model_loader & ml) = 0;

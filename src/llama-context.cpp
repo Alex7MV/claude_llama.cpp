@@ -2,6 +2,9 @@
 
 #include "ggml.h"
 #include "ggml-backend-pipeline.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1340,7 +1343,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        // Build graph, optionally extracting pipeline data and initializing
+        // the DeepSeek pipeline scheduler (done inside build_graph while the
+        // graph context is still alive).
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+        bool want_pipeline = cparams.deepseek_pipeline && model.arch == LLM_ARCH_DEEPSEEK32;
+        struct llama_pipeline_setup pipe_setup;
+        gf = model.build_graph(gparams, want_pipeline ? &pipe_setup : nullptr,
+                               want_pipeline ? &deepseek_pipeline : nullptr);
+
+        // Set up CUDA expert prefetch callback
+        if (deepseek_pipeline) {
+#ifdef GGML_USE_CUDA
+            for (int _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
+                auto * _b = ggml_backend_sched_get_backend(sched.get(), _bi);
+                if (ggml_backend_is_cuda(_b)) {
+                    llama_pipeline_cuda_init_prefetch(deepseek_pipeline, _b);
+                    break;
+                }
+            }
+#endif
+        }
+#else
         gf = model.build_graph(gparams);
+#endif
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1391,6 +1417,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+    bool use_pipeline = (deepseek_pipeline != nullptr);
+
+    if (use_pipeline) {
+        // Copy input data to persistent scratch before pipeline compute
+        // (inpL_embd and inp_pos are in GPU main-buffer; DSA masks/indices are in
+        // the original DSA input object and must be copied to our scratch copies).
+        // The original tensor pointers were saved in the pipeline struct during
+        // build_graph init.
+        llama_pipeline_sched_copy_inputs(
+            deepseek_pipeline,
+            nullptr, // backend not needed for copy
+            res->t_inp_embd,
+            deepseek_pipeline->saved_inp_pos,
+            deepseek_pipeline->saved_inp_attn_dsa);
+
+        // Compute all layers using the three-phase pipeline
+        llama_pipeline_sched_compute(deepseek_pipeline, deepseek_pipeline->n_layer);
+
+        // Compute output head: rms_norm(last hidden) -> lm_head
+        llama_pipeline_sched_compute_output_head(
+            deepseek_pipeline,
+            res,
+            model.output_norm, // rms norm weight
+            model.hparams.f_norm_rms_eps,
+            model.output);
+
+        ret = GGML_STATUS_SUCCESS;
+        return res;
+    }
+#endif
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
