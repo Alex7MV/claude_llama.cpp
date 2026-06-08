@@ -115,6 +115,9 @@ struct llama_pipeline_sched {
     // Per-layer MoE indicator (true for layers with MoE experts)
     bool                 has_moe[LLAMA_PIPELINE_MAX_LAYERS];
 
+    // Backing GPU buffer for prefetch destination tensors
+    ggml_backend_buffer_t  prefetch_buf;
+
     // Prefetch destination tensors (GPU-resident, sized for n_expert_used × 3 weight types)
     struct ggml_tensor * prefetch_gate;  // [n_embd, n_ff_exp, n_expert_used]
     struct ggml_tensor * prefetch_up;    // [n_embd, n_ff_exp, n_expert_used]
@@ -174,7 +177,7 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer);
 // Must be called after llama_pipeline_sched_compute.
 void llama_pipeline_sched_compute_output_head(
     struct llama_pipeline_sched  * p,
-    struct llm_graph_result      * res,
+    class llm_graph_result      * res,
     struct ggml_tensor           * output_norm_weight,
     float                          norm_rms_eps,
     struct ggml_tensor           * lm_head_weight);

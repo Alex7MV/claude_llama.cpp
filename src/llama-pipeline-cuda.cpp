@@ -15,6 +15,7 @@ static void deepseek_prefetch_callback(
     ggml_backend_event_t  completion_event,
     void                * user_data) {
 
+    (void)layer;
     ggml_backend_t backend = (ggml_backend_t)user_data;
     ggml_backend_cuda_pipeline_expert_prefetch(
         dst_tensors, src_tensors, slice_bytes, top_k,

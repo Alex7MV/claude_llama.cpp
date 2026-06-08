@@ -27,6 +27,7 @@ static void build_phase_a(
         uint32_t                              il,
         struct llama_layer_scratch          * scratch) {
 
+    (void)kq_scale;
     struct ggml_context * ctx0_saved = ctx.ctx0;
     struct ggml_cgraph  * gf_saved   = ctx.gf;
     ctx.ctx0 = ctx0_layer;
@@ -334,6 +335,7 @@ static void build_phase_c(
         struct ggml_tensor                  * prefetch_up    = nullptr,
         struct ggml_tensor                  * prefetch_down  = nullptr) {
 
+    (void)inp_out_ids;
     struct ggml_context * ctx0_saved = ctx.ctx0;
     struct ggml_cgraph  * gf_saved   = ctx.gf;
     ctx.ctx0 = ctx0_layer;
@@ -705,7 +707,7 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
 
                 // Rebuild with prefetch tensors
                 int slot = il % LLAMA_PIPELINE_DEPTH;
-                struct ggml_tensor * layer_inpL = (il == 0) ? p->inpL_embd : p->inpL_next[(il-1) % LLAMA_PIPELINE_DEPTH];
+                // build_phase_c reads inpL from the persistent scratch/slot
                 // Re-run only phase C with prefetch overrides
                 // build_phase_c needs scratch data and the layer's inpL_next output
                 build_phase_c(model, ctx, p->ctx_layers[il], p->gf_ffn[il],
@@ -746,6 +748,7 @@ void llama_pipeline_sched_copy_inputs(
     struct ggml_tensor           * src_inp_pos,
     class llm_graph_input_attn_k_dsa * src_dsa) {
 
+    (void)backend;
     if (!p) return;
 
     // Copy embedding and position to persistent scratch
@@ -856,7 +859,7 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
 
 void llama_pipeline_sched_compute_output_head(
     struct llama_pipeline_sched  * p,
-    struct llm_graph_result      * res,
+    class llm_graph_result      * res,
     struct ggml_tensor           * output_norm_weight,
     float                          norm_rms_eps,
     struct ggml_tensor           * lm_head_weight) {
