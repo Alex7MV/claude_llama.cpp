@@ -2791,8 +2791,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<int32_t> expert_counts_dev(ctx.pool(), ne02);
     std::vector<int32_t> tokens_per_expert(ne02);
 
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
+    int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
     // GPU sort-by-expert: histogram + scatter, no host involvement
     {
@@ -2803,8 +2803,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dim3 grid_dim((ne12 * n_expert_used + block_threads - 1) / block_threads, 1);
         sort_by_expert_kernel<<<grid_dim, block_dim, 0, stream>>>(
             (const int32_t *)ids->data,
-            (int32_t *)ids_to_sorted,
-            (int32_t *)ids_from_sorted,
+            ids_to_sorted,
+            ids_from_sorted,
             expert_counts_dev.ptr,
             (int)ne12,
             (int)n_expert_used,
