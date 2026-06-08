@@ -341,7 +341,9 @@ private:
 
     // DeepSeek V3/R1 three-phase async pipeline scheduler
     // (optional, created when cparams.deepseek_pipeline == true)
+#ifdef LLAMA_DEEPSEEK_PIPELINE
     struct llama_pipeline_sched * deepseek_pipeline = nullptr;
+#endif
 
     bool sched_need_reserve = true;
 

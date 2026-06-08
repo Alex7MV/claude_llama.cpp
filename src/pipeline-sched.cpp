@@ -424,6 +424,8 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     llama_pipeline_expert_prefetch_fn   prefetch_fn,
     void                              * prefetch_user_data) {
 
+    (void)inpL;
+
     auto * p = new llama_pipeline_sched();
     memset(p, 0, sizeof(*p));
     p->backend     = backend;
