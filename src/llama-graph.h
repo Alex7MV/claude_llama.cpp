@@ -766,11 +766,11 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 //
 
 // Pipeline scheduler setup data (model-specific, filled by graph builders)
-struct llm_graph_input_attn_k_dsa;
+class llm_graph_input_attn_k_dsa;
 struct llama_pipeline_setup {
     struct ggml_tensor                  * inpL           = nullptr;
     struct ggml_tensor                  * inp_pos        = nullptr;
-    struct llm_graph_input_attn_k_dsa   * inp_attn_dsa   = nullptr;
+    class  llm_graph_input_attn_k_dsa   * inp_attn_dsa   = nullptr;
     struct ggml_tensor                  * inp_out_ids    = nullptr;
     float                                 kq_scale       = 0.0f;
     bool                                  has_value      = false;

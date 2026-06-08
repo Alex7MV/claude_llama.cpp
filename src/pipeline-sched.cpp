@@ -22,7 +22,7 @@ static void build_phase_a(
         struct ggml_cgraph                  * gf_layer,
         struct ggml_tensor                  * inpL,
         struct ggml_tensor                  * inp_pos,
-        struct llm_graph_input_attn_k_dsa   * inp_attn_dsa,
+        class llm_graph_input_attn_k_dsa   * inp_attn_dsa,
         float                                 kq_scale,
         uint32_t                              il,
         struct llama_layer_scratch          * scratch) {
@@ -273,7 +273,7 @@ static void build_phase_b(
         struct ggml_cgraph                  * gf_layer,
         struct ggml_tensor                  * inpL,
         struct llama_layer_scratch          * scratch,
-        struct llm_graph_input_attn_k_dsa   * inp_attn_dsa,
+        class llm_graph_input_attn_k_dsa   * inp_attn_dsa,
         struct ggml_tensor                  * inp_out_ids,
         float                                 kq_scale,
         uint32_t                              il) {
@@ -414,7 +414,7 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     struct llm_graph_context          & ctx,
     struct ggml_tensor                * inpL,
     struct ggml_tensor                * inp_pos,
-    struct llm_graph_input_attn_k_dsa * inp_attn_dsa,
+    class llm_graph_input_attn_k_dsa * inp_attn_dsa,
     struct ggml_tensor                * inp_out_ids,
     float                               kq_scale,
     void                              (*set_stream)(ggml_backend_t, int),
@@ -744,7 +744,7 @@ void llama_pipeline_sched_copy_inputs(
     ggml_backend_t                 backend,
     struct ggml_tensor           * src_inpL,
     struct ggml_tensor           * src_inp_pos,
-    struct llm_graph_input_attn_k_dsa * src_dsa) {
+    class llm_graph_input_attn_k_dsa * src_dsa) {
 
     if (!p) return;
 

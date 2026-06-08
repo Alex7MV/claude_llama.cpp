@@ -522,7 +522,7 @@ ggml_cgraph * llama_build_deepseek32_layer(
               struct ggml_cgraph            * gf_layer,
               struct ggml_tensor            * inpL,
               struct ggml_tensor            * inp_pos,
-              struct llm_graph_input_attn_k_dsa * inp_attn_dsa,
+              class llm_graph_input_attn_k_dsa * inp_attn_dsa,
               struct ggml_tensor            * inp_out_ids,
               float                           kq_scale,
               uint32_t                        il) {

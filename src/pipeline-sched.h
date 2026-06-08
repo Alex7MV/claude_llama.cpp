@@ -95,12 +95,12 @@ struct llama_pipeline_sched {
 
     // Persistent DSA input object (references scratch tensors above)
     // Created during init; passed to phase builders so graphs reference scratch data.
-    struct llm_graph_input_attn_k_dsa * inp_attn_persist;
+    class llm_graph_input_attn_k_dsa * inp_attn_persist;
 
     // Pointers to the ORIGINAL main-graph tensors (from the most recent build_graph).
     // These are used by copy_inputs to locate the source data.
     struct ggml_tensor                  * saved_inp_pos;        // original inp_pos from build_graph
-    struct llm_graph_input_attn_k_dsa   * saved_inp_attn_dsa;  // original DSA input from build_graph
+    class llm_graph_input_attn_k_dsa   * saved_inp_attn_dsa;  // original DSA input from build_graph
 
     // Output head graph (built once during init)
     struct ggml_cgraph * gf_output;       // output head: last_hidden → norm → lm_head
@@ -146,7 +146,7 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     struct llm_graph_context          & ctx,
     struct ggml_tensor                * inpL,
     struct ggml_tensor                * inp_pos,
-    struct llm_graph_input_attn_k_dsa * inp_attn_dsa,
+    class llm_graph_input_attn_k_dsa * inp_attn_dsa,
     struct ggml_tensor                * inp_out_ids,
     float                               kq_scale,
     void                              (*set_stream)(ggml_backend_t, int),
@@ -162,7 +162,7 @@ void llama_pipeline_sched_copy_inputs(
     ggml_backend_t                 backend,
     struct ggml_tensor           * src_inpL,
     struct ggml_tensor           * src_inp_pos,
-    struct llm_graph_input_attn_k_dsa * src_dsa);
+    class llm_graph_input_attn_k_dsa * src_dsa);
 
 // Execute the three-stage sliding window across compute/attn streams.
 // After return, the last layer's hidden state is in p->inpL_next[(n_layer-1) % LLAMA_PIPELINE_DEPTH].

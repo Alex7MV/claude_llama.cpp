@@ -1041,7 +1041,7 @@ struct llama_model_deepseek32 : public llama_model_base {
         // Pipeline scheduler data captured during construction
         struct ggml_tensor                * m_pipe_inpL         = nullptr;
         struct ggml_tensor                * m_pipe_inp_pos      = nullptr;
-        struct llm_graph_input_attn_k_dsa * m_pipe_inp_attn_dsa = nullptr;
+        class llm_graph_input_attn_k_dsa * m_pipe_inp_attn_dsa = nullptr;
         struct ggml_tensor                * m_pipe_inp_out_ids  = nullptr;
         float                               m_pipe_kq_scale     = 0.0f;
 
@@ -1070,7 +1070,7 @@ struct ggml_cgraph * llama_build_deepseek32_layer(
         struct ggml_cgraph                  * gf_layer,
         struct ggml_tensor                  * inpL,
         struct ggml_tensor                  * inp_pos,
-        struct llm_graph_input_attn_k_dsa   * inp_attn_dsa,
+        class llm_graph_input_attn_k_dsa   * inp_attn_dsa,
         struct ggml_tensor                  * inp_out_ids,
         float                                 kq_scale,
         uint32_t                              il);
