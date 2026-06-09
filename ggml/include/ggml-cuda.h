@@ -58,6 +58,26 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_stream(ggml_backend_t backend);
 // Used by pipeline prefetch to access the transfer stream for async H2D copies.
 GGML_BACKEND_API void * ggml_backend_cuda_get_stream_ptr(ggml_backend_t backend, int stream_id);
 
+// CDA barrier — GPU-side flag for sub-microsecond stream synchronization.
+// Replaces cudaEventRecord/cudaStreamWaitEvent with a device memory write + spin
+// to avoid CPU involvement in the inter-stream ordering path.
+typedef void * ggml_backend_cda_t;
+
+// Create a CDA barrier (allocates device-side flag).
+// Returns NULL on failure.
+GGML_BACKEND_API ggml_backend_cda_t ggml_backend_cuda_cda_create(ggml_backend_t backend);
+
+// Destroy a CDA barrier.
+GGML_BACKEND_API void ggml_backend_cuda_cda_free(ggml_backend_t backend, ggml_backend_cda_t cda);
+
+// Signal the barrier on the backend's current stream (writes flag to 1).
+// All preceding work on the current stream is completed before the signal.
+GGML_BACKEND_API void ggml_backend_cuda_cda_signal(ggml_backend_t backend, ggml_backend_cda_t cda);
+
+// Wait for the barrier on the backend's current stream (spins until flag is 1).
+// The wait is a GPU-side spin loop — no CPU involvement after launch.
+GGML_BACKEND_API void ggml_backend_cuda_cda_wait(ggml_backend_t backend, ggml_backend_cda_t cda);
+
 // Asynchronous expert prefetch for DeepSeek pipeline (all CUDA operations on
 // a single transfer stream managed internally via ggml_backend_cuda_set_stream).
 // - Switches backend to transfer stream (id=2).

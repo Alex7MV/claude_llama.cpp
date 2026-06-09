@@ -56,8 +56,15 @@ typedef void (*llama_pipeline_expert_prefetch_fn)(
 struct llama_pipeline_sched {
     // Backend
     ggml_backend_t         backend;
-    ggml_backend_sched_t   sched;
     ggml_backend_dev_t     device;
+
+    // Three separate schedulers with independent gallocr instances:
+    //   sched[0] = QKV phase (stream 0)
+    //   sched[1] = flash_attn phase (stream 1)
+    //   sched[2] = FFN phase (stream 0)
+    ggml_backend_sched_t   sched_pipe[3];
+    // Original caller scheduler (for output head computation)
+    ggml_backend_sched_t   sched_orig;
 
     // Stream control function pointers (set by CUDA-capable caller)
     // Allows switching between compute_stream (0) and attn_stream (1) etc.
@@ -71,9 +78,14 @@ struct llama_pipeline_sched {
     struct ggml_context * ctx_layers[LLAMA_PIPELINE_MAX_LAYERS]; // per-layer metadata
     int n_layer;
 
-    // Events
+    // Events (fallback)
     ggml_backend_event_t e_qkv_done [LLAMA_PIPELINE_MAX_LAYERS];
     ggml_backend_event_t e_attn_done[LLAMA_PIPELINE_MAX_LAYERS];
+
+    // CDA barriers (GPU-side flag sync, replaces events when available)
+    bool     use_cda;  // true when CDA barriers are active
+    void   * cda_qkv [LLAMA_PIPELINE_MAX_LAYERS]; // QKV→attn sync
+    void   * cda_attn[LLAMA_PIPELINE_MAX_LAYERS]; // attn→FFN sync
 
     // Persistent scratch buffer + tensors (survives sched reset)
     ggml_backend_buffer_t scratch_buf;

@@ -5,9 +5,15 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-dsa.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <cassert>
+#include <vector>
+#include <algorithm>
 
 // ============================================================================
 // Phase A:  norm -> QKV proj -> DSA indexer -> Qcur/Kcur/Vcur/top_k
@@ -429,7 +435,7 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     auto * p = new llama_pipeline_sched();
     memset(p, 0, sizeof(*p));
     p->backend     = backend;
-    p->sched       = sched;
+    p->sched_orig  = sched;
     p->device      = backend ? ggml_backend_get_device(backend) : nullptr;
     p->set_stream  = set_stream;
     p->get_stream  = get_stream;
@@ -724,11 +730,71 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     p->saved_inp_pos = inp_pos;
     p->saved_inp_attn_dsa = inp_attn_dsa;
 
-    // ---- Create events ----
-    if (p->device) {
+    // ---- Create CDA barriers (GPU-side flag sync) or fall back to events ----
+    p->use_cda = false;
+#ifdef GGML_USE_CUDA
+    if (p->backend && ggml_backend_is_cuda(p->backend)) {
+        bool cda_ok = true;
+        for (int i = 0; i < p->n_layer && cda_ok; i++) {
+            p->cda_qkv[i]  = ggml_backend_cuda_cda_create(p->backend);
+            p->cda_attn[i] = ggml_backend_cuda_cda_create(p->backend);
+            if (!p->cda_qkv[i] || !p->cda_attn[i]) {
+                cda_ok = false;
+            }
+        }
+        if (cda_ok) {
+            p->use_cda = true;
+        }
+    }
+#endif
+    if (!p->use_cda && p->device) {
         for (int i = 0; i < p->n_layer; i++) {
             p->e_qkv_done[i]  = ggml_backend_event_new(p->device);
             p->e_attn_done[i] = ggml_backend_event_new(p->device);
+        }
+    }
+
+    // ---- Create three separate schedulers for stream parallelism ----
+    {
+        int n_backends = ggml_backend_sched_get_n_backends(sched);
+        std::vector<ggml_backend_t> backends(n_backends);
+        std::vector<ggml_backend_buffer_type_t> bufts(n_backends);
+        for (int i = 0; i < n_backends; i++) {
+            backends[i] = ggml_backend_sched_get_backend(sched, i);
+            bufts[i] = ggml_backend_sched_get_buffer_type(sched, backends[i]);
+        }
+
+        // Compute max_nodes from phase graphs
+        int max_nodes = 0;
+        for (int i = 0; i < p->n_layer; i++) {
+            if (p->gf_qkv[i])  max_nodes = std::max(max_nodes, p->gf_qkv[i]->n_nodes  + p->gf_qkv[i]->n_leafs);
+            if (p->gf_attn[i]) max_nodes = std::max(max_nodes, p->gf_attn[i]->n_nodes + p->gf_attn[i]->n_leafs);
+            if (p->gf_ffn[i])  max_nodes = std::max(max_nodes, p->gf_ffn[i]->n_nodes  + p->gf_ffn[i]->n_leafs);
+        }
+        max_nodes = max_nodes + max_nodes / 4; // 25% margin
+
+        for (int si = 0; si < 3; si++) {
+            p->sched_pipe[si] = ggml_backend_sched_new(
+                backends.data(), bufts.data(), n_backends,
+                max_nodes,
+                true,  // pipeline_parallel — separate buffer copies per layer
+                false  // op_offload
+            );
+            if (!p->sched_pipe[si]) {
+                LLAMA_LOG_ERROR("%s: failed to create pipeline scheduler %d\n", __func__, si);
+                llama_pipeline_sched_free(p);
+                return nullptr;
+            }
+        }
+
+        // Pre-allocate each scheduler with its first phase graph
+        if (p->n_layer > 0) {
+            ggml_backend_sched_reset(p->sched_pipe[0]);
+            ggml_backend_sched_alloc_graph(p->sched_pipe[0], p->gf_qkv[0]);
+            ggml_backend_sched_reset(p->sched_pipe[1]);
+            ggml_backend_sched_alloc_graph(p->sched_pipe[1], p->gf_attn[0]);
+            ggml_backend_sched_reset(p->sched_pipe[2]);
+            ggml_backend_sched_alloc_graph(p->sched_pipe[2], p->gf_ffn[0]);
         }
     }
 
@@ -797,25 +863,24 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
     if (!p || !p->backend || n_layer <= 0) return;
     if (n_layer > p->n_layer) n_layer = p->n_layer;
 
-    // Whether prefetch is enabled for this batch
     const bool use_prefetch = (p->prefetch_fn != nullptr) &&
                               (p->prefetch_gate != nullptr) &&
                               (p->device != nullptr);
 
     for (int L = 0; L < n_layer; L++) {
-        // ---- Stage 1: QKV proj on compute stream (0) ----
-        ggml_backend_sched_synchronize(p->sched);
-        ggml_backend_sched_reset(p->sched);
+        // ---- Stage 1: QKV proj on stream 0 (sched_pipe[0]) ----
+        ggml_backend_sched_reset(p->sched_pipe[0]);
         if (p->set_stream) p->set_stream(p->backend, 0);
-        ggml_backend_sched_graph_compute_async(p->sched, p->gf_qkv[L]);
-        if (p->e_qkv_done[L]) ggml_backend_event_record(p->e_qkv_done[L], p->backend);
+        ggml_backend_sched_graph_compute_async(p->sched_pipe[0], p->gf_qkv[L]);
+        if (p->cda_qkv[L]) {
+            p->set_stream(p->backend, 0);
+            ggml_backend_cuda_cda_signal(p->backend, p->cda_qkv[L]);
+        } else if (p->e_qkv_done[L]) {
+            ggml_backend_event_record(p->e_qkv_done[L], p->backend);
+        }
 
-        // ---- Expert Prefetch Launch (after QKV, before attn) ----
-        // Call prefetch_fn with GPU top_k tensor, model weight tensors, and
-        // prefetch destination buffers. The callback reads top_k on GPU,
-        // determines which experts to prefetch, and launches async H2D copies
-        // on a dedicated transfer stream. The completion event syncs with FFN.
-        if (use_prefetch && p->has_moe[L]) {
+        // ---- Expert Prefetch Launch (for non-CDA mode; CDA uses GPU sync) ----
+        if (use_prefetch && !p->use_cda && p->has_moe[L]) {
             struct ggml_tensor * top_k_t = p->scratch[L % LLAMA_PIPELINE_DEPTH].top_k;
             if (top_k_t && p->model_gate_exps[L]) {
                 struct ggml_tensor * dst[3]  = {p->prefetch_gate, p->prefetch_up, p->prefetch_down};
@@ -832,20 +897,31 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
             }
         }
 
-        // ---- Stage 2: flash_attn on attn stream (1) ----
-        ggml_backend_sched_synchronize(p->sched);
-        ggml_backend_sched_reset(p->sched);
+        // ---- Stage 2: flash_attn on stream 1 (sched_pipe[1]) ----
+        ggml_backend_sched_reset(p->sched_pipe[1]);
         if (p->set_stream) p->set_stream(p->backend, 1);
-        if (p->e_qkv_done[L]) ggml_backend_event_wait(p->backend, p->e_qkv_done[L]);
-        ggml_backend_sched_graph_compute_async(p->sched, p->gf_attn[L]);
-        if (p->e_attn_done[L]) ggml_backend_event_record(p->e_attn_done[L], p->backend);
+        if (p->cda_qkv[L]) {
+            ggml_backend_cuda_cda_wait(p->backend, p->cda_qkv[L]);
+        } else if (p->e_qkv_done[L]) {
+            ggml_backend_event_wait(p->backend, p->e_qkv_done[L]);
+        }
+        ggml_backend_sched_graph_compute_async(p->sched_pipe[1], p->gf_attn[L]);
+        if (p->cda_attn[L]) {
+            p->set_stream(p->backend, 1);
+            ggml_backend_cuda_cda_signal(p->backend, p->cda_attn[L]);
+        } else if (p->e_attn_done[L]) {
+            ggml_backend_event_record(p->e_attn_done[L], p->backend);
+        }
 
-        // ---- Stage 3: FFN on compute stream (0) ----
-        ggml_backend_sched_synchronize(p->sched);
-        ggml_backend_sched_reset(p->sched);
+        // ---- Stage 3: FFN on stream 0 (sched_pipe[2]) ----
+        ggml_backend_sched_reset(p->sched_pipe[2]);
         if (p->set_stream) p->set_stream(p->backend, 0);
-        if (p->e_attn_done[L]) ggml_backend_event_wait(p->backend, p->e_attn_done[L]);
-        ggml_backend_sched_graph_compute_async(p->sched, p->gf_ffn[L]);
+        if (p->cda_attn[L]) {
+            ggml_backend_cuda_cda_wait(p->backend, p->cda_attn[L]);
+        } else if (p->e_attn_done[L]) {
+            ggml_backend_event_wait(p->backend, p->e_attn_done[L]);
+        }
+        ggml_backend_sched_graph_compute_async(p->sched_pipe[2], p->gf_ffn[L]);
     }
 
     ggml_backend_synchronize(p->backend);
@@ -916,19 +992,19 @@ void llama_pipeline_sched_compute_output_head(
         ggml_build_forward_expand(p->gf_output, embd);
     }
 
-    // Allocate and compute using the pipeline's scheduler
-    // (same sched used for layers)
-    if (!p->sched) return;
+    // Allocate and compute using the original caller's scheduler
+    ggml_backend_sched_t sched_out = p->sched_orig;
+    if (!sched_out) return;
 
-    ggml_backend_sched_synchronize(p->sched);
-    ggml_backend_sched_reset(p->sched);
+    ggml_backend_sched_synchronize(sched_out);
+    ggml_backend_sched_reset(sched_out);
 
-    if (!ggml_backend_sched_alloc_graph(p->sched, p->gf_output)) {
+    if (!ggml_backend_sched_alloc_graph(sched_out, p->gf_output)) {
         LLAMA_LOG_ERROR("%s: failed to allocate output head graph\n", __func__);
         return;
     }
 
-    ggml_backend_sched_graph_compute(p->sched, p->gf_output);
+    ggml_backend_sched_graph_compute(sched_out, p->gf_output);
 
     // Copy results to the result object for the caller
     res->t_logits = cur;
@@ -950,7 +1026,14 @@ void llama_pipeline_sched_set_prefetch_fn(
 void llama_pipeline_sched_free(struct llama_pipeline_sched * p) {
     if (!p) return;
 
-    if (p->device) {
+    if (p->use_cda) {
+#ifdef GGML_USE_CUDA
+        for (int i = 0; i < p->n_layer; i++) {
+            if (p->cda_qkv[i])  ggml_backend_cuda_cda_free(p->backend, p->cda_qkv[i]);
+            if (p->cda_attn[i]) ggml_backend_cuda_cda_free(p->backend, p->cda_attn[i]);
+        }
+#endif
+    } else if (p->device) {
         for (int i = 0; i < p->n_layer; i++) {
             if (p->e_qkv_done[i])  ggml_backend_event_free(p->e_qkv_done[i]);
             if (p->e_attn_done[i]) ggml_backend_event_free(p->e_attn_done[i]);
@@ -976,6 +1059,13 @@ void llama_pipeline_sched_free(struct llama_pipeline_sched * p) {
         if (p->ctx_layers[i]) {
             ggml_free(p->ctx_layers[i]);
             p->ctx_layers[i] = nullptr;
+        }
+    }
+
+    for (int si = 0; si < 3; si++) {
+        if (p->sched_pipe[si]) {
+            ggml_backend_sched_free(p->sched_pipe[si]);
+            p->sched_pipe[si] = nullptr;
         }
     }
 
