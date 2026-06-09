@@ -611,6 +611,7 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp, int ith) {
+    (void)ith;
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
