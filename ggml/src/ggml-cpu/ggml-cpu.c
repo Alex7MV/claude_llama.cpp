@@ -129,10 +129,14 @@ static void atomic_store_explicit(atomic_int * ptr, LONG val, memory_order mo) {
     InterlockedExchange(ptr, val);
 }
 static LONG atomic_load(atomic_int * ptr) {
-    return InterlockedCompareExchange(ptr, 0, 0);
+    return *(volatile LONG *)ptr;
 }
 static LONG atomic_load_explicit(atomic_int * ptr, memory_order mo) {
-    // TODO: add support for explicit memory order
+    if (mo == memory_order_relaxed || mo == memory_order_consume) {
+        // Plain volatile load: sufficient for relaxed/consume on x86/x64
+        return *(volatile LONG *)ptr;
+    }
+    // acquire, seq_cst: keep InterlockedCompareExchange for full barrier
     return InterlockedCompareExchange(ptr, 0, 0);
 }
 static LONG atomic_fetch_add(atomic_int * ptr, LONG inc) {
@@ -639,7 +643,11 @@ void ggml_barrier(struct ggml_threadpool * tp, int ith) {
 
     // wait for other threads
   {
+#ifndef GGML_CPU_TIMERS
+        const int64_t t_barrier_start UNUSED = 0;
+#else
         const int64_t t_barrier_start = ggml_time_us();
+#endif
 
         // Phase 1: brief spin (uses existing poll parameter, same scale as poll_for_work)
         {
@@ -661,10 +669,12 @@ void ggml_barrier(struct ggml_threadpool * tp, int ith) {
             ggml_mutex_unlock_shared(&tp->mutex);
         }
 
+#ifdef GGML_CPU_TIMERS
         atomic_fetch_add_explicit(&tp->t_barrier_us[ith],
             ggml_time_us() - t_barrier_start, memory_order_relaxed);
         atomic_fetch_add_explicit(&tp->n_barrier_ops[ith],
             1, memory_order_relaxed);
+#endif
     }
 
     // exit barrier (full seq-cst fence)
@@ -3597,20 +3607,28 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         // The main thread is the only one that can dispatch new work
 
         {
+#ifndef GGML_CPU_TIMERS
+            ggml_graph_compute_check_for_work(state);
+#else
             const int64_t t_poll_start = ggml_time_us();
             ggml_graph_compute_check_for_work(state);
             atomic_fetch_add_explicit(&threadpool->t_poll_us[state->ith],
                 ggml_time_us() - t_poll_start, memory_order_relaxed);
+#endif
         }
         if (state->pending) {
             state->pending = false;
 
+#ifdef GGML_CPU_TIMERS
             const int64_t t_compute_start = ggml_time_us();
             ggml_graph_compute_thread(state);
             atomic_fetch_add_explicit(&threadpool->t_compute_us[state->ith],
                 ggml_time_us() - t_compute_start, memory_order_relaxed);
             atomic_fetch_add_explicit(&threadpool->n_compute_ops[state->ith],
                 1, memory_order_relaxed);
+#else
+            ggml_graph_compute_thread(state);
+#endif
         }
     }
 
