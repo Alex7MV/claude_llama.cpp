@@ -764,14 +764,14 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
             bufts[i] = ggml_backend_sched_get_buffer_type(sched, backends[i]);
         }
 
-        // Compute max_nodes from phase graphs
+        // Estimate max_nodes from the largest phase graph using public API
         int max_nodes = 0;
         for (int i = 0; i < p->n_layer; i++) {
-            if (p->gf_qkv[i])  max_nodes = std::max(max_nodes, p->gf_qkv[i]->n_nodes  + p->gf_qkv[i]->n_leafs);
-            if (p->gf_attn[i]) max_nodes = std::max(max_nodes, p->gf_attn[i]->n_nodes + p->gf_attn[i]->n_leafs);
-            if (p->gf_ffn[i])  max_nodes = std::max(max_nodes, p->gf_ffn[i]->n_nodes  + p->gf_ffn[i]->n_leafs);
+            if (p->gf_qkv[i])  max_nodes = std::max(max_nodes, ggml_graph_n_nodes(p->gf_qkv[i]));
+            if (p->gf_attn[i]) max_nodes = std::max(max_nodes, ggml_graph_n_nodes(p->gf_attn[i]));
+            if (p->gf_ffn[i])  max_nodes = std::max(max_nodes, ggml_graph_n_nodes(p->gf_ffn[i]));
         }
-        max_nodes = max_nodes + max_nodes / 4; // 25% margin
+        max_nodes = max_nodes * 4; // generous margin for leafs + 25% safety
 
         for (int si = 0; si < 3; si++) {
             p->sched_pipe[si] = ggml_backend_sched_new(
