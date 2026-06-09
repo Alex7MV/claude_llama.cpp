@@ -1,5 +1,5 @@
 #include "ggml-cuda.h"
-#include "vendors/cuda.h"
+#include "common.cuh"
 
 // ---- CDA Barrier — GPU-side flag for sub-microsecond inter-stream sync ----
 //
