@@ -1086,8 +1086,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
+    const uint32_t n_seq = (uint32_t)seq_to_stream.size();
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+    for (uint32_t s = 0; s < n_seq; ++s) {
         seq_pos_max_rm[s] = -1;
     }
 
@@ -1131,7 +1132,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
-    for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+    for (uint32_t s = 0; s < n_seq; ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
         }
@@ -1516,8 +1517,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     const T mask_drop = llama_cast<T>(-INFINITY);
 
     // the min position in the batch for each sequence
+    const uint32_t n_seq = (uint32_t)seq_to_stream.size();
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
-    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    std::fill(seq_pos_min, seq_pos_min + n_seq, INT32_MAX);
 
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -1525,10 +1527,13 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+    // track the first token per sequence for mask reuse (reused across streams to avoid reallocation)
+    std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
-        // track the first token per sequence for mask reuse
-        std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
-        std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        seq_srct.clear();
+        seq_idxs.clear();
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
