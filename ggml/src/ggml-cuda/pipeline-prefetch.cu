@@ -54,7 +54,7 @@ void ggml_backend_cuda_pipeline_expert_prefetch(
             if (!dst[s] || !src[s] || slice_bytes[s] == 0) continue;
             void * gpu_dst = (char *)dst[s]->data + (size_t)i * slice_bytes[s];
             void * cpu_src = (char *)src[s]->data + (size_t)e * slice_bytes[s];
-            cudaMemcpyAsync(gpu_dst, cpu_src, slice_bytes[s], cudaMemcpyDefault, stream);
+            cudaMemcpyAsync(gpu_dst, cpu_src, slice_bytes[s], cudaMemcpyHostToDevice, stream);
         }
     }
 
