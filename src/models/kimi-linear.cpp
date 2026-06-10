@@ -1,4 +1,5 @@
 #include "models.h"
+#include "llama-context.h"
 #include "llama-memory-recurrent.h"
 
 void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
@@ -304,7 +305,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                     layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s);
                 ggml_tensor * ffn_shexp = build_ffn(cur, layer.ffn_up_shexp, NULL, NULL,
                     layer.ffn_gate_shexp, NULL, NULL, layer.ffn_down_shexp, NULL, NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
                 cur = ggml_add(ctx0, cur, ffn_inp);
                 cur = build_cvec(cur, il);
