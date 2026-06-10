@@ -1476,7 +1476,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         total_experts += (int32_t)model.hparams.n_expert;
 
                         // Compact expert copy: kept experts DDR5 → VRAM
-                        if (kept > 0) {
+                        if (kept > 0 && (size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
                             auto * src_gate = model.layers[il].ffn_gate_exps;
                             auto * src_up   = model.layers[il].ffn_up_exps;
                             auto * src_down = model.layers[il].ffn_down_exps;
@@ -1526,7 +1526,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
                 }
 
-                moe_weight_cache.compact_ready = true;
+                // compact_ready only if at least one layer has compact buffers
+                moe_weight_cache.compact_ready = false;
+                for (int _il = (int)n_layer_dense_lead; _il < (int)n_layer; _il++) {
+                    if ((size_t)_il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[_il]) {
+                        moe_weight_cache.compact_ready = true;
+                        break;
+                    }
+                }
 
                 // ---- Phase 2: build compact FFN graph ----
                 moe_weight_cache.build_phase = 2;
@@ -1761,63 +1768,64 @@ void llama_context::init_moe_weight_cache() {
         }
     }
 
-    // Allocate persistent GPU buffer
-    moe_weight_cache.buf = ggml_backend_alloc_buffer(gpu, total_sz);
-    if (!moe_weight_cache.buf) {
-        LLAMA_LOG_ERROR("%s: failed to allocate MoE weight cache buffer\n", __func__);
-        ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
-        return;
-    }
-
-    moe_weight_cache.gate.resize(n_layer, nullptr);
-    moe_weight_cache.up.resize(n_layer, nullptr);
-    moe_weight_cache.down.resize(n_layer, nullptr);
-
-    size_t offset = 0;
-    auto * buf_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.buf);
-
-    auto make_cache_tensor = [&](const ggml_tensor * src, size_t sz) -> ggml_tensor * {
-        const int nd = ggml_n_dims(src);
-        ggml_tensor * t;
-        switch (nd) {
-            case 1: t = ggml_new_tensor_1d(moe_weight_cache.ctx_meta, src->type, src->ne[0]); break;
-            case 2: t = ggml_new_tensor_2d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1]); break;
-            case 3: t = ggml_new_tensor_3d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2]); break;
-            default: t = ggml_new_tensor_4d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]); break;
-        }
-        if (t) {
-            t->data   = buf_base + offset;
-            t->buffer = moe_weight_cache.buf;
-            t->flags |= GGML_TENSOR_FLAG_INPUT;
-            offset += sz;
-        }
-        return t;
-    };
-
-    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
-        moe_weight_cache.gate[il] = make_cache_tensor(model.layers[il].ffn_gate_exps, sz_gate);
-        moe_weight_cache.up[il]   = make_cache_tensor(model.layers[il].ffn_up_exps,   sz_up);
-        moe_weight_cache.down[il] = make_cache_tensor(model.layers[il].ffn_down_exps, sz_down);
-    }
-
-    moe_weight_cache.n_layers = n_moe_layers;
-
-    // Copy all weights from CPU → GPU
-    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
-        ggml_backend_tensor_copy(model.layers[il].ffn_gate_exps, moe_weight_cache.gate[il]);
-        ggml_backend_tensor_copy(model.layers[il].ffn_up_exps,   moe_weight_cache.up[il]);
-        ggml_backend_tensor_copy(model.layers[il].ffn_down_exps, moe_weight_cache.down[il]);
-    }
-
-    ggml_backend_synchronize(gpu);
-    moe_weight_cache.populated = true;
-
-    // ---- v2 scratch + compact buffer allocation ----
+    // Allocate persistent GPU buffer for v1 full cache (skipped for two-phase; uses DDR5 directly)
     if (!cparams.moe_two_phase) {
+        moe_weight_cache.buf = ggml_backend_alloc_buffer(gpu, total_sz);
+        if (!moe_weight_cache.buf) {
+            LLAMA_LOG_ERROR("%s: failed to allocate MoE weight cache buffer\n", __func__);
+            ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
+            return;
+        }
+
+        moe_weight_cache.gate.resize(n_layer, nullptr);
+        moe_weight_cache.up.resize(n_layer, nullptr);
+        moe_weight_cache.down.resize(n_layer, nullptr);
+
+        size_t offset = 0;
+        auto * buf_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.buf);
+
+        auto make_cache_tensor = [&](const ggml_tensor * src, size_t sz) -> ggml_tensor * {
+            const int nd = ggml_n_dims(src);
+            ggml_tensor * t;
+            switch (nd) {
+                case 1: t = ggml_new_tensor_1d(moe_weight_cache.ctx_meta, src->type, src->ne[0]); break;
+                case 2: t = ggml_new_tensor_2d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1]); break;
+                case 3: t = ggml_new_tensor_3d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2]); break;
+                default: t = ggml_new_tensor_4d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]); break;
+            }
+            if (t) {
+                t->data   = buf_base + offset;
+                t->buffer = moe_weight_cache.buf;
+                t->flags |= GGML_TENSOR_FLAG_INPUT;
+                offset += sz;
+            }
+            return t;
+        };
+
+        for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+            moe_weight_cache.gate[il] = make_cache_tensor(model.layers[il].ffn_gate_exps, sz_gate);
+            moe_weight_cache.up[il]   = make_cache_tensor(model.layers[il].ffn_up_exps,   sz_up);
+            moe_weight_cache.down[il] = make_cache_tensor(model.layers[il].ffn_down_exps, sz_down);
+        }
+
+        moe_weight_cache.n_layers = n_moe_layers;
+
+        for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+            ggml_backend_tensor_copy(model.layers[il].ffn_gate_exps, moe_weight_cache.gate[il]);
+            ggml_backend_tensor_copy(model.layers[il].ffn_up_exps,   moe_weight_cache.up[il]);
+            ggml_backend_tensor_copy(model.layers[il].ffn_down_exps, moe_weight_cache.down[il]);
+        }
+
+        ggml_backend_synchronize(gpu);
+        moe_weight_cache.populated = true;
+
         LLAMA_LOG_INFO("%s: MoE weight cache initialized (v1): %ld layers, %zu MB\n",
             __func__, (long)n_moe_layers, total_sz / (1024 * 1024));
         return;
     }
+
+    // ---- v2 two-phase: scratch + compact buffer allocation (no v1 full cache) ----
+    moe_weight_cache.populated = true;
 
     const int n_tokens = (int)cparams.n_ubatch;
     const int64_t n_expert_used = hparams.n_expert_used;
@@ -1828,7 +1836,14 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_ffn_inp     = ggml_row_size(GGML_TYPE_F32, hparams.n_embd * n_tokens);
     const size_t total_scratch = n_moe_layers * (s_moe_ids + s_moe_weights + s_ffn_inp);
 
-    // Compact buffer: per-layer kept expert weights
+    // Threshold + remap tensors: expert_mask, remap, kept_count
+    const int64_t n_mask_words = (n_expert + 63) / 64;
+    const size_t s_expert_mask = (size_t)n_mask_words * sizeof(uint64_t);
+    const size_t s_remap       = ggml_row_size(GGML_TYPE_I32, n_expert);
+    const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
+    const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
+
+    // Compact buffer: per-layer kept expert weights (upper bound = n_expert)
     const int max_kept = (int)n_expert;
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
@@ -1839,18 +1854,14 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_down = slice_down * max_kept;
     const size_t total_compact = n_moe_layers * (s_kept_gate + s_kept_up + s_kept_down);
 
-    // Threshold + remap tensors: expert_mask, remap, kept_count
-    const int64_t n_mask_words = (n_expert + 63) / 64;
-    const size_t s_expert_mask = (size_t)n_mask_words * sizeof(uint64_t);
-    const size_t s_remap       = ggml_row_size(GGML_TYPE_I32, n_expert);
-    const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
-    const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
-
-    // Single GPU buffer for scratch + compact + threshold
     const size_t total_v2_sz = total_scratch + total_compact + total_threshold;
     moe_weight_cache.scratch_buf = ggml_backend_alloc_buffer(gpu, total_v2_sz);
     if (!moe_weight_cache.scratch_buf) {
-        LLAMA_LOG_ERROR("%s: failed to allocate v2 scratch buffer\n", __func__);
+        LLAMA_LOG_WARN("%s: failed to allocate v2 scratch+compact buffer (%zu MB), falling back to single-phase\n",
+            __func__, total_v2_sz / (1024 * 1024));
+        moe_weight_cache.populated = false;
+        ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf;
+        moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
         return;
     }
 
@@ -1907,8 +1918,8 @@ void llama_context::init_moe_weight_cache() {
 
     ggml_backend_synchronize(gpu);
 
-    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, full=%zuMB, scratch+compact=%zuMB\n",
-        __func__, n_moe_layers, total_sz / (1024 * 1024), total_v2_sz / (1024 * 1024));
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, scratch+compact=%zuMB\n",
+        __func__, n_moe_layers, total_v2_sz / (1024 * 1024));
 }
 #endif
 

@@ -311,6 +311,25 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 cur = build_cvec(cur, il);
                 cb(cur, "l_out", il);
                 inpL = cur;
+            } else if ((size_t)il < moe_cache->scratch_moe_ids.size() && moe_cache->scratch_moe_ids[il]) {
+                // Fallback: no compact buffer, use original DDR5 weights with cached routing
+                int64_t n_expert_used = hparams.n_expert_used;
+                ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
+                ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
+                ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens);
+                ggml_tensor * moe_out = build_moe_ffn(cur,
+                    layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
+                    hparams.n_expert, n_expert_used, LLM_FFN_SILU, il,
+                    cached_ids, cached_w_3d, layer.ffn_gate_up_exps,
+                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s);
+                ggml_tensor * ffn_shexp = build_ffn(cur, layer.ffn_up_shexp, NULL, NULL,
+                    layer.ffn_gate_shexp, NULL, NULL, layer.ffn_down_shexp, NULL, NULL,
+                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                cur = ggml_add(ctx0, cur, ffn_inp);
+                cur = build_cvec(cur, il);
+                cb(cur, "l_out", il);
+                inpL = cur;
             }
             continue;
         }
