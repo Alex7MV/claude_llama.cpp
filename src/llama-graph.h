@@ -947,6 +947,27 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr) const;
 
+    // Hyper-sparse MoE: cached routing path.
+    // Builds MoE FFN using pre-computed expert IDs and renormalized weights,
+    // SKIPPING the routing computation (gate_inp proj → softmax → top-k).
+    // cached_ids:   [n_expert_used, n_tokens] i32 — already remapped to compact slots
+    // cached_weights: [1, n_expert_used, n_tokens] f32 — already renormalized
+    ggml_tensor * build_moe_ffn(
+             ggml_tensor * cur,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                     int   il,
+             ggml_tensor * cached_ids,
+             ggml_tensor * cached_weights,
+             ggml_tensor * gate_up_exps = nullptr,
+             ggml_tensor * up_exps_s = nullptr,
+             ggml_tensor * gate_exps_s = nullptr,
+             ggml_tensor * down_exps_s = nullptr) const;
+
     //
     // inputs
     //

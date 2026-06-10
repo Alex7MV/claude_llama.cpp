@@ -1,0 +1,6 @@
+Short:
+Explain the technical concept of 'Huang's Law' in the context of GPU scaling from 2010 to 2026. Briefly state why traditional monolithic inference pipelines fail to sustain this law as model sizes cross the 500B parameter threshold. Focus on the memory wall bottleneck.
+
+
+Long:
+Write a comprehensive technical white paper titled 'The Death of Huang’s Law: The Rise of Asynchronous Hybrid Inference.'Your essay must cover the following sections in extreme detail:Historical Context: How GPU compute outpaced memory bandwidth over the last decade.The 671B Problem: Detailed analysis of DeepSeek-V3/V4 architectures and why they break standard consumer hardware constraints.Architectural Countermeasures: Compare monolithic CUDA graph execution versus the 'Hyper-Synergy' 3-stage asynchronous pipeline (QKV Proj -> Async Attention -> MoE FFN).Hardware Synergy: Discuss how 12-channel DDR5 subsystems on EPYC Turin act as a high-capacity 'L4 cache' for VRAM-limited systems.The Future: Predictions on how decentralized, asynchronous hybrid systems will democratize 1-trillion parameter models for individual researchers.Aim for a highly technical tone, 1500+ words, and use complex logical structures to maximize expert switching in the MoE layers.

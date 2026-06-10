@@ -97,6 +97,36 @@ GGML_BACKEND_API void ggml_backend_cuda_pipeline_expert_prefetch(
     ggml_backend_event_t  completion_event,
     ggml_backend_t        backend);
 
+// Hyper-sparse MoE: skip-mask based expert prefetch.
+// Copies only non-skipped experts from CPU DDR5 to compact VRAM buffer.
+// Uses TMA on sm_90+ (RTX 5090), falls back to cudaMemcpyAsync.
+// expert_mask:  GPU tensor with skip bitmask (read as uint64_t[])
+// moe_remap:    GPU tensor [n_expert] i32 — maps original ID → compact slot
+GGML_BACKEND_API void ggml_backend_cuda_pipeline_expert_skip_prefetch(
+    struct ggml_tensor  * dst[3],
+    struct ggml_tensor  * src[3],
+    size_t                slice_bytes[3],
+    struct ggml_tensor  * expert_mask,
+    struct ggml_tensor  * moe_remap,
+    ggml_backend_event_t  moe_ready,
+    ggml_backend_event_t  completion_event,
+    ggml_backend_t        backend);
+
+// Hyper-sparse MoE: cumulative weight threshold kernel.
+// Launched on compute stream after Phase A routing produces moe_ids/moe_weights.
+// Reads per-expert contributions, sorts descending, finds 0.95 threshold with
+// floor(3), builds skip_mask bitmask and remap table, renormalizes weights.
+GGML_BACKEND_API void ggml_backend_cuda_pipeline_moe_threshold(
+    struct ggml_tensor  * moe_ids,
+    struct ggml_tensor  * moe_weights_in,
+    struct ggml_tensor  * moe_weights_out,
+    struct ggml_tensor  * skip_mask,
+    struct ggml_tensor  * remap,
+    struct ggml_tensor  * kept_count,
+    float                 threshold,
+    int                   floor_experts,
+    ggml_backend_t        backend);
+
 #ifdef  __cplusplus
 }
 #endif

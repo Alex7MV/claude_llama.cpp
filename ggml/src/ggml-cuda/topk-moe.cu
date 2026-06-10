@@ -1,5 +1,6 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
+#include "ggml-backend-impl.h"
 #include "topk-moe.cuh"
 
 #include <cmath>
@@ -402,7 +403,6 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
             return false;
         }
 
-        // don't fuse when masks or sinks are present
         if (softmax->src[1] || softmax->src[2]) {
             return false;
         }
@@ -415,4 +415,245 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
     }
 
     return true;
+}
+
+// ============================================================================
+// Hyper-sparse MoE Phase 2: Cumulative Threshold Kernel
+//
+// 1 block × 32 threads. Reads per-expert contribution totals after Phase A
+// routing (moe_ids + moe_weights), computes cumulative weight threshold at
+// 0.95 with floor(3), builds skip_mask (uint64_t bitmask) and remap table.
+//
+// Inputs:
+//   moe_ids:       [n_expert_used, n_tokens] i32 — expert IDs per token per slot
+//   moe_weights_in: [n_expert_used, n_tokens] f32 — pre-renormalization weights
+//
+// Outputs (GPU global memory):
+//   moe_weights_out: [n_expert_used, n_tokens] f32 — renormalized (skipped → 0.0)
+//   skip_mask:       [ceil(n_expert/64)] uint64_t — bit=1 → skip this expert
+//   remap:           [n_expert] int32_t — remap[expert_id] = compact_slot or -1
+//   kept_count:      [1] int32_t — number of kept experts
+// ============================================================================
+__global__ void cumulative_threshold_kernel(
+    const int32_t * moe_ids,
+    const float   * moe_weights_in,
+    float         * moe_weights_out,
+    uint64_t      * skip_mask,
+    int32_t       * remap,
+    int32_t       * kept_count,
+    int             n_tokens,
+    int             n_expert_used,
+    int             n_expert,
+    int             n_padded,       // next power of 2 >= n_expert (bitonic sort requires POW2)
+    float           threshold,
+    int             floor_experts) {
+
+    // Shared memory for per-expert contributions and sort indices.
+    // Padded to n_padded for bitonic sort (max 1024 → 12 KB < 48 KB).
+    extern __shared__ float shmem[];
+    float * contrib   = shmem;                     // [n_padded]
+    float * s_vals    = shmem + n_padded;          // [n_padded] sorted copy
+    int   * s_idx     = (int *)(shmem + 2 * n_padded);  // [n_padded]
+
+    const int tid = threadIdx.x;  // 0..31
+    const int total_slots = n_tokens * n_expert_used;
+
+    // ---- Step 1: Clear contribution buffer ----
+    for (int i = tid; i < n_padded; i += 32) {
+        contrib[i] = 0.0f;
+    }
+    __syncthreads();
+
+    // ---- Step 2: Scatter weights → per-expert contributions ----
+    for (int idx = tid; idx < total_slots; idx += 32) {
+        int e = moe_ids[idx];
+        float w = moe_weights_in[idx];
+        if (e >= 0 && e < n_expert) {
+            atomicAdd(&contrib[e], w);
+        }
+    }
+    __syncthreads();
+
+    // ---- Step 3: Compute total contribution sum ----
+    float total = 0.0f;
+    for (int i = tid; i < n_expert; i += 32) {
+        total += contrib[i];
+    }
+    total = warp_reduce_sum(total);
+
+    // Copy contrib → s_vals, init s_idx; pad extras with -FLT_MAX
+    for (int i = tid; i < n_padded; i += 32) {
+        if (i < n_expert) {
+            s_vals[i] = contrib[i];
+            s_idx[i]  = i;
+        } else {
+            s_vals[i] = -FLT_MAX;
+            s_idx[i]  = i;
+        }
+    }
+    __syncthreads();
+
+    // ---- Step 4: Bitonic sort descending by contribution ----
+    // Operates on n_padded elements; sentinel -FLT_MAX sink to bottom.
+    for (int k = 2; k <= n_padded; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int ixj;
+            for (int base = tid; base < n_padded; base += 32) {
+                int i = base;
+                ixj = i ^ j;
+                if (ixj > i) {
+                    bool descending = ((i & k) == 0);
+                    bool swap = descending ? (s_vals[i] < s_vals[ixj]) : (s_vals[i] > s_vals[ixj]);
+                    if (swap) {
+                        float tmp_f = s_vals[i];
+                        s_vals[i]   = s_vals[ixj];
+                        s_vals[ixj] = tmp_f;
+                        int tmp_i   = s_idx[i];
+                        s_idx[i]    = s_idx[ixj];
+                        s_idx[ixj]  = tmp_i;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // ---- Step 5: Cumulative threshold (iterate only real n_expert, not padded) ----
+    float cum = 0.0f;
+    float target = total * threshold;
+    int split = n_expert;
+
+    if (tid == 0) {
+        for (int i = 0; i < n_expert; i++) {
+            cum += s_vals[i];
+            if ((cum >= target || i >= n_expert - floor_experts) && i >= floor_experts - 1) {
+                split = i + 1;
+                if (cum < target) {
+                    split = i + 1;
+                }
+                break;
+            }
+        }
+        if (split < floor_experts) {
+            split = floor_experts;
+        }
+        *kept_count = split;
+    }
+    __syncthreads();
+
+    // ---- Step 6: Build skip_mask (bit=1 → skip) ----
+    const int n_mask_words = (n_expert + 63) / 64;
+
+    // Reuse contrib area as byte "is_kept" flag (contrib dead after sort)
+    bool * is_kept = (bool *)shmem;
+
+    for (int e = tid; e < n_expert; e += 32) {
+        is_kept[e] = false;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < split; i += 32) {
+        is_kept[s_idx[i]] = true;
+    }
+    __syncthreads();
+
+    for (int w = tid; w < n_mask_words; w += 32) {
+        uint64_t mask = 0ULL;
+        int base = w * 64;
+        int limit = min(64, n_expert - base);
+        for (int b = 0; b < limit; b++) {
+            if (!is_kept[base + b]) {
+                mask |= (1ULL << b);
+            }
+        }
+        skip_mask[w] = mask;
+    }
+    __syncthreads();
+
+    // ---- Step 7: Build remap table (original expert ID → compact slot) ----
+    // S4: skipped experts get remap[e]=0 (safe sentinel; zero weight kills output).
+    //     DO NOT write -1 — ggml_get_rows treats it as OOB → GPU crash.
+    for (int e = tid; e < n_expert; e += 32) {
+        remap[e] = 0;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < split; i += 32) {
+        remap[s_idx[i]] = i;
+    }
+    __syncthreads();
+
+    // ---- Step 8: Renormalize weights (skipped → 0.0, kept → w / Σ_kept w) ----
+    for (int t = tid; t < n_tokens; t += 32) {
+        const float * w_in  = moe_weights_in + t * n_expert_used;
+        float *       w_out = moe_weights_out + t * n_expert_used;
+
+        float kept_sum = 0.0f;
+        for (int k = 0; k < n_expert_used; k++) {
+            int e = moe_ids[t * n_expert_used + k];
+            int word = e / 64;
+            int bit  = e % 64;
+            bool skipped = (skip_mask[word] >> bit) & 1ULL;
+            if (!skipped) {
+                kept_sum += w_in[k];
+            }
+        }
+
+        float inv_sum = kept_sum > 1e-10f ? 1.0f / kept_sum : 1.0f;
+        for (int k = 0; k < n_expert_used; k++) {
+            int e = moe_ids[t * n_expert_used + k];
+            int word = e / 64;
+            int bit  = e % 64;
+            bool skipped = (skip_mask[word] >> bit) & 1ULL;
+            w_out[k] = skipped ? 0.0f : w_in[k] * inv_sum;
+        }
+    }
+}
+
+// ============================================================================
+// Host wrapper: launches cumulative_threshold_kernel with proper block config.
+// Called from pipeline-sched.cpp after Phase A compute completes.
+// ============================================================================
+void ggml_backend_cuda_pipeline_moe_threshold(
+    struct ggml_tensor  * moe_ids,
+    struct ggml_tensor  * moe_weights_in,
+    struct ggml_tensor  * moe_weights_out,
+    struct ggml_tensor  * skip_mask,
+    struct ggml_tensor  * remap,
+    struct ggml_tensor  * kept_count,
+    float                 threshold,
+    int                   floor_experts,
+    ggml_backend_t        backend) {
+
+    auto * ctx = (ggml_backend_cuda_context *)backend->context;
+
+    int n_expert_used = moe_ids->ne[0];
+    int n_tokens      = moe_ids->ne[1];
+    int n_expert      = remap->ne[0];
+
+    // S1: pad to next power of 2 for bitonic sort
+    int n_padded = 1;
+    while (n_padded < n_expert) n_padded <<= 1;
+
+    cudaStream_t stream = ctx->stream();
+
+    // shared memory sized for padded arrays
+    size_t shmem_bytes = (2 * sizeof(float) + sizeof(int)) * n_padded;
+
+    dim3 grid_dims(1, 1, 1);
+    dim3 block_dims(32, 1, 1);
+
+    cumulative_threshold_kernel<<<grid_dims, block_dims, shmem_bytes, stream>>>(
+        (const int32_t *)moe_ids->data,
+        (const float   *)moe_weights_in->data,
+        (float         *)moe_weights_out->data,
+        (uint64_t      *)skip_mask->data,
+        (int32_t       *)remap->data,
+        (int32_t       *)kept_count->data,
+        n_tokens,
+        n_expert_used,
+        n_expert,
+        n_padded,
+        threshold,
+        floor_experts);
 }

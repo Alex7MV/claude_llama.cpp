@@ -7,6 +7,7 @@
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+#include <cuda_runtime.h>
 #endif
 
 #include <cmath>
@@ -31,9 +32,14 @@ static void build_phase_a(
         class llm_graph_input_attn_k_dsa   * inp_attn_dsa,
         float                                 kq_scale,
         uint32_t                              il,
-        struct llama_layer_scratch          * scratch) {
+        struct llama_layer_scratch          * scratch,
+        // Hyper-sparse MoE caching: pre-compute routing in Phase A
+        float                                 moe_threshold  = 0.95f,
+        int                                   moe_floor      = 3) {
 
     (void)kq_scale;
+    (void)moe_threshold;
+    (void)moe_floor;
     struct ggml_context * ctx0_saved = ctx.ctx0;
     struct ggml_cgraph  * gf_saved   = ctx.gf;
     ctx.ctx0 = ctx0_layer;
@@ -231,8 +237,86 @@ static void build_phase_a(
         kv_cmpr = ctx.build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
         ctx.cb(kv_cmpr, "kv_cmpr", il);
 
-        // ---- Build Qcur, Kcur, Vcur for flash_attn ----
-        q_nope = ggml_permute(ctx0_layer, q_nope, 0, 2, 1, 3);
+    // ---- Hyper-sparse MoE: pre-compute routing + cache to scratch ----
+    // Uses FFN-normed pre-attention hidden state (approximation: attention delta is small).
+    // For dense layers (il < n_layer_dense_lead), no MoE routing is needed.
+    {
+        const uint32_t n_layer_dense_lead = ctx.hparams.n_layer_dense_lead;
+        if ((uint32_t) il >= n_layer_dense_lead && scratch->moe_ids) {
+            // Apply ffn_norm on inpL (pre-attention residual stream)
+            ggml_tensor * moe_cur = ctx.build_norm(inpL, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+            ctx.cb(moe_cur, "ffn_moe_norm", il);
+
+            // gate_inp projection → [n_expert, n_tokens]
+            ggml_tensor * moe_logits = ctx.build_lora_mm(model.layers[il].ffn_gate_inp, moe_cur);
+            ctx.cb(moe_logits, "ffn_moe_logits", il);
+
+            // softmax → probs
+            ggml_tensor * moe_probs = ggml_soft_max(ctx0_layer, moe_logits);
+            ctx.cb(moe_probs, "ffn_moe_probs", il);
+
+            // Expert selection bias (DeepSeek V3 aux-loss-free balancing)
+            ggml_tensor * selection_probs = moe_probs;
+            if (model.layers[il].ffn_exp_probs_b) {
+                selection_probs = ggml_add(ctx0_layer, moe_probs,
+                    model.layers[il].ffn_exp_probs_b);
+                ctx.cb(selection_probs, "ffn_moe_probs_biased", il);
+            }
+
+            // Group routing (DeepSeek V3-style): select top n_group_used groups
+            if (ctx.hparams.n_expert_groups > 1 && ctx.n_tokens > 0) {
+                const int64_t n_exp_per_group = ctx.hparams.n_expert /
+                                                ctx.hparams.n_expert_groups;
+                ggml_tensor * sel_groups = ggml_reshape_3d(ctx0_layer, moe_probs,
+                    n_exp_per_group, ctx.hparams.n_expert_groups, ctx.n_tokens);
+                ggml_tensor * g_scores = ggml_argsort_top_k(ctx0_layer, sel_groups, 2);
+                g_scores = ggml_get_rows(ctx0_layer,
+                    ggml_reshape_4d(ctx0_layer, moe_probs, 1,
+                        moe_probs->ne[0], moe_probs->ne[1], moe_probs->ne[2]),
+                    g_scores);
+                g_scores = ggml_sum_rows(ctx0_layer,
+                    ggml_reshape_3d(ctx0_layer, g_scores,
+                        g_scores->ne[1], g_scores->ne[2], g_scores->ne[3]));
+                g_scores = ggml_reshape_2d(ctx0_layer, g_scores,
+                    g_scores->ne[1], g_scores->ne[2]);
+                ggml_tensor * expert_groups = ggml_argsort_top_k(
+                    ctx0_layer, g_scores, ctx.hparams.n_group_used);
+                ctx.cb(expert_groups, "ffn_moe_group_topk", il);
+                selection_probs = ggml_get_rows(ctx0_layer, sel_groups, expert_groups);
+                selection_probs = ggml_set_rows(ctx0_layer,
+                    ggml_fill(ctx0_layer, sel_groups, -INFINITY),
+                    selection_probs, expert_groups);
+                selection_probs = ggml_reshape_2d(ctx0_layer,
+                    selection_probs, ctx.hparams.n_expert, ctx.n_tokens);
+                ctx.cb(selection_probs, "ffn_moe_probs_masked", il);
+            }
+
+            // top-k expert selection → [n_expert_used, n_tokens]
+            const int64_t n_expert_used = ctx.hparams.n_expert_used;
+            ggml_tensor * selected = ggml_argsort_top_k(ctx0_layer, selection_probs, n_expert_used);
+            ctx.cb(selected, "ffn_moe_topk", il);
+
+            // Extract weights → [1, n_expert_used, n_tokens]
+            ggml_tensor * moe_weights_3d = ggml_get_rows(ctx0_layer,
+                ggml_reshape_3d(ctx0_layer, moe_probs, 1, ctx.hparams.n_expert, ctx.n_tokens),
+                selected);
+            ctx.cb(moe_weights_3d, "ffn_moe_weights", il);
+
+            // Flatten weights → [n_expert_used, n_tokens] for scratch storage
+            ggml_tensor * moe_weights_2d = ggml_reshape_2d(ctx0_layer, moe_weights_3d,
+                n_expert_used, ctx.n_tokens);
+            ctx.cb(moe_weights_2d, "ffn_moe_weights_flat", il);
+
+            // Copy to persistent scratch for later phases
+            ggml_build_forward_expand(gf_layer,
+                ggml_cpy(ctx0_layer, selected, scratch->moe_ids));
+            ggml_build_forward_expand(gf_layer,
+                ggml_cpy(ctx0_layer, moe_weights_2d, scratch->moe_weights));
+        }
+    }
+
+    // ---- Build Qcur, Kcur, Vcur for flash_attn ----
+    q_nope = ggml_permute(ctx0_layer, q_nope, 0, 2, 1, 3);
         ctx.cb(q_nope, "q_nope_perm", il);
 
         ggml_tensor * q_nope_absorbed = ggml_mul_mat(ctx0_layer, model.layers[il].wk_b, q_nope);
@@ -339,7 +423,11 @@ static void build_phase_c(
         uint32_t                              il,
         struct ggml_tensor                  * prefetch_gate  = nullptr,
         struct ggml_tensor                  * prefetch_up    = nullptr,
-        struct ggml_tensor                  * prefetch_down  = nullptr) {
+        struct ggml_tensor                  * prefetch_down  = nullptr,
+        // Hyper-sparse MoE: cached routing (from scratch)
+        struct ggml_tensor                  * cached_ids     = nullptr,
+        struct ggml_tensor                  * cached_weights = nullptr,
+        struct ggml_tensor                  * remap_tensor   = nullptr) {
 
     (void)inp_out_ids;
     struct ggml_context * ctx0_saved = ctx.ctx0;
@@ -368,22 +456,48 @@ static void build_phase_c(
         struct ggml_tensor * ffn_gate_exps = prefetch_gate ? prefetch_gate : model.layers[il].ffn_gate_exps;
         struct ggml_tensor * ffn_down_exps = prefetch_down ? prefetch_down : model.layers[il].ffn_down_exps;
 
-        ggml_tensor * moe_out = ctx.build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            ffn_up_exps,
-            ffn_gate_exps,
-            ffn_down_exps,
-            model.layers[il].ffn_exp_probs_b,
-            ctx.n_expert, ctx.n_expert_used,
-            LLM_FFN_SILU, ctx.hparams.expert_weights_norm,
-            ctx.hparams.expert_weights_scale,
-            (llama_expert_gating_func_type) ctx.hparams.expert_gating_func,
-            il,
-            nullptr,
-            model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+        ggml_tensor * moe_out;
+        if (cached_ids && cached_weights && remap_tensor) {
+            // Hyper-sparse path: use pre-computed routing from Phase A
+            // Remap original expert IDs → compact prefetch slot IDs
+            ggml_tensor * remapped_ids = ggml_get_rows(ctx0_layer,
+                remap_tensor, cached_ids);
+            ctx.cb(remapped_ids, "ffn_moe_remapped_ids", il);
+
+            // Use cached (already renormalized) weights
+            ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0_layer,
+                cached_weights, 1, ctx.n_expert_used, ctx.n_tokens);
+            ctx.cb(cached_w_3d, "ffn_moe_cached_weights", il);
+
+            // Build FFN with cached IDs + weights (no routing recomputed)
+            moe_out = ctx.build_moe_ffn(cur,
+                ffn_up_exps, ffn_gate_exps, ffn_down_exps,
+                ctx.n_expert, ctx.n_expert_used,
+                LLM_FFN_SILU, il,
+                remapped_ids, cached_w_3d,
+                model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+        } else {
+            // Standard path: full routing inside build_moe_ffn
+            moe_out = ctx.build_moe_ffn(cur,
+                model.layers[il].ffn_gate_inp,
+                ffn_up_exps,
+                ffn_gate_exps,
+                ffn_down_exps,
+                model.layers[il].ffn_exp_probs_b,
+                ctx.n_expert, ctx.n_expert_used,
+                LLM_FFN_SILU, ctx.hparams.expert_weights_norm,
+                ctx.hparams.expert_weights_scale,
+                (llama_expert_gating_func_type) ctx.hparams.expert_gating_func,
+                il,
+                nullptr,
+                model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+        }
         ctx.cb(moe_out, "ffn_moe_out", il);
 
         {
@@ -450,6 +564,12 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
 
     p->prefetch_fn        = prefetch_fn;
     p->prefetch_user_data = prefetch_user_data;
+    p->n_expert_stats      = ctx.hparams.n_expert;
+    p->moe_threshold       = 0.95f;  // L1: keep 95% cumulative weight
+    p->moe_floor           = 3;      // L1: at least 3 experts
+    memset(&p->stats, 0, sizeof(p->stats));
+    p->stats_counter       = 0;
+    p->stats_log_interval  = 0;
 
     const uint32_t n_layers = ctx.hparams.n_layer - ctx.hparams.nextn_predict_layers;
     if (n_layers > LLAMA_PIPELINE_MAX_LAYERS) { delete p; return nullptr; }
@@ -475,6 +595,17 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
             nrot = tmp / 2;
         }
 
+        // MoE routing scratch sizes (hyper-sparse)
+        const int64_t n_expert      = ctx.hparams.n_expert;
+        const int64_t n_expert_used = ctx.hparams.n_expert_used;
+        const size_t s_moe_ids      = ggml_row_size(GGML_TYPE_I32, n_expert_used * n_tokens);
+        const size_t s_moe_weights  = ggml_row_size(GGML_TYPE_F32, n_expert_used * n_tokens);
+        // expert_mask: byte buffer sized for ceil(n_expert/64) uint64 words
+        const int64_t n_mask_words  = (n_expert + 63) / 64;
+        const size_t s_expert_mask  = (size_t)n_mask_words * sizeof(uint64_t);
+        const size_t s_moe_remap    = ggml_row_size(GGML_TYPE_I32, n_expert);
+        const size_t s_moe_kept     = ggml_row_size(GGML_TYPE_I32, 1);
+
         // Scratch sizes
         const size_t s_inpL_embd     = ggml_row_size(GGML_TYPE_F32, n_embd * n_tokens);
         const size_t s_Qcur          = ggml_row_size(GGML_TYPE_F32, n_embd_head_k * n_head * n_tokens);
@@ -485,6 +616,8 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
         const size_t s_inpL_next     = ggml_row_size(GGML_TYPE_F32, n_embd * n_tokens);
         const size_t s_inp_pos       = ggml_row_size(GGML_TYPE_I32, n_tokens);
 
+        const size_t s_moe_slot      = s_moe_ids + s_moe_weights + s_expert_mask + s_moe_remap + s_moe_kept;
+
         // DSA scratch sizes (persistent copies -- one set shared across all layers)
         const size_t s_k_rot_lid     = ggml_row_size(GGML_TYPE_F32, nrot * nrot);
         const size_t s_k_idxs_lid    = ggml_row_size(GGML_TYPE_I64, n_tokens);
@@ -492,12 +625,13 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
         const size_t s_mask_lid      = ggml_row_size(GGML_TYPE_F32, (size_t)n_ctx_max * n_tokens);
         const size_t s_mask_mla      = ggml_row_size(GGML_TYPE_F16, (size_t)n_ctx_max * n_tokens);
 
-        const size_t slot_size = s_inpL_embd + s_Qcur + s_Kcur + s_Vcur + s_top_k + s_ffn_inp + s_inpL_next + s_inp_pos;
+        const size_t slot_size = s_inpL_embd + s_Qcur + s_Kcur + s_Vcur + s_top_k + s_ffn_inp + s_inpL_next + s_inp_pos + s_moe_slot;
         const size_t dsa_scratch = s_k_rot_lid + s_k_idxs_lid + s_k_idxs_mla + s_mask_lid + s_mask_mla;
         const size_t total_scratch = LLAMA_PIPELINE_DEPTH * slot_size + dsa_scratch;
 
         // ggml_context for scratch tensor metadata
-        const int n_tensors_per_slot = 7; // qcur, kcur, vcur, top_k, ffn_inp, inpL_next, inp_pos
+        const int n_tensors_per_slot = 12; // qcur, kcur, vcur, top_k, ffn_inp, inpL_next, inp_pos,
+                                            // moe_ids, moe_weights, expert_mask, moe_remap, moe_kept_count
         const int n_dsa_tensors = 5; // k_rot_lid, k_idxs_lid, k_idxs_mla, mask_lid, mask_mla
         const int n_output_tensors = 4; // logits, embd, norm_output, etc.
         const size_t ctx_meta = LLAMA_PIPELINE_DEPTH * (n_tensors_per_slot * ggml_tensor_overhead()) +
@@ -526,12 +660,22 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
         // Per-slot scratch tensors for intermediate data
         for (int s = 0; s < LLAMA_PIPELINE_DEPTH; s++) {
             auto & sc = p->scratch[s];
-            sc.qcur     = make_scratch(GGML_TYPE_F32, n_embd_head_k, n_head, n_tokens, 1);
-            sc.kcur     = make_scratch(GGML_TYPE_F32, kv_lora_rank + n_embd_head_qk_rope, 1, n_tokens, 1);
-            sc.vcur     = make_scratch(GGML_TYPE_F32, kv_lora_rank, 1, n_tokens, 1);
-            sc.top_k    = make_scratch(GGML_TYPE_I32, n_indexer_top_k, n_tokens, 1, 1);
-            sc.ffn_inp  = make_scratch(GGML_TYPE_F32, n_embd, n_tokens, 1, 1);
+            sc.qcur      = make_scratch(GGML_TYPE_F32, n_embd_head_k, n_head, n_tokens, 1);
+            sc.kcur      = make_scratch(GGML_TYPE_F32, kv_lora_rank + n_embd_head_qk_rope, 1, n_tokens, 1);
+            sc.vcur      = make_scratch(GGML_TYPE_F32, kv_lora_rank, 1, n_tokens, 1);
+            sc.top_k     = make_scratch(GGML_TYPE_I32, n_indexer_top_k, n_tokens, 1, 1);
+            sc.ffn_inp   = make_scratch(GGML_TYPE_F32, n_embd, n_tokens, 1, 1);
             p->inpL_next[s] = make_scratch(GGML_TYPE_F32, n_embd, n_tokens, 1, 1);
+            // MoE routing cache (hyper-sparse)
+            sc.moe_ids       = make_scratch(GGML_TYPE_I32, n_expert_used, n_tokens, 1, 1);
+            sc.moe_weights   = make_scratch(GGML_TYPE_F32, n_expert_used, n_tokens, 1, 1);
+            sc.expert_mask   = make_scratch(GGML_TYPE_I8, (n_expert + 63) / 64 * (int64_t)sizeof(uint64_t), 1, 1, 1);
+            sc.moe_remap     = make_scratch(GGML_TYPE_I32, n_expert, 1, 1, 1);
+            sc.moe_kept_count = make_scratch(GGML_TYPE_I32, 1, 1, 1, 1);
+            // Initially mark as no kept experts (Phase A will fill)
+            if (sc.moe_kept_count) {
+                memset(sc.moe_kept_count->data, 0, ggml_nbytes(sc.moe_kept_count));
+            }
         }
         // inpL_embd: embedding input copy (only needed by layer 0)
         p->inpL_embd = make_scratch(GGML_TYPE_F32, n_embd, n_tokens, 1, 1);
@@ -601,9 +745,15 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
                       layer_inpL, &p->scratch[slot],
                       p->inp_attn_persist, inp_out_ids, kq_scale, il);
 
+        // For MoE layers, pass cached routing scratch + remap tensor
+        const bool is_moe = ((uint32_t)il >= ctx.hparams.n_layer_dense_lead);
         build_phase_c(model, ctx, p->ctx_layers[il], p->gf_ffn[il],
                       &p->scratch[slot], p->inpL_next[slot],
-                      inp_out_ids, il);
+                      inp_out_ids, il,
+                      nullptr, nullptr, nullptr,  // no prefetch buffers yet
+                      is_moe ? p->scratch[slot].moe_ids : nullptr,
+                      is_moe ? p->scratch[slot].moe_weights : nullptr,
+                      is_moe ? p->remap_tensor : nullptr);
 
         layer_inpL = p->inpL_next[slot];
     }
@@ -639,10 +789,8 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
         }
 
         if (p->prefetch_fn && moe_il >= 0) {
-            // Allocate prefetch buffers for n_expert_used experts per weight type
-            const int n_expert_used = (int)ctx.hparams.n_expert_used;
-            const int ne2 = (n_expert_used > 0 && n_expert_used <= LLAMA_PIPELINE_PREFETCH_MAX_EXPERTS)
-                          ? n_expert_used : LLAMA_PIPELINE_PREFETCH_MAX_EXPERTS;
+            // Compact prefetch buffer: sized for max kept experts across ubatch
+            const int ne2 = LLAMA_PIPELINE_PREFETCH_MAX_EXPERTS;
 
             auto * ref_gate = p->model_gate_exps[moe_il];
             auto * ref_up   = p->model_up_exps[moe_il];
@@ -677,12 +825,17 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
                         assign(p->prefetch_gate, s_gate);
                         assign(p->prefetch_up,   s_up);
                         assign(p->prefetch_down, s_down);
+
+                        // S4: zero-initialize prefetch buffer — cudaMalloc may leave
+                        //     uninitialized (potentially NaN) values. Skipped experts
+                        //     map to slot 0 with weight=0.0.  0.0 × NaN = NaN
+                        //     propagates through FFN → silent corruption.
+                        ggml_backend_buffer_clear(p->prefetch_buf, 0);
+                        ggml_backend_synchronize(backend);
                     }
                 }
 
-                if (p->device) {
-                    p->e_prefetch_done = ggml_backend_event_new(p->device);
-                }
+                // S3: e_prefetch_done created per-layer in the init event loop above.
             }
         }
     }
@@ -718,10 +871,14 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
                 // build_phase_c reads inpL from the persistent scratch/slot
                 // Re-run only phase C with prefetch overrides
                 // build_phase_c needs scratch data and the layer's inpL_next output
+                // Rebuild with prefetch tensors AND cached MoE routing from scratch
                 build_phase_c(model, ctx, p->ctx_layers[il], p->gf_ffn[il],
                               &p->scratch[slot], p->inpL_next[slot],
                               inp_out_ids, il,
-                              p->prefetch_gate, p->prefetch_up, p->prefetch_down);
+                              p->prefetch_gate, p->prefetch_up, p->prefetch_down,
+                              p->scratch[slot].moe_ids,
+                              p->scratch[slot].moe_weights,
+                              p->remap_tensor);
             }
         }
     }
@@ -731,6 +888,10 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     p->saved_inp_attn_dsa = inp_attn_dsa;
 
     // ---- Create CDA barriers (GPU-side flag sync) or fall back to events ----
+    // S2: e_moe_done is ALWAYS created — prefetch callback needs a real cudaEvent_t,
+    //     and CDA barriers are not cudaEvent_t. The ternary that cast cda_moe→event
+    //     was a type confusion bug.
+    // S3: e_prefetch_done is per-layer (one shared event caused FFN(L≥1) to skip wait).
     p->use_cda = false;
 #ifdef GGML_USE_CUDA
     if (p->backend && ggml_backend_is_cuda(p->backend)) {
@@ -747,10 +908,44 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
         }
     }
 #endif
-    if (!p->use_cda && p->device) {
+    // Events used by all phases — always create regardless of CDA mode
+    if (p->device) {
         for (int i = 0; i < p->n_layer; i++) {
             p->e_qkv_done[i]  = ggml_backend_event_new(p->device);
             p->e_attn_done[i] = ggml_backend_event_new(p->device);
+            p->e_moe_done[i]  = ggml_backend_event_new(p->device);
+            p->e_prefetch_done[i] = ggml_backend_event_new(p->device);
+        }
+    }
+
+    // ---- Allocate persistent expert remap buffer (GPU) ----
+    // Shared across all layers: maps original expert ID → compact prefetch slot.
+    // Written by cumulative_threshold_kernel in Phase A.
+    // Read by prefetch callback and Phase C's remap step.
+    {
+        const int64_t n_expert = ctx.hparams.n_expert;
+        const size_t sz_remap   = ggml_row_size(GGML_TYPE_I32, n_expert);
+        const size_t sz_mask    = (size_t)((n_expert + 63) / 64) * sizeof(uint64_t);
+        const size_t sz_kept    = ggml_row_size(GGML_TYPE_I32, 1);
+        const size_t total_sz = sz_remap + sz_mask + sz_kept;
+
+        // Allocate in persistent scratch context (p->scratch_ctx)
+        p->remap_tensor      = ggml_new_tensor_1d(p->scratch_ctx, GGML_TYPE_I32, n_expert);
+        p->expert_mask_perm  = ggml_new_tensor_1d(p->scratch_ctx, GGML_TYPE_I8,
+                                                   (int64_t)((n_expert + 63) / 64) * (int64_t)sizeof(uint64_t));
+
+        p->remap_buf = ggml_backend_alloc_buffer(backend, total_sz);
+        if (p->remap_buf) {
+            size_t off = 0;
+            auto assign = [&](struct ggml_tensor * t, size_t sz) {
+                if (!t) return;
+                t->data   = (uint8_t *)ggml_backend_buffer_get_base(p->remap_buf) + off;
+                t->buffer = p->remap_buf;
+                t->flags |= GGML_TENSOR_FLAG_INPUT;
+                off += sz;
+            };
+            assign(p->remap_tensor,     sz_remap);
+            assign(p->expert_mask_perm, sz_mask);
         }
     }
 
@@ -863,15 +1058,21 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
     if (!p || !p->backend || n_layer <= 0) return;
     if (n_layer > p->n_layer) n_layer = p->n_layer;
 
-    const bool use_prefetch = (p->prefetch_fn != nullptr) &&
-                              (p->prefetch_gate != nullptr) &&
-                              (p->device != nullptr);
+    const bool use_prefetch  = (p->prefetch_fn != nullptr) &&
+                               (p->prefetch_gate != nullptr) &&
+                               (p->device != nullptr);
 
     for (int L = 0; L < n_layer; L++) {
-        // ---- Stage 1: QKV proj on stream 0 (sched_pipe[0]) ----
+        int slot = L % LLAMA_PIPELINE_DEPTH;
+        struct llama_layer_scratch * sc = &p->scratch[slot];
+
+        // ---- Stage 1: QKV proj + MoE routing on stream 0 (sched_pipe[0]) ----
+        // Phase A graph now includes: QKV + DSA + MoE gate_inp → softmax → topk → cache
         ggml_backend_sched_reset(p->sched_pipe[0]);
         if (p->set_stream) p->set_stream(p->backend, 0);
         ggml_backend_sched_graph_compute_async(p->sched_pipe[0], p->gf_qkv[L]);
+
+        // Signal QKV done → attn can start (non-CDA or CDA)
         if (p->cda_qkv[L]) {
             p->set_stream(p->backend, 0);
             ggml_backend_cuda_cda_signal(p->backend, p->cda_qkv[L]);
@@ -879,10 +1080,66 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
             ggml_backend_event_record(p->e_qkv_done[L], p->backend);
         }
 
-        // ---- Expert Prefetch Launch (for non-CDA mode; CDA uses GPU sync) ----
-        if (use_prefetch && !p->use_cda && p->has_moe[L]) {
-            struct ggml_tensor * top_k_t = p->scratch[L % LLAMA_PIPELINE_DEPTH].top_k;
-            if (top_k_t && p->model_gate_exps[L]) {
+        // ---- Cumulative Threshold Launch (after Phase A, before prefetch) ----
+        // For MoE layers: launch GPU threshold kernel that:
+        //   1. Reads scratch.moe_weights (per-expert total across ubatch)
+        //   2. Cumulative sum → find 0.95 split with floor(3)
+        //   3. Builds expert_mask (skip bitmask) in scratch.expert_mask
+        //   4. Builds remap table in persistent p->remap_tensor
+        //   5. Renormalizes kept-expert weights in scratch.moe_weights
+        if (p->has_moe[L]) {
+            // Launch cumulative threshold kernel (1 warp, 1 block).
+            // Reads:  sc->moe_weights, sc->moe_ids
+            // Writes: sc->expert_mask, p->remap_tensor, sc->moe_weights (in-place renormalize)
+            // sc->moe_kept_count gets number of kept experts
+            if (sc->moe_ids && sc->moe_weights && sc->expert_mask && p->remap_tensor && sc->moe_kept_count) {
+                ggml_backend_cuda_pipeline_moe_threshold(
+                    sc->moe_ids,
+                    sc->moe_weights,        // in: pre-renormalization weights
+                    sc->moe_weights,        // out: renormalized in-place
+                    sc->expert_mask,
+                    p->remap_tensor,
+                    sc->moe_kept_count,
+                    p->moe_threshold,
+                    p->moe_floor,
+                    p->backend);
+
+                // ---- Stats: sync D2H kept_count (4 bytes, ~1 µs) ----
+                int32_t kept = 0;
+#ifdef GGML_USE_CUDA
+                CUDA_CHECK(cudaMemcpy(&kept, sc->moe_kept_count->data, sizeof(int32_t), cudaMemcpyDeviceToHost));
+#else
+                (void)kept;
+#endif
+                p->stats.n_total_experts += p->n_expert_stats;
+                p->stats.n_skipped_experts += (p->n_expert_stats - kept);
+                p->stats.cumulative_sparsity =
+                    100.0 * (double)p->stats.n_skipped_experts / (double)p->stats.n_total_experts;
+
+                // Log sparsity every N layers
+                if (p->stats_log_interval > 0 && (++p->stats_counter % p->stats_log_interval) == 0) {
+                    LLAMA_LOG_INFO("[pipeline] MoE cumulative sparsity: %.1f%% "
+                                   "(kept avg %.1f/%lld experts per layer)\n",
+                        p->stats.cumulative_sparsity,
+                        (double)p->n_expert_stats * (100.0 - p->stats.cumulative_sparsity) / 100.0,
+                        (long long)p->n_expert_stats);
+                }
+            }
+
+            // Signal moe_ready: MoE routing data is in scratch, prefetch can start.
+            // S2: always use e_moe_done (real cudaEvent_t) — prefetch callback
+            //     calls ggml_backend_event_wait which needs event->context.
+            //     CDA barriers are not events and cannot substitute.
+            if (p->e_moe_done[L]) {
+                ggml_backend_event_record(p->e_moe_done[L], p->backend);
+            }
+        }
+
+        // ---- Expert Prefetch Launch (transfer stream 2) ----
+        // Now uses cda_moe (or e_moe_done) instead of cda_qkv.
+        // Reads expert_mask and remap_tensor instead of DSA top_k.
+        if (use_prefetch && p->has_moe[L]) {
+            if (sc->expert_mask && p->remap_tensor && p->model_gate_exps[L]) {
                 struct ggml_tensor * dst[3]  = {p->prefetch_gate, p->prefetch_up, p->prefetch_down};
                 struct ggml_tensor * src[3]  = {p->model_gate_exps[L], p->model_up_exps[L], p->model_down_exps[L]};
                 size_t sb[3];
@@ -890,8 +1147,12 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
                     sb[i] = src[i] ? ggml_row_size(src[i]->type, src[i]->ne[0] * src[i]->ne[1]) : 0;
                 }
                 if (dst[0] && dst[1] && dst[2] && src[0] && src[1] && src[2]) {
-                    p->prefetch_fn(dst, src, sb, top_k_t, L,
-                                   p->e_qkv_done[L], p->e_prefetch_done,
+                    p->prefetch_fn(dst, src, sb,
+                                   sc->expert_mask,
+                                   p->remap_tensor,
+                                   L,
+                                   p->e_moe_done[L],          // moe_ready
+                                   p->e_prefetch_done[L],      // S3: per-layer event
                                    p->prefetch_user_data);
                 }
             }
@@ -914,6 +1175,9 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
         }
 
         // ---- Stage 3: FFN on stream 0 (sched_pipe[2]) ----
+        // Uses cached moe_ids + moe_weights from scratch (pre-computed in Phase A).
+        // IDs are remapped via p->remap_tensor → compact prefetch buffer slots.
+        // Waits for both attn completion AND prefetch completion.
         ggml_backend_sched_reset(p->sched_pipe[2]);
         if (p->set_stream) p->set_stream(p->backend, 0);
         if (p->cda_attn[L]) {
@@ -921,7 +1185,13 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
         } else if (p->e_attn_done[L]) {
             ggml_backend_event_wait(p->backend, p->e_attn_done[L]);
         }
+        // Wait for prefetch H2D copies to complete before FFN
+        // S3: per-layer event ensures FFN(L) waits for Prefetch(L), not a stale signal
+        if (use_prefetch && p->e_prefetch_done[L] && p->has_moe[L]) {
+            ggml_backend_event_wait(p->backend, p->e_prefetch_done[L]);
+        }
         ggml_backend_sched_graph_compute_async(p->sched_pipe[2], p->gf_ffn[L]);
+
     }
 
     ggml_backend_synchronize(p->backend);
@@ -1026,25 +1296,32 @@ void llama_pipeline_sched_set_prefetch_fn(
 void llama_pipeline_sched_free(struct llama_pipeline_sched * p) {
     if (!p) return;
 
-    if (p->use_cda) {
+    // Free CDA barriers (main pipeline ordering only)
 #ifdef GGML_USE_CUDA
+    if (p->use_cda) {
         for (int i = 0; i < p->n_layer; i++) {
-            if (p->cda_qkv[i])  ggml_backend_cuda_cda_free(p->backend, p->cda_qkv[i]);
-            if (p->cda_attn[i]) ggml_backend_cuda_cda_free(p->backend, p->cda_attn[i]);
+            ggml_backend_cuda_cda_free(p->backend, p->cda_qkv[i]);
+            ggml_backend_cuda_cda_free(p->backend, p->cda_attn[i]);
         }
+    }
 #endif
-    } else if (p->device) {
+    // Free events (always allocated, independent of CDA mode)
+    // S2: e_moe_done always exists (required by prefetch)
+    // S3: e_prefetch_done is per-layer (array, not single event)
+    if (p->device) {
         for (int i = 0; i < p->n_layer; i++) {
-            if (p->e_qkv_done[i])  ggml_backend_event_free(p->e_qkv_done[i]);
-            if (p->e_attn_done[i]) ggml_backend_event_free(p->e_attn_done[i]);
+            if (p->e_qkv_done[i])       ggml_backend_event_free(p->e_qkv_done[i]);
+            if (p->e_attn_done[i])      ggml_backend_event_free(p->e_attn_done[i]);
+            if (p->e_moe_done[i])       ggml_backend_event_free(p->e_moe_done[i]);
+            if (p->e_prefetch_done[i])  ggml_backend_event_free(p->e_prefetch_done[i]);
         }
-        if (p->e_prefetch_done) ggml_backend_event_free(p->e_prefetch_done);
     }
 
     if (p->scratch_buf) ggml_backend_buffer_free(p->scratch_buf);
     if (p->scratch_ctx) ggml_free(p->scratch_ctx);
 
     if (p->prefetch_buf) ggml_backend_buffer_free(p->prefetch_buf);
+    if (p->remap_buf) ggml_backend_buffer_free(p->remap_buf);
 
     if (p->ctx_output) {
         ggml_free(p->ctx_output);

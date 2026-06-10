@@ -1,12 +1,33 @@
 #include "ggml-cuda.h"
+#include "tma-transfer.h"
 #include "vendors/cuda.h"
 
-void ggml_backend_cuda_pipeline_expert_prefetch(
+#include <cstdlib>
+#include <cstring>
+
+// Read skip_mask from GPU → host, iterate non-skipped experts, copy each to compact slot.
+// Uses TMA for H2D when available (sm_90+ / RTX 5090), falls back to cudaMemcpyAsync.
+//
+// dst[3]: compact GPU prefetch buffer (gate/up/down) [..., PREFETCH_MAX_EXPERTS]
+// src[3]: CPU model weight tensors [..., n_expert]
+// slice_bytes[3]: bytes per single expert in each weight type
+// expert_mask: GPU tensor [ceil(n_expert/64)] u64, bit=1 → skip
+// moe_remap:   GPU tensor [n_expert] i32, value = compact_slot for kept, -1 for skipped
+//
+// For each non-skipped expert e (expert_mask bit = 0):
+//   slot = moe_remap[e]  (guaranteed >= 0 and < LLAMA_PIPELINE_PREFETCH_MAX_EXPERTS)
+//   for each weight type s:
+//     TMA/cudaMemcpyAsync(dst[s] + slot * slice_bytes[s],
+//                         src[s] + e   * slice_bytes[s],
+//                         slice_bytes[s], H2D, transfer_stream)
+//
+void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     struct ggml_tensor  * dst[3],
     struct ggml_tensor  * src[3],
     size_t                slice_bytes[3],
-    struct ggml_tensor  * top_k,
-    ggml_backend_event_t  qkv_done,
+    struct ggml_tensor  * expert_mask,
+    struct ggml_tensor  * moe_remap,
+    ggml_backend_event_t  moe_ready,
     ggml_backend_event_t  completion_event,
     ggml_backend_t        backend) {
 
@@ -15,48 +36,73 @@ void ggml_backend_cuda_pipeline_expert_prefetch(
     // Switch backend to transfer stream
     ggml_backend_cuda_set_stream(backend, transfer_stream_id);
 
-    // Wait for QKV to complete on the transfer stream
-    ggml_backend_event_wait(backend, qkv_done);
+    // Wait for MoE routing + threshold to complete before reading skip_mask
+    ggml_backend_event_wait(backend, moe_ready);
 
-    // Get raw CUDA stream pointer for cudaMemcpyAsync
     cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(backend, transfer_stream_id);
 
-    // Read top_k indices from GPU to host (async D2H on transfer stream)
-    size_t topk_nbytes = ggml_nbytes(top_k);
-    int * host_topk = (int *)malloc(topk_nbytes);
-    if (!host_topk) {
+    // ---- Step 1: Read expert_mask from GPU → host (D2H async, tiny) ----
+    // expert_mask is [ceil(n_expert/64)] u64 → max 9 uint64 = 72 bytes
+    size_t mask_nbytes = ggml_nbytes(expert_mask);
+    uint64_t * host_mask = (uint64_t *)malloc(mask_nbytes);
+    if (!host_mask) {
         ggml_backend_event_record(completion_event, backend);
         ggml_backend_cuda_set_stream(backend, 0);
         return;
     }
-
-    cudaMemcpyAsync(host_topk, top_k->data, topk_nbytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(host_mask, expert_mask->data, mask_nbytes,
+                    cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    // Deduplicate expert IDs (small array — O(n^2) is fine)
-    int n_total = (int)(topk_nbytes / (int)sizeof(int));
-    int unique[256];
-    int n_unique = 0;
-    for (int i = 0; i < n_total && n_unique < 256; i++) {
-        int e = host_topk[i];
-        int j;
-        for (j = 0; j < n_unique; j++) {
-            if (unique[j] == e) break;
-        }
-        if (j == n_unique) unique[n_unique++] = e;
-    }
-    free(host_topk);
+    // Read n_expert from moe_remap shape: [n_expert] i32
+    int n_expert = (int)(ggml_nbytes(moe_remap) / (int)sizeof(int32_t));
 
-    // Launch async H2D copies for each unique expert's three weight types
-    for (int i = 0; i < n_unique; i++) {
-        int e = unique[i];
+    // ---- Step 2: Read moe_remap from GPU → host (also tiny) ----
+    size_t remap_nbytes = ggml_nbytes(moe_remap);
+    int32_t * host_remap = (int32_t *)malloc(remap_nbytes);
+    if (!host_remap) {
+        free(host_mask);
+        ggml_backend_event_record(completion_event, backend);
+        ggml_backend_cuda_set_stream(backend, 0);
+        return;
+    }
+    cudaMemcpyAsync(host_remap, moe_remap->data, remap_nbytes,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    // ---- Step 3: Fast Skip — iterate experts, H2D only non-skipped ----
+    int n_kept = 0;
+    for (int e = 0; e < n_expert; e++) {
+        // Check skip bit in mask
+        int word = e / 64;
+        int bit  = e % 64;
+        bool skip = (host_mask[word] >> bit) & 1ULL;
+        if (skip) continue;  // ← Fast Skip: no memcpy at all
+
+        // Compact slot from remap table
+        int slot = host_remap[e];
+        if (slot < 0) continue; // safety: should never happen for non-skipped
+
+        n_kept++;
+
+        // Use TMA for H2D when available, fallback to cudaMemcpyAsync
         for (int s = 0; s < 3; s++) {
             if (!dst[s] || !src[s] || slice_bytes[s] == 0) continue;
-            void * gpu_dst = (char *)dst[s]->data + (size_t)i * slice_bytes[s];
-            void * cpu_src = (char *)src[s]->data + (size_t)e * slice_bytes[s];
-            cudaMemcpyAsync(gpu_dst, cpu_src, slice_bytes[s], cudaMemcpyHostToDevice, stream);
+
+            void * gpu_dst = (char *)dst[s]->data + (size_t)slot * slice_bytes[s];
+            void * cpu_src = (char *)src[s]->data + (size_t)e     * slice_bytes[s];
+
+            // Try TMA first (sm_90+ Blackwell / RTX 5090 feature)
+            if (!ggml_tma_enqueue_h2d_1d(gpu_dst, cpu_src, slice_bytes[s], stream)) {
+                // TMA unavailable/fallback → use cudaMemcpyAsync
+                cudaMemcpyAsync(gpu_dst, cpu_src, slice_bytes[s],
+                                cudaMemcpyHostToDevice, stream);
+            }
         }
     }
+
+    free(host_mask);
+    free(host_remap);
 
     // Record completion event on transfer stream
     ggml_backend_event_record(completion_event, backend);

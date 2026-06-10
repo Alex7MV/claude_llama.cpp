@@ -1792,6 +1792,161 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+// ============================================================================
+// Hyper-sparse MoE: cached routing path (no gate_inp, no softmax, no top-k)
+//
+// Uses pre-computed expert IDs and renormalized weights from Phase A.
+// cached_ids are already remapped to compact prefetch buffer slots.
+// cached_weights are already renormalized (skipped experts → 0.0).
+// ============================================================================
+ggml_tensor * llm_graph_context::build_moe_ffn(
+         ggml_tensor * cur,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                  int   il,
+         ggml_tensor * cached_ids,
+         ggml_tensor * cached_weights,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s) const {
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+
+    // cached_weights is [1, n_expert_used, n_tokens] — already renormalized
+    // cached_ids is [n_expert_used, n_tokens] — already remapped to compact slots
+    // Share them into the graph so the compute dependency chain works
+    cb(cached_weights, "ffn_moe_cached_weights", il);
+    cb(cached_ids, "ffn_moe_cached_ids", il);
+
+    // Early-expand weights so they are computed along with the FFN
+    ggml_build_forward_expand(gf, cached_weights);
+    ggml_build_forward_expand(gf, cached_ids);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    ggml_tensor * up = nullptr;
+    ggml_tensor * experts = nullptr;
+
+    if (gate_up_exps) {
+        // Fused gate+up path: one MUL_MAT_ID, then split
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, cached_ids);
+        cb(gate_up, "ffn_moe_gate_up", il);
+
+        // Per-expert scale2 on fused gate+up
+        if (up_exps_s) {
+            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx0, s, cached_ids);
+            gate_up = ggml_mul(ctx0, gate_up, s);
+            cb(gate_up, "ffn_moe_gate_up_scaled", il);
+        }
+
+        const int64_t n_ff = gate_up->ne[0] / 2;
+        cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2],
+                           gate_up->nb[1], gate_up->nb[2], 0);
+        cb(cur, "ffn_moe_gate", il);
+        up = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2],
+                          gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+        cb(up, "ffn_moe_up", il);
+    } else {
+        // Separate gate and up paths
+        up = build_lora_mm_id(up_exps, cur, cached_ids);
+        cb(up, "ffn_moe_up", il);
+
+        if (up_exps_s) {
+            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx0, s, cached_ids);
+            up = ggml_mul(ctx0, up, s);
+            cb(up, "ffn_moe_up_scaled", il);
+        }
+
+        if (gate_exps) {
+            cur = build_lora_mm_id(gate_exps, cur, cached_ids);
+            cb(cur, "ffn_moe_gate", il);
+        } else {
+            cur = up;
+        }
+
+        if (gate_exps_s) {
+            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            s = ggml_get_rows(ctx0, s, cached_ids);
+            cur = ggml_mul(ctx0, cur, s);
+            cb(cur, "ffn_moe_gate_scaled", il);
+        }
+    }
+
+    const bool has_gate = gate_exps || gate_up_exps;
+
+    // Activation
+    switch (type_op) {
+        case LLM_FFN_SILU:
+            if (has_gate) {
+                cur = ggml_swiglu_split(ctx0, cur, up);
+                cb(cur, "ffn_moe_swiglu", il);
+            } else {
+                cur = ggml_silu(ctx0, cur);
+                cb(cur, "ffn_moe_silu", il);
+            } break;
+        case LLM_FFN_GELU:
+            if (has_gate) {
+                cur = ggml_geglu_split(ctx0, cur, up);
+                cb(cur, "ffn_moe_geglu", il);
+            } else {
+                cur = ggml_gelu(ctx0, cur);
+                cb(cur, "ffn_moe_gelu", il);
+            } break;
+        default:
+            GGML_ABORT("fatal error: unsupported activation for cached MoE FFN");
+    }
+
+    // Down projection
+    experts = build_lora_mm_id(down_exps, cur, cached_ids);
+    cb(experts, "ffn_moe_down", il);
+
+    if (down_exps_s) {
+        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
+        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        s = ggml_get_rows(ctx0, s, cached_ids);
+        experts = ggml_mul(ctx0, experts, s);
+        cb(experts, "ffn_moe_down_scaled", il);
+    }
+
+    // Apply cached weights (renormalized, skipped → 0.0)
+    experts = ggml_mul(ctx0, experts, cached_weights);
+    cb(experts, "ffn_moe_weighted", il);
+
+    ggml_build_forward_expand(gf, experts);
+
+    // Sum across expert dimension
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS];
+    for (uint32_t i = 0; i < (uint32_t)n_expert_used; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens,
+                                      experts->nb[2], i * experts->nb[1]);
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    ggml_tensor * moe_out = cur_experts[0];
+    for (uint32_t i = 1; i < (uint32_t)n_expert_used; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        ggml_build_forward_expand(gf, moe_out);
+    }
+
+    if (n_expert_used == 1) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    cb(moe_out, "ffn_moe_out", il);
+    return moe_out;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();
