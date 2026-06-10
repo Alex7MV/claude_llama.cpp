@@ -1843,8 +1843,8 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
     const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
 
-    // Compact buffer: per-layer kept expert weights (upper bound = n_expert)
-    const int max_kept = (int)n_expert;
+    // Compact buffer: per-layer kept expert weights (capped at 16 — enough for threshold=0.95 + floor=3)
+    const int max_kept = std::min((int)n_expert, 16);
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
     const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
@@ -1857,8 +1857,8 @@ void llama_context::init_moe_weight_cache() {
     const size_t total_v2_sz = total_scratch + total_compact + total_threshold;
     moe_weight_cache.scratch_buf = ggml_backend_alloc_buffer(gpu, total_v2_sz);
     if (!moe_weight_cache.scratch_buf) {
-        LLAMA_LOG_WARN("%s: failed to allocate v2 scratch+compact buffer (%zu MB), falling back to single-phase\n",
-            __func__, total_v2_sz / (1024 * 1024));
+        LLAMA_LOG_WARN("%s: failed to allocate v2 scratch+compact buffer (%zu MB total, max_kept=%d), falling back to single-phase DDR5\n",
+            __func__, total_v2_sz / (1024 * 1024), max_kept);
         moe_weight_cache.populated = false;
         ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf;
         moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
@@ -1918,8 +1918,9 @@ void llama_context::init_moe_weight_cache() {
 
     ggml_backend_synchronize(gpu);
 
-    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, scratch+compact=%zuMB\n",
-        __func__, n_moe_layers, total_v2_sz / (1024 * 1024));
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, max_kept=%d, scratch=%zuMB compact=%zuMB\n",
+        __func__, n_moe_layers, max_kept,
+        total_scratch / (1024 * 1024), total_compact / (1024 * 1024));
 }
 #endif
 
