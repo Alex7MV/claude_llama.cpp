@@ -1524,14 +1524,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 (long long)model.hparams.n_expert);
                         }
                     }
-                }
 
-                // compact_ready only if at least one layer has compact buffers
-                moe_weight_cache.compact_ready = false;
-                for (int _il = (int)n_layer_dense_lead; _il < (int)n_layer; _il++) {
-                    if ((size_t)_il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[_il]) {
-                        moe_weight_cache.compact_ready = true;
-                        break;
+                    // compact_ready only if at least one layer has compact buffers
+                    moe_weight_cache.compact_ready = false;
+                    for (int _il = (int)n_layer_dense_lead; _il < (int)n_layer; _il++) {
+                        if ((size_t)_il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[_il]) {
+                            moe_weight_cache.compact_ready = true;
+                            break;
+                        }
                     }
                 }
 
