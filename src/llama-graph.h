@@ -972,9 +972,6 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr) const;
 
-    // Hyper-sparse MoE GPU weight cache (forward declaration — defined in llama-context.h)
-    struct llama_moe_weight_cache;
-
     // Pointer to context-level MoE weight cache (set before graph building).
     // When populated, model builders use GPU-cached expert weights instead of
     // original CPU tensors, avoiding DDR5 reads during MUL_MAT_ID.
