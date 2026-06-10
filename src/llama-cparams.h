@@ -48,7 +48,14 @@ struct llama_cparams {
     int32_t pipeline_split_size;    // layers per split group (default 8)
 
     // DeepSeek per-layer async pipeline (3-phase QKV/Attn/FFN on separate CUDA streams)
-    bool deepseek_pipeline;
+    bool   deepseek_pipeline;
+
+    // v2: two-phase execution (routing → threshold+fetch → compact FFN) within a ubatch
+    bool   moe_two_phase    = true;
+
+    // Hyper-sparse MoE cumulative weight threshold params
+    float  moe_threshold  = 0.95f;  // cumulative weight threshold
+    int    moe_floor      = 3;      // minimum kept experts
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

@@ -61,3 +61,6 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# Hyper-sparse MoE: cumulative threshold + expert prefetch pipeline
+target_compile_definitions(llama PRIVATE LLAMA_DEEPSEEK_PIPELINE)

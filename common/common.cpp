@@ -1594,6 +1594,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.pipeline_depth      = params.pipeline_depth;
     cparams.pipeline_split_size = params.pipeline_split_size;
 
+    cparams.deepseek_pipeline = params.deepseek_pipeline;
+
     return cparams;
 }
 

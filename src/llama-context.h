@@ -343,6 +343,54 @@ private:
     // (optional, created when cparams.deepseek_pipeline == true)
 #ifdef LLAMA_DEEPSEEK_PIPELINE
     struct llama_pipeline_sched * deepseek_pipeline = nullptr;
+
+    // Hyper-sparse MoE GPU weight cache (full copy of all expert weights in VRAM)
+    // Allocated per-layer: gate/up/down weight tensors in GPU memory.
+    // Populated once at init, then reused across ubatches.
+    struct llama_moe_weight_cache {
+        ggml_context *      ctx_meta = nullptr;    // for tensor metadata (freed with cache)
+        uint8_t *           ctx_meta_buf = nullptr;// backing buffer for ctx_meta (owned)
+        ggml_backend_buffer_t buf = nullptr;       // persistent full-cache GPU buffer
+        int                   n_layers = 0;         // number of MoE layers cached
+
+        // Full cache: all expert weights (v1) — GPU-resident, same shape as original
+        std::vector<ggml_tensor *> gate;   // [n_embd, n_ff_exp, n_expert]
+        std::vector<ggml_tensor *> up;     // [n_embd, n_ff_exp, n_expert]
+        std::vector<ggml_tensor *> down;   // [n_ff_exp, n_embd, n_expert]
+
+        // v2 two-phase scratch buffers (GPU)
+        ggml_context *         ctx_scratch = nullptr;
+        uint8_t *              ctx_scratch_buf = nullptr;
+        ggml_backend_buffer_t  scratch_buf = nullptr;
+        std::vector<ggml_tensor *> scratch_ffn_inp;    // [n_embd, n_tokens] per-layer
+        std::vector<ggml_tensor *> scratch_moe_ids;    // [n_expert_used, n_tokens]
+        std::vector<ggml_tensor *> scratch_moe_weights;// [1, n_expert_used, n_tokens]
+
+        // v2 compact expert buffers — only kept experts, loaded per-phase from DDR5
+        int    max_kept = 0;               // upper bound: floor(n_expert * threshold) + floor_room
+        std::vector<ggml_tensor *> kept_gate;  // [n_embd, n_ff_exp, max_kept]
+        std::vector<ggml_tensor *> kept_up;    // [n_embd, n_ff_exp, max_kept]
+        std::vector<ggml_tensor *> kept_down;  // [n_ff_exp, n_embd, max_kept]
+
+        // v2 threshold outputs (GPU)
+        ggml_tensor * expert_mask  = nullptr;   // [ceil(n_expert/64)] u64 skip bitmask
+        ggml_tensor * remap        = nullptr;   // [n_expert] i32 original→compact slot
+        ggml_tensor * kept_count   = nullptr;   // [1] i32 scalar
+
+        // v2 per-layer sparsity tracking
+        int32_t n_kept_last = 0;          // kept count from last threshold run
+        double  cumulative_sparsity = 0.0;
+        int64_t n_total_experts = 0;
+        int64_t n_skipped_experts = 0;
+        int32_t stats_counter = 0;
+
+        int build_phase = 0;          // 0=full, 1=routing-only, 2=compact FFN
+        bool populated = false;   // full cache populated
+        bool compact_ready = false; // compact buffer has valid kept experts
+    } moe_weight_cache;
+
+    // Initialize the MoE weight cache by copying all expert weights to GPU
+    void init_moe_weight_cache();
 #endif
 
     bool sched_need_reserve = true;

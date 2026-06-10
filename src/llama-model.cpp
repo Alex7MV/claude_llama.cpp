@@ -2129,9 +2129,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
-ggml_cgraph * llama_model::build_graph(const llm_graph_params & params, struct llama_pipeline_setup * pipeline_setup, struct llama_pipeline_sched ** p_pipeline) const {
+ggml_cgraph * llama_model::build_graph(const llm_graph_params & params, struct llama_pipeline_setup * pipeline_setup, struct llama_pipeline_sched ** p_pipeline, struct llama_moe_weight_cache * moe_cache) const {
     (void)p_pipeline;
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+
+    // Pass MoE weight cache to graph context for GPU-cached MoE FFN
+    if (moe_cache) {
+        llm->moe_cache = moe_cache;
+        llm->build_phase = moe_cache->build_phase;
+    }
 
     // Extract pipeline scheduler data if requested (before llm is destroyed)
     if (pipeline_setup) {

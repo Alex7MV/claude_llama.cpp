@@ -776,6 +776,10 @@ struct llama_pipeline_setup {
     bool                                  has_value      = false;
 };
 
+// MoE weight cache (full GPU copy, used by standalone hyper-sparse MoE)
+// Definition in llama-context.h
+struct llama_moe_weight_cache;
+
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
@@ -967,6 +971,28 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr) const;
+
+    // Hyper-sparse MoE GPU weight cache (forward declaration — defined in llama-context.h)
+    struct llama_moe_weight_cache;
+
+    // Pointer to context-level MoE weight cache (set before graph building).
+    // When populated, model builders use GPU-cached expert weights instead of
+    // original CPU tensors, avoiding DDR5 reads during MUL_MAT_ID.
+    struct llama_moe_weight_cache * moe_cache = nullptr;
+
+    // v2 two-phase execution: 0=full, 1=routing-only, 2=FFN-only (compact+remap+cached)
+    int build_phase = 0;
+
+    // Persistent scratch tensors for routing results (set before phase 1 build)
+    // After Phase 1 compute, these contain routing outputs on GPU for threshold kernel.
+    struct {
+        struct ggml_tensor * ffn_inp      = nullptr; // [n_embd, n_tokens] saved ffn input
+        struct ggml_tensor * moe_ids      = nullptr; // [n_expert_used, n_tokens] top-k expert IDs
+        struct ggml_tensor * moe_weights  = nullptr; // [1, n_expert_used, n_tokens] top-k weights
+        struct ggml_tensor * remap        = nullptr; // [n_expert] remap: original ID → compact slot
+        struct ggml_tensor * expert_mask  = nullptr; // [ceil(n_expert/64)] u64 skip bitmask
+        struct ggml_tensor * kept_count   = nullptr; // [1] scalar: number of kept experts
+    } routing_scratch;
 
     //
     // inputs

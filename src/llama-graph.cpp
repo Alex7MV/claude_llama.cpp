@@ -1589,6 +1589,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+    // v2 Phase 1: save routing to scratch, skip FFN matmuls
+    if (build_phase == 1 && moe_cache && il >= 0 && (size_t)il < moe_cache->scratch_moe_ids.size()) {
+        if (moe_cache->scratch_moe_ids[il] && moe_cache->scratch_moe_weights[il]) {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, moe_cache->scratch_moe_ids[il]));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, weights, moe_cache->scratch_moe_weights[il]));
+        }
+        // Skip expert matmuls — return cur as pass-through for layer output
+        return cur;
+    }
+#endif
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     if (weight_before_ffn) {

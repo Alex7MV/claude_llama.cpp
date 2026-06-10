@@ -277,6 +277,44 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
 
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+        // Phase 2: skip dense layers (already computed in Phase 1),
+        // skip attention for MoE layers, run compact FFN with cached routing.
+        if (build_phase == 2) {
+            if ((uint32_t)il < hparams.n_layer_dense_lead) {
+                // Dense layer: full output from Phase 1 passes through unchanged
+                continue;
+            }
+            if (!moe_cache || (size_t)il >= moe_cache->scratch_ffn_inp.size() || !moe_cache->scratch_ffn_inp[il]) {
+                continue;
+            }
+            ggml_tensor * ffn_inp = moe_cache->scratch_ffn_inp[il];
+            cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
+
+            if (moe_cache->compact_ready && (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il]) {
+                int64_t n_expert_used = hparams.n_expert_used;
+                ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
+                ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
+                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap, cached_ids);
+                ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens);
+                ggml_tensor * moe_out = build_moe_ffn(cur, moe_cache->kept_up[il], moe_cache->kept_gate[il],
+                    moe_cache->kept_down[il], moe_cache->max_kept, n_expert_used, LLM_FFN_SILU, il,
+                    remapped_ids, cached_w_3d, layer.ffn_gate_up_exps,
+                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s);
+                ggml_tensor * ffn_shexp = build_ffn(cur, layer.ffn_up_shexp, NULL, NULL,
+                    layer.ffn_gate_shexp, NULL, NULL, layer.ffn_down_shexp, NULL, NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+                cur = ggml_add(ctx0, moe_out, ffn_shexp);
+                cur = ggml_add(ctx0, cur, ffn_inp);
+                cur = build_cvec(cur, il);
+                cb(cur, "l_out", il);
+                inpL = cur;
+            }
+            continue;
+        }
+#endif
+
         // Attention Norm
         cur = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -476,16 +514,31 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
 
-        // Residual
+        // Residual → ffn_inp (input to FFN)
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
+
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+        // v2 two-phase: Phase 1 saves ffn_inp to scratch; Phase 2 reads it back
+        if (build_phase == 2 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
+            moe_cache->scratch_ffn_inp[il]) {
+            // Phase 2: skip attention, read saved ffn_inp from Phase 1 scratch
+            ffn_inp = moe_cache->scratch_ffn_inp[il];
+            // inpSA is unused in Phase 2 (no residual needed here for attention)
+            cur = ffn_inp; // start FFN from saved input
+        } else if (build_phase == 1 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
+                   moe_cache->scratch_ffn_inp[il]) {
+            // Phase 1: save ffn_inp to scratch for Phase 2
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_inp, moe_cache->scratch_ffn_inp[il]));
+        }
+#endif
 
         // FFN Norm
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
-            // Dense FFN layer
+            // Dense FFN layer (always computed in both phases)
             cur = build_ffn(cur,
                 layer.ffn_up, NULL, NULL,
                 layer.ffn_gate, NULL, NULL,
@@ -494,22 +547,97 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             cb(cur, "ffn_out", il);
         } else {
             // MoE layer
-            // Kimi uses moe_renormalize=True and routed_scaling_factor (stored as expert_weights_scale) = 2.446
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                layer.ffn_exp_probs_b,
-                hparams.n_expert,
-                hparams.n_expert_used,
-                LLM_FFN_SILU, true,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+            ggml_tensor * moe_out;
+
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+            // v2 Phase 1: routing only (FFN already skipped in build_moe_ffn early-return)
+            // v2 Phase 2: compact FFN with cached routing
+            if (build_phase == 2 && moe_cache && moe_cache->compact_ready &&
+                (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il] &&
+                moe_cache->scratch_moe_ids[il] && moe_cache->remap) {
+
+                int64_t n_expert_used = hparams.n_expert_used;
+                int64_t n_tokens_layer = n_tokens;
+
+                // Remap original expert IDs → compact buffer slots
+                ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
+                ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
+                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap, cached_ids);
+                cb(remapped_ids, "ffn_moe_remapped_ids", il);
+
+                // Reshape weights for cached-routing overload
+                ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens_layer);
+                cb(cached_w_3d, "ffn_moe_cached_weights", il);
+
+                // Compact cache tensors: gate/up/down with only kept experts
+                ggml_tensor * ffn_up_exps   = moe_cache->kept_up[il];
+                ggml_tensor * ffn_gate_exps = moe_cache->kept_gate[il];
+                ggml_tensor * ffn_down_exps = moe_cache->kept_down[il];
+
+                moe_out = build_moe_ffn(cur,
+                    ffn_up_exps, ffn_gate_exps, ffn_down_exps,
+                    moe_cache->max_kept, n_expert_used,
+                    LLM_FFN_SILU, il,
+                    remapped_ids, cached_w_3d,
+                    layer.ffn_gate_up_exps,
+                    layer.ffn_up_exps_s,
+                    layer.ffn_gate_exps_s,
+                    layer.ffn_down_exps_s);
+                cb(moe_out, "ffn_moe_out", il);
+            } else if (build_phase == 1) {
+                // Phase 1: routing is handled by build_moe_ffn's early return
+                // (build_moe_ffn saves routing to scratch and returns cur unchanged)
+                moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    layer.ffn_exp_probs_b,
+                    hparams.n_expert,
+                    hparams.n_expert_used,
+                    LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+                // moe_out == cur (identity pass-through, FFN skipped)
+                // Skip shared expert + residual for phase 1
+                cb(moe_out, "ffn_moe_skip", il);
+                cur = ffn_inp; // keep ffn_inp as layer output (no FFN contribution)
+                continue; // skip to next layer (no shared expert, no residual)
+            } else
+#endif
+            // Non-phase mode: full computation with GPU cache or original weights
+            if (moe_cache && moe_cache->populated && il < (int)moe_cache->up.size() &&
+                moe_cache->up[il] && moe_cache->gate[il] && moe_cache->down[il]) {
+                moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    moe_cache->up[il],
+                    moe_cache->gate[il],
+                    moe_cache->down[il],
+                    layer.ffn_exp_probs_b,
+                    hparams.n_expert,
+                    hparams.n_expert_used,
+                    LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+            } else {
+                moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    layer.ffn_exp_probs_b,
+                    hparams.n_expert,
+                    hparams.n_expert_used,
+                    LLM_FFN_SILU, true,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il);
+            }
             cb(moe_out, "ffn_moe_out", il);
 
-            // Shared expert
+            // Shared expert (skipped in phase 1 via continue above)
             {
                 ggml_tensor * ffn_shexp = build_ffn(cur,
                         layer.ffn_up_shexp, NULL, NULL,

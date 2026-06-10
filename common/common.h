@@ -565,6 +565,9 @@ struct common_params {
     bool hybrid_pipeline   = false; // enable hybrid CPU/GPU speculative pipeline
     bool kv_vram           = true;  // store target model KV-cache in VRAM
 
+    // hyper-sparse MoE: cumulative weight threshold + expert prefetch
+    bool deepseek_pipeline = false; // enable standalone hyper-sparse MoE optimization
+
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

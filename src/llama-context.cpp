@@ -414,6 +414,43 @@ llama_context::~llama_context() {
         ggml_backend_sched_pipelined_free(sched_pipeline);
         sched_pipeline = nullptr;
     }
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+    if (moe_weight_cache.populated) {
+        if (moe_weight_cache.ctx_meta) {
+            ggml_free(moe_weight_cache.ctx_meta);
+            moe_weight_cache.ctx_meta = nullptr;
+        }
+        delete[] moe_weight_cache.ctx_meta_buf;
+        moe_weight_cache.ctx_meta_buf = nullptr;
+        if (moe_weight_cache.buf) {
+            ggml_backend_buffer_free(moe_weight_cache.buf);
+            moe_weight_cache.buf = nullptr;
+        }
+        moe_weight_cache.gate.clear();
+        moe_weight_cache.up.clear();
+        moe_weight_cache.down.clear();
+
+        // v2 cleanup
+        if (moe_weight_cache.ctx_scratch) {
+            ggml_free(moe_weight_cache.ctx_scratch);
+            moe_weight_cache.ctx_scratch = nullptr;
+        }
+        delete[] moe_weight_cache.ctx_scratch_buf;
+        moe_weight_cache.ctx_scratch_buf = nullptr;
+        if (moe_weight_cache.scratch_buf) {
+            ggml_backend_buffer_free(moe_weight_cache.scratch_buf);
+            moe_weight_cache.scratch_buf = nullptr;
+        }
+        moe_weight_cache.scratch_ffn_inp.clear();
+        moe_weight_cache.scratch_moe_ids.clear();
+        moe_weight_cache.scratch_moe_weights.clear();
+        moe_weight_cache.kept_gate.clear();
+        moe_weight_cache.kept_up.clear();
+        moe_weight_cache.kept_down.clear();
+
+        moe_weight_cache.populated = false;
+    }
+#endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1324,7 +1361,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !cparams.moe_two_phase && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1348,25 +1385,201 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // graph context is still alive).
 #ifdef LLAMA_DEEPSEEK_PIPELINE
         bool want_pipeline = cparams.deepseek_pipeline && model.arch == LLM_ARCH_DEEPSEEK32;
+        bool want_moe_cache = cparams.deepseek_pipeline && model.hparams.n_expert > 0;
         struct llama_pipeline_setup pipe_setup;
-        gf = model.build_graph(gparams, want_pipeline ? &pipe_setup : nullptr,
-                               want_pipeline ? &deepseek_pipeline : nullptr);
 
-        // Set up CUDA expert prefetch callback
-        if (deepseek_pipeline) {
-#ifdef GGML_USE_CUDA
-            for (int _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
-                auto * _b = ggml_backend_sched_get_backend(sched.get(), _bi);
-                if (ggml_backend_is_cuda(_b)) {
-                    llama_pipeline_cuda_init_prefetch(deepseek_pipeline, _b);
-                    break;
+        // Initialize MoE GPU weight cache on first use
+        if (want_moe_cache && !moe_weight_cache.populated) {
+            init_moe_weight_cache();
+        }
+
+            // v2 two-phase: Phase 1 (routing+attention) → threshold+fetch → Phase 2 (compact FFN)
+            if (want_moe_cache && cparams.moe_two_phase && moe_weight_cache.populated &&
+                moe_weight_cache.scratch_ffn_inp.size() > 0 && !want_pipeline) {
+
+                // ---- Phase 1: build routing+attention graph ----
+                moe_weight_cache.build_phase = 1;
+                gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize Phase 1 graph\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
                 }
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate Phase 1 graph\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+
+                res->set_inputs(&ubatch);
+
+                {
+                    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: Phase 1 compute failed: %d\n", __func__, status);
+                        ret = status;
+                        return nullptr;
+                    }
+                }
+
+                // ---- Threshold + Expert Fetch ----
+                ggml_backend_t gpu = nullptr;
+                for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched.get()); bi++) {
+                    auto * b = ggml_backend_sched_get_backend(sched.get(), bi);
+                    auto * dev = ggml_backend_get_device(b);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        gpu = b; break;
+                    }
+                }
+
+                if (gpu) {
+                    const int64_t n_layer = model.hparams.n_layer;
+                    const int64_t n_layer_dense_lead = model.hparams.n_layer_dense_lead;
+                    int32_t total_kept = 0;
+                    int32_t total_experts = 0;
+
+                    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+                        if (!moe_weight_cache.scratch_moe_ids[il] ||
+                            !moe_weight_cache.scratch_moe_weights[il]) continue;
+
+                        // Launch cumulative threshold kernel on the GPU
+#ifdef GGML_USE_CUDA
+                        ggml_backend_cuda_pipeline_moe_threshold(
+                            moe_weight_cache.scratch_moe_ids[il],
+                            moe_weight_cache.scratch_moe_weights[il],
+                            moe_weight_cache.scratch_moe_weights[il], // in-place renormalize
+                            moe_weight_cache.expert_mask,
+                            moe_weight_cache.remap,
+                            moe_weight_cache.kept_count,
+                            cparams.moe_threshold,
+                            cparams.moe_floor,
+                            gpu);
+#else
+                        (void)gpu;
+                        int32_t kept = (int32_t)model.hparams.n_expert;
+                        moe_weight_cache.n_kept_last = kept;
+                        total_kept += kept;
+                        total_experts += (int32_t)model.hparams.n_expert;
+                        moe_weight_cache.compact_ready = false;
+                        continue;
+#endif
+
+                        // Sync kept_count D2H (4 bytes, ~1 microsecond)
+                        int32_t kept = 0;
+                        ggml_backend_tensor_get(moe_weight_cache.kept_count, &kept, 0, sizeof(int32_t));
+                        moe_weight_cache.n_kept_last = kept;
+                        total_kept += kept;
+                        total_experts += (int32_t)model.hparams.n_expert;
+
+                        // Compact expert copy: kept experts DDR5 → VRAM
+                        if (kept > 0) {
+                            auto * src_gate = model.layers[il].ffn_gate_exps;
+                            auto * src_up   = model.layers[il].ffn_up_exps;
+                            auto * src_down = model.layers[il].ffn_down_exps;
+                            if (src_gate && src_up && src_down) {
+#ifdef GGML_USE_CUDA
+                                ggml_tensor * dst_arr[3] = {
+                                    moe_weight_cache.kept_gate[il],
+                                    moe_weight_cache.kept_up[il],
+                                    moe_weight_cache.kept_down[il]
+                                };
+                                ggml_tensor * src_arr[3] = { src_gate, src_up, src_down };
+                                size_t sb_arr[3] = {
+                                    ggml_row_size(src_gate->type, src_gate->ne[0] * src_gate->ne[1]),
+                                    ggml_row_size(src_up->type,   src_up->ne[0]   * src_up->ne[1]),
+                                    ggml_row_size(src_down->type, src_down->ne[0] * src_down->ne[1])
+                                };
+                                ggml_backend_cuda_pipeline_expert_skip_prefetch(
+                                    dst_arr, src_arr, sb_arr,
+                                    moe_weight_cache.expert_mask,
+                                    moe_weight_cache.remap,
+                                    il,
+                                    nullptr,
+                                    nullptr,
+                                    gpu);
+#else
+                                (void)kept;
+                                (void)src_gate;
+                                (void)src_up;
+                                (void)src_down;
+#endif
+                            }
+                        }
+                    }
+
+                    // Update sparsity stats
+                    if (total_experts > 0) {
+                        moe_weight_cache.n_total_experts += total_experts;
+                        moe_weight_cache.n_skipped_experts += (total_experts - total_kept);
+                        moe_weight_cache.cumulative_sparsity =
+                            100.0 * (double)moe_weight_cache.n_skipped_experts /
+                                   (double)moe_weight_cache.n_total_experts;
+                        if (++moe_weight_cache.stats_counter % 10 == 0) {
+                            LLAMA_LOG_INFO("MoE cumulative sparsity: %.1f%% (kept avg %.1f/%lld experts per batch)\n",
+                                moe_weight_cache.cumulative_sparsity,
+                                (double)total_kept / (double)((int)n_layer - (int)n_layer_dense_lead),
+                                (long long)model.hparams.n_expert);
+                        }
+                    }
+                }
+
+                moe_weight_cache.compact_ready = true;
+
+                // ---- Phase 2: build compact FFN graph ----
+                moe_weight_cache.build_phase = 2;
+                gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+
+                if (!gf) {
+                    LLAMA_LOG_ERROR("%s: failed to initialize Phase 2 graph\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+
+                res->set_inputs(&ubatch);
+
+                {
+                    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
+                        ret = status;
+                        return nullptr;
+                    }
+                }
+
+                ret = GGML_STATUS_SUCCESS;
+                return res;
+            } else
+#endif
+        {
+            // Single-phase: full graph (v1 cache or original weights)
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+            gf = model.build_graph(gparams,
+                                   want_pipeline ? &pipe_setup : nullptr,
+                                   want_pipeline ? &deepseek_pipeline : nullptr,
+                                   want_moe_cache ? &moe_weight_cache : nullptr);
+
+            // Set up CUDA expert prefetch callback
+            if (deepseek_pipeline) {
+#ifdef GGML_USE_CUDA
+                for (int _bi = 0; _bi < ggml_backend_sched_get_n_backends(sched.get()); _bi++) {
+                    auto * _b = ggml_backend_sched_get_backend(sched.get(), _bi);
+                    if (ggml_backend_is_cuda(_b)) {
+                        llama_pipeline_cuda_init_prefetch(deepseek_pipeline, _b);
+                        break;
+                    }
+                }
+#endif
             }
+#else
+            gf = model.build_graph(gparams);
 #endif
         }
-#else
-        gf = model.build_graph(gparams);
-#endif
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1457,15 +1670,245 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+    // Standalone hyper-sparse MoE: sparsity logging placeholder
+    // TODO: Read routing outputs from GPU, launch cumulative_threshold_kernel,
+    //       D2H kept_count, log sparsity. Requires graph tensor access for
+    //       the routing outputs (weights, selected_experts).
+    if (cparams.deepseek_pipeline && model.hparams.n_expert > 0 && moe_weight_cache.populated) {
+        // Threshold kernel + stats collection will be wired in follow-up.
+    }
+#endif
+
     // hybrid: fence for async flash_attn — ensures GPU output is visible to CPU
     // The fence implementation lives in common/hybrid_stage.cpp (llama-common lib)
     // and is not linked into the core llama library.
-    // The server code handles the fence externally via the orchestrator API.
 
     ret = GGML_STATUS_SUCCESS;
 
     return res;
 }
+
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+void llama_context::init_moe_weight_cache() {
+    if (moe_weight_cache.populated) return;
+
+    const auto & hparams = model.hparams;
+    const int64_t n_expert = hparams.n_expert;
+    if (n_expert <= 0) return;
+
+    const int64_t n_layer = (int64_t)hparams.n_layer;
+    const int64_t n_layer_dense_lead = (int64_t)hparams.n_layer_dense_lead;
+    const int64_t n_moe_layers = n_layer - n_layer_dense_lead;
+    if (n_moe_layers <= 0) return;
+
+    // Find GPU backend
+    ggml_backend_t gpu = nullptr;
+    for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched.get()); bi++) {
+        auto * b = ggml_backend_sched_get_backend(sched.get(), bi);
+        auto * dev = ggml_backend_get_device(b);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = b; break;
+        }
+    }
+    if (!gpu) return;
+
+    // Find a representative MoE layer to determine tensor shapes
+    int ref_il = -1;
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+        if (model.layers[il].ffn_gate_exps) { ref_il = il; break; }
+    }
+    if (ref_il < 0) return;
+
+    auto * ref_gate = model.layers[ref_il].ffn_gate_exps;
+    auto * ref_up   = model.layers[ref_il].ffn_up_exps;
+    auto * ref_down = model.layers[ref_il].ffn_down_exps;
+    if (!ref_gate || !ref_up || !ref_down) return;
+
+    // Determine tensor dimensionalities (compute per-tensor, not hardcoded)
+
+    // Allocate a ggml_context for tensor metadata (3 tensors per MoE layer)
+    const size_t ctx_meta_size = (size_t)n_moe_layers * 3 * (ggml_tensor_overhead() + 256);
+    moe_weight_cache.ctx_meta_buf = new uint8_t[ctx_meta_size];
+    moe_weight_cache.ctx_meta = ggml_init({ctx_meta_size, moe_weight_cache.ctx_meta_buf, false});
+    if (!moe_weight_cache.ctx_meta) {
+        delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta_buf = nullptr;
+        LLAMA_LOG_ERROR("%s: failed to init metadata context\n", __func__);
+        return;
+    }
+
+    const size_t sz_gate = ggml_nbytes(ref_gate);
+    const size_t sz_up   = ggml_nbytes(ref_up);
+    const size_t sz_down = ggml_nbytes(ref_down);
+    const size_t total_sz = n_moe_layers * (sz_gate + sz_up + sz_down);
+
+    // Verify all MoE layers have matching shapes
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+        auto * g = model.layers[il].ffn_gate_exps;
+        auto * u = model.layers[il].ffn_up_exps;
+        auto * d = model.layers[il].ffn_down_exps;
+        if (!g || !u || !d) {
+            LLAMA_LOG_WARN("%s: missing weight tensors at layer %d\n", __func__, il);
+            ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
+            return;
+        }
+        if (ggml_nbytes(g) != sz_gate || ggml_nbytes(u) != sz_up || ggml_nbytes(d) != sz_down) {
+            LLAMA_LOG_WARN("%s: MoE layer weight shapes differ, cache not initialized\n", __func__);
+            ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
+            return;
+        }
+    }
+
+    // Allocate persistent GPU buffer
+    moe_weight_cache.buf = ggml_backend_alloc_buffer(gpu, total_sz);
+    if (!moe_weight_cache.buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate MoE weight cache buffer\n", __func__);
+        ggml_free(moe_weight_cache.ctx_meta); delete[] moe_weight_cache.ctx_meta_buf; moe_weight_cache.ctx_meta = nullptr; moe_weight_cache.ctx_meta_buf = nullptr;
+        return;
+    }
+
+    moe_weight_cache.gate.resize(n_layer, nullptr);
+    moe_weight_cache.up.resize(n_layer, nullptr);
+    moe_weight_cache.down.resize(n_layer, nullptr);
+
+    size_t offset = 0;
+    auto * buf_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.buf);
+
+    auto make_cache_tensor = [&](const ggml_tensor * src, size_t sz) -> ggml_tensor * {
+        const int nd = ggml_n_dims(src);
+        ggml_tensor * t;
+        switch (nd) {
+            case 1: t = ggml_new_tensor_1d(moe_weight_cache.ctx_meta, src->type, src->ne[0]); break;
+            case 2: t = ggml_new_tensor_2d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1]); break;
+            case 3: t = ggml_new_tensor_3d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2]); break;
+            default: t = ggml_new_tensor_4d(moe_weight_cache.ctx_meta, src->type, src->ne[0], src->ne[1], src->ne[2], src->ne[3]); break;
+        }
+        if (t) {
+            t->data   = buf_base + offset;
+            t->buffer = moe_weight_cache.buf;
+            t->flags |= GGML_TENSOR_FLAG_INPUT;
+            offset += sz;
+        }
+        return t;
+    };
+
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+        moe_weight_cache.gate[il] = make_cache_tensor(model.layers[il].ffn_gate_exps, sz_gate);
+        moe_weight_cache.up[il]   = make_cache_tensor(model.layers[il].ffn_up_exps,   sz_up);
+        moe_weight_cache.down[il] = make_cache_tensor(model.layers[il].ffn_down_exps, sz_down);
+    }
+
+    moe_weight_cache.n_layers = n_moe_layers;
+
+    // Copy all weights from CPU → GPU
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+        ggml_backend_tensor_copy(model.layers[il].ffn_gate_exps, moe_weight_cache.gate[il]);
+        ggml_backend_tensor_copy(model.layers[il].ffn_up_exps,   moe_weight_cache.up[il]);
+        ggml_backend_tensor_copy(model.layers[il].ffn_down_exps, moe_weight_cache.down[il]);
+    }
+
+    ggml_backend_synchronize(gpu);
+    moe_weight_cache.populated = true;
+
+    // ---- v2 scratch + compact buffer allocation ----
+    if (!cparams.moe_two_phase) {
+        LLAMA_LOG_INFO("%s: MoE weight cache initialized (v1): %d layers, %zu MB\n",
+            __func__, n_moe_layers, total_sz / (1024 * 1024));
+        return;
+    }
+
+    const int n_tokens = (int)cparams.n_ubatch;
+    const int64_t n_expert_used = hparams.n_expert_used;
+
+    // Compute scratch buffer sizes: routing (moe_ids, moe_weights, ffn_inp) per layer
+    const size_t s_moe_ids     = ggml_row_size(GGML_TYPE_I32, n_expert_used * n_tokens);
+    const size_t s_moe_weights = ggml_row_size(GGML_TYPE_F32, n_expert_used * n_tokens);
+    const size_t s_ffn_inp     = ggml_row_size(GGML_TYPE_F32, hparams.n_embd * n_tokens);
+    const size_t total_scratch = n_moe_layers * (s_moe_ids + s_moe_weights + s_ffn_inp);
+
+    // Compact buffer: per-layer kept expert weights
+    const int max_kept = (int)n_expert;
+    moe_weight_cache.max_kept = max_kept;
+    const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
+    const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
+    const size_t slice_down = ggml_row_size(ref_down->type, ref_down->ne[0] * ref_down->ne[1]);
+    const size_t s_kept_gate = slice_gate * max_kept;
+    const size_t s_kept_up   = slice_up   * max_kept;
+    const size_t s_kept_down = slice_down * max_kept;
+    const size_t total_compact = n_moe_layers * (s_kept_gate + s_kept_up + s_kept_down);
+
+    // Threshold + remap tensors: expert_mask, remap, kept_count
+    const int64_t n_mask_words = (n_expert + 63) / 64;
+    const size_t s_expert_mask = (size_t)n_mask_words * sizeof(uint64_t);
+    const size_t s_remap       = ggml_row_size(GGML_TYPE_I32, n_expert);
+    const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
+    const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
+
+    // Single GPU buffer for scratch + compact + threshold
+    const size_t total_v2_sz = total_scratch + total_compact + total_threshold;
+    moe_weight_cache.scratch_buf = ggml_backend_alloc_buffer(gpu, total_v2_sz);
+    if (!moe_weight_cache.scratch_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate v2 scratch buffer\n", __func__);
+        return;
+    }
+
+    // Metadata context for v2 tensors
+    const int n_v2_tensors = (int)(n_moe_layers * 6 + 3);
+    const size_t ctx_v2_size = n_v2_tensors * (ggml_tensor_overhead() + 128);
+    moe_weight_cache.ctx_scratch_buf = new uint8_t[ctx_v2_size];
+    moe_weight_cache.ctx_scratch = ggml_init({ctx_v2_size, moe_weight_cache.ctx_scratch_buf, false});
+    if (!moe_weight_cache.ctx_scratch) {
+        delete[] moe_weight_cache.ctx_scratch_buf; moe_weight_cache.ctx_scratch_buf = nullptr;
+        LLAMA_LOG_ERROR("%s: failed to init v2 scratch ctx\n", __func__);
+        return;
+    }
+
+    auto * scratch_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.scratch_buf);
+    size_t scratch_offset = 0;
+
+    auto make_scratch_tensor = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, size_t sz) -> ggml_tensor * {
+        ggml_tensor * t;
+        if (ne2 > 1) {
+            t = ggml_new_tensor_3d(moe_weight_cache.ctx_scratch, type, ne0, ne1, ne2);
+        } else {
+            t = ggml_new_tensor_2d(moe_weight_cache.ctx_scratch, type, ne0, ne1);
+        }
+        if (t) {
+            t->data   = scratch_base + scratch_offset;
+            t->buffer = moe_weight_cache.scratch_buf;
+            t->flags |= GGML_TENSOR_FLAG_INPUT;
+            scratch_offset += sz;
+        }
+        return t;
+    };
+
+    moe_weight_cache.scratch_ffn_inp.resize(n_layer, nullptr);
+    moe_weight_cache.scratch_moe_ids.resize(n_layer, nullptr);
+    moe_weight_cache.scratch_moe_weights.resize(n_layer, nullptr);
+    moe_weight_cache.kept_gate.resize(n_layer, nullptr);
+    moe_weight_cache.kept_up.resize(n_layer, nullptr);
+    moe_weight_cache.kept_down.resize(n_layer, nullptr);
+
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+        moe_weight_cache.scratch_ffn_inp[il]    = make_scratch_tensor(GGML_TYPE_F32, hparams.n_embd, n_tokens, 1, s_ffn_inp);
+        moe_weight_cache.scratch_moe_ids[il]     = make_scratch_tensor(GGML_TYPE_I32, n_expert_used, n_tokens, 1, s_moe_ids);
+        moe_weight_cache.scratch_moe_weights[il] = make_scratch_tensor(GGML_TYPE_F32, n_expert_used, n_tokens, 1, s_moe_weights);
+        moe_weight_cache.kept_gate[il] = make_scratch_tensor(ref_gate->type, ref_gate->ne[0], ref_gate->ne[1], max_kept, s_kept_gate);
+        moe_weight_cache.kept_up[il]   = make_scratch_tensor(ref_up->type,   ref_up->ne[0],   ref_up->ne[1],   max_kept, s_kept_up);
+        moe_weight_cache.kept_down[il] = make_scratch_tensor(ref_down->type, ref_down->ne[0], ref_down->ne[1], max_kept, s_kept_down);
+    }
+
+    // Threshold tensors
+    moe_weight_cache.expert_mask = make_scratch_tensor(GGML_TYPE_I8, n_mask_words * (int64_t)sizeof(uint64_t), 1, 1, s_expert_mask);
+    moe_weight_cache.remap       = make_scratch_tensor(GGML_TYPE_I32, n_expert, 1, 1, s_remap);
+    moe_weight_cache.kept_count  = make_scratch_tensor(GGML_TYPE_I32, 1, 1, 1, s_kept_count);
+
+    ggml_backend_synchronize(gpu);
+
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %d layers, full=%zuMB, scratch+compact=%zuMB\n",
+        __func__, n_moe_layers, total_sz / (1024 * 1024), total_v2_sz / (1024 * 1024));
+}
+#endif
 
 int llama_context::encode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
