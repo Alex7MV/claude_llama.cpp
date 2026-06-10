@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-context.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
