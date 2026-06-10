@@ -568,7 +568,7 @@ struct llama_pipeline_sched * llama_pipeline_sched_init(
     p->moe_floor           = 3;      // L1: at least 3 experts
     memset(&p->stats, 0, sizeof(p->stats));
     p->stats_counter       = 0;
-    p->stats_log_interval  = 0;
+    p->stats_log_interval  = 60;  // log sparsity every ~60 MoE layers (≈1 batch)
 
     const uint32_t n_layers = ctx.hparams.n_layer - ctx.hparams.nextn_predict_layers;
     if (n_layers > LLAMA_PIPELINE_MAX_LAYERS) { delete p; return nullptr; }
