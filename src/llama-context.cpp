@@ -1490,14 +1490,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     ggml_row_size(src_up->type,   src_up->ne[0]   * src_up->ne[1]),
                                     ggml_row_size(src_down->type, src_down->ne[0] * src_down->ne[1])
                                 };
-                                ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                                    dst_arr, src_arr, sb_arr,
-                                    moe_weight_cache.expert_mask,
-                                    moe_weight_cache.remap,
-                                    il,
-                                    nullptr,
-                                    nullptr,
-                                    gpu);
+                            ggml_backend_cuda_pipeline_expert_skip_prefetch(
+                                dst_arr, src_arr, sb_arr,
+                                moe_weight_cache.expert_mask,
+                                moe_weight_cache.remap,
+                                nullptr,
+                                nullptr,
+                                gpu);
 #else
                                 (void)kept;
                                 (void)src_gate;
@@ -1812,8 +1811,8 @@ void llama_context::init_moe_weight_cache() {
 
     // ---- v2 scratch + compact buffer allocation ----
     if (!cparams.moe_two_phase) {
-        LLAMA_LOG_INFO("%s: MoE weight cache initialized (v1): %d layers, %zu MB\n",
-            __func__, n_moe_layers, total_sz / (1024 * 1024));
+        LLAMA_LOG_INFO("%s: MoE weight cache initialized (v1): %ld layers, %zu MB\n",
+            __func__, (long)n_moe_layers, total_sz / (1024 * 1024));
         return;
     }
 
@@ -1905,7 +1904,7 @@ void llama_context::init_moe_weight_cache() {
 
     ggml_backend_synchronize(gpu);
 
-    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %d layers, full=%zuMB, scratch+compact=%zuMB\n",
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, full=%zuMB, scratch+compact=%zuMB\n",
         __func__, n_moe_layers, total_sz / (1024 * 1024), total_v2_sz / (1024 * 1024));
 }
 #endif
