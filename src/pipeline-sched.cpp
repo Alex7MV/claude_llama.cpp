@@ -7,7 +7,6 @@
 
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
-#include <cuda_runtime.h>
 #endif
 
 #include <cmath>
@@ -1106,11 +1105,9 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
 
                 // ---- Stats: sync D2H kept_count (4 bytes, ~1 µs) ----
                 int32_t kept = 0;
-#ifdef GGML_USE_CUDA
-                CUDA_CHECK(cudaMemcpy(&kept, sc->moe_kept_count->data, sizeof(int32_t), cudaMemcpyDeviceToHost));
-#else
-                (void)kept;
-#endif
+                // Use backend-agnostic tensor_get (works with CUDA, CPU, etc.)
+                // Avoids direct cuda_runtime.h dependency in .cpp files.
+                ggml_backend_tensor_get(sc->moe_kept_count, &kept, 0, sizeof(int32_t));
                 p->stats.n_total_experts += p->n_expert_stats;
                 p->stats.n_skipped_experts += (p->n_expert_stats - kept);
                 p->stats.cumulative_sparsity =
