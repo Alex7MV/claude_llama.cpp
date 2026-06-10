@@ -391,6 +391,9 @@ extern "C" {
         // Pipeline configuration for hybrid CPU+GPU prefill (opt-in)
         int32_t pipeline_depth;         // 0 = disabled, 3 = CPU+TMA+GPU
         int32_t pipeline_split_size;    // layers per split group (default 8)
+
+        // Standalone hyper-sparse MoE optimization (DeepSeek V3-like)
+        bool    deepseek_pipeline;      // enable expert prefetch + two-phase
     };
 
     struct llama_model_tensor_override {

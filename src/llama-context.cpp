@@ -206,6 +206,9 @@ llama_context::llama_context(
     cparams.pipeline_depth = params.pipeline_depth;
     cparams.pipeline_split_size = params.pipeline_split_size;
 
+    // Standalone hyper-sparse MoE optimization
+    cparams.deepseek_pipeline = params.deepseek_pipeline;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -3938,6 +3941,7 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.pipeline_depth              =*/ 3,
         /*.pipeline_split_size         =*/ 8,
+        /*.deepseek_pipeline           =*/ false,
     };
 
     return result;
