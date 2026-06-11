@@ -1397,7 +1397,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
             // v2 two-phase: Phase 1 (routing+attention) → threshold+fetch → Phase 2 (compact FFN)
-            if (want_moe_cache && cparams.moe_two_phase && moe_weight_cache.populated &&
+            // Skip two-phase during warmup: warmup overrides n_expert_used → n_expert,
+            // which mismatches scratch buffer dims (n_expert_used)
+            if (want_moe_cache && cparams.moe_two_phase && !cparams.warmup && moe_weight_cache.populated &&
                 moe_weight_cache.scratch_ffn_inp.size() > 0 && !want_pipeline) {
 
                 // ---- Phase 1: build routing+attention graph ----
