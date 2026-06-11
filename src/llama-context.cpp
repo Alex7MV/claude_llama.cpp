@@ -1867,15 +1867,12 @@ void llama_context::init_moe_weight_cache() {
         return;
     }
 
-    // Metadata context for v2 tensors
-    // ggml_new_tensor_* allocates both tensor struct AND data from the context pool.
-    // We set t->data to GPU buffer afterwards, but ggml still needs enough pool space
-    // for the pre-allocated data. Include data sizes + metadata overhead.
+    // Metadata context for v2 tensors (no_alloc: ggml_new_tensor won't allocate data,
+    // we set t->data to GPU buffer after creation)
     const int n_v2_tensors = (int)(n_moe_layers * 6 + 3);
-    const size_t ctx_v2_size = n_v2_tensors * (ggml_tensor_overhead() + 128)
-                             + total_scratch + total_compact + total_threshold;
+    const size_t ctx_v2_size = n_v2_tensors * (ggml_tensor_overhead() + 128);
     moe_weight_cache.ctx_scratch_buf = new uint8_t[ctx_v2_size];
-    moe_weight_cache.ctx_scratch = ggml_init({ctx_v2_size, moe_weight_cache.ctx_scratch_buf, false});
+    moe_weight_cache.ctx_scratch = ggml_init({ctx_v2_size, moe_weight_cache.ctx_scratch_buf, true});
     if (!moe_weight_cache.ctx_scratch) {
         delete[] moe_weight_cache.ctx_scratch_buf; moe_weight_cache.ctx_scratch_buf = nullptr;
         LLAMA_LOG_ERROR("%s: failed to init v2 scratch ctx\n", __func__);
