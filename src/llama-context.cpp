@@ -1443,16 +1443,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
                 }
 
+                // Save kept_* pointers before potential fallback null-out (used outside if(gpu))
+                std::vector<ggml_tensor *> saved_kept_gate = moe_weight_cache.kept_gate;
+                std::vector<ggml_tensor *> saved_kept_up   = moe_weight_cache.kept_up;
+                std::vector<ggml_tensor *> saved_kept_down = moe_weight_cache.kept_down;
+
                 if (gpu) {
                     const int64_t n_layer = model.hparams.n_layer;
                     const int64_t n_layer_dense_lead = model.hparams.n_layer_dense_lead;
                     int32_t total_kept = 0;
                     int32_t total_experts = 0;
-
-                    // Save kept_* pointers before potential fallback null-out
-                    auto saved_kept_gate = moe_weight_cache.kept_gate;
-                    auto saved_kept_up   = moe_weight_cache.kept_up;
-                    auto saved_kept_down = moe_weight_cache.kept_down;
 
                     for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
                         if (!moe_weight_cache.scratch_moe_ids[il] ||
