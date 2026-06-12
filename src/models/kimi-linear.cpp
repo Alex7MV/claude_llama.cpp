@@ -549,7 +549,9 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         } else if (build_phase == 1 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
                    moe_cache->scratch_ffn_inp[il]) {
             // Phase 1: save ffn_inp to scratch for Phase 2
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_inp, moe_cache->scratch_ffn_inp[il]));
+            // Scratch buffer is sized for max ubatch; reshape to match current n_tokens
+            ggml_tensor * dst_ffn_inp = ggml_reshape_2d(ctx0, moe_cache->scratch_ffn_inp[il], n_embd, n_tokens);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_inp, dst_ffn_inp));
         }
 #endif
 

@@ -1596,8 +1596,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // v2 Phase 1: save routing to scratch, skip FFN matmuls
     if (build_phase == 1 && moe_cache && il >= 0 && (size_t)il < moe_cache->scratch_moe_ids.size()) {
         if (moe_cache->scratch_moe_ids[il] && moe_cache->scratch_moe_weights[il]) {
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, moe_cache->scratch_moe_ids[il]));
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, weights, moe_cache->scratch_moe_weights[il]));
+            // Scratch buffers are allocated for max ubatch size (cparams.n_ubatch),
+            // but current n_tokens may be smaller — reshape to match source shape
+            ggml_tensor * dst_ids = ggml_reshape_2d(ctx0, moe_cache->scratch_moe_ids[il], n_expert_used, n_tokens);
+            ggml_tensor * dst_w   = ggml_reshape_3d(ctx0, moe_cache->scratch_moe_weights[il], 1, n_expert_used, n_tokens);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, dst_ids));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, weights, dst_w));
         }
         // Skip expert matmuls — return cur as pass-through for layer output
         return cur;
