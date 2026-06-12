@@ -33,6 +33,12 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
 
     const int transfer_stream_id = 2;
 
+    // Synchronize compute stream (stream 0) to ensure threshold kernel output
+    // is visible before reading via the transfer stream (stream 2).
+    // ggml_backend_cuda_synchronize syncs the stream at curr_stream_no,
+    // which should be 0 (set by the previous set_stream(0) in the caller).
+    ggml_backend_synchronize(backend);
+
     // Switch backend to transfer stream
     ggml_backend_cuda_set_stream(backend, transfer_stream_id);
 
