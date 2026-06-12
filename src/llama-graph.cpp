@@ -1598,17 +1598,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (moe_cache->scratch_moe_ids[il] && moe_cache->scratch_moe_weights[il]) {
             // Scratch buffers are allocated for max ubatch size (cparams.n_ubatch),
             // but current n_tokens may be smaller — use views to match source shape
-            {
-                ggml_tensor * dst_ids = ggml_view_2d(ctx0, moe_cache->scratch_moe_ids[il], n_expert_used, n_tokens,
-                    moe_cache->scratch_moe_ids[il]->nb[1], 0);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, dst_ids));
-            }
-            {
-                ggml_tensor * dst_w = ggml_view_3d(ctx0, moe_cache->scratch_moe_weights[il], 1, n_expert_used, n_tokens,
-                    moe_cache->scratch_moe_weights[il]->nb[0],
-                    moe_cache->scratch_moe_weights[il]->nb[1], 0);
-                ggml_build_forward_expand(gf, ggml_cpy(ctx0, weights, dst_w));
-            }
+            fprintf(stderr, "%s: phase1 layer %d view_2d ne=%ld,%ld\n", __func__, il, (long)n_expert_used, (long)n_tokens);
+            ggml_tensor * dst_ids = ggml_view_2d(ctx0, moe_cache->scratch_moe_ids[il], n_expert_used, n_tokens,
+                moe_cache->scratch_moe_ids[il]->nb[1], 0);
+            fprintf(stderr, "%s: phase1 layer %d view_2d OK, cpy\n", __func__, il);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, selected_experts, dst_ids));
+            fprintf(stderr, "%s: phase1 layer %d view_3d\n", __func__, il);
+            ggml_tensor * dst_w = ggml_view_3d(ctx0, moe_cache->scratch_moe_weights[il], 1, n_expert_used, n_tokens,
+                moe_cache->scratch_moe_weights[il]->nb[0],
+                moe_cache->scratch_moe_weights[il]->nb[1], 0);
+            fprintf(stderr, "%s: phase1 layer %d view_3d OK, cpy\n", __func__, il);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, weights, dst_w));
         }
         // Skip expert matmuls — return cur as pass-through for layer output
         return cur;
