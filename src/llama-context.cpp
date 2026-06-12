@@ -1744,6 +1744,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 #ifdef LLAMA_DEEPSEEK_PIPELINE
+#else
+    #pragma message("WARNING: LLAMA_DEEPSEEK_PIPELINE not defined - compact pool init will be a stub!")
+#endif
+// init_moe_weight_cache — must be inside #ifdef LLAMA_DEEPSEEK_PIPELINE
+#ifdef LLAMA_DEEPSEEK_PIPELINE
 void llama_context::init_moe_weight_cache() {
     if (moe_weight_cache.populated) return;
 
@@ -1888,8 +1893,8 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
     const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
 
-    // Compact buffer: per-layer kept expert weights (capped at 6 — keeps VRAM ~7 GB for K2.6 Q4_0)
-    const int max_kept = std::min((int)n_expert, 6);
+    // Compact buffer: per-layer kept expert weights (hardcoded 4 to fit ~4500 MiB on 32 GB VRAM)
+    const int max_kept = 4;
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
     const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
@@ -1964,8 +1969,9 @@ void llama_context::init_moe_weight_cache() {
 
     ggml_backend_synchronize(gpu);
 
-    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, max_kept=%d, scratch=%zuMB compact=%zuMB\n",
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, max_kept=%d, pool=%zuMB (scratch=%zuMB + compact=%zuMB + threshold)\n",
         __func__, n_moe_layers, max_kept,
+        total_v2_sz / (1024 * 1024),
         total_scratch / (1024 * 1024), total_compact / (1024 * 1024));
 }
 #endif
