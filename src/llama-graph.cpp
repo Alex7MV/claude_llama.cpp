@@ -1042,10 +1042,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
-    moe_cache        (params.moe_cache),
-    build_phase      (params.build_phase),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    moe_cache        (params.moe_cache),
+    build_phase      (params.build_phase) {
         res->set_params(params);
     }
 
