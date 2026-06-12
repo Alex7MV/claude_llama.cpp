@@ -1406,15 +1406,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                 // ---- Phase 1: build routing+attention graph ----
                 moe_weight_cache.build_phase = 1;
-                fprintf(stderr, "%s: Phase 1 BEFORE build_graph\n", __func__);
                 gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
-                fprintf(stderr, "%s: Phase 1 AFTER build_graph\n", __func__);
 
                 if (!gf) {
                     LLAMA_LOG_ERROR("%s: failed to initialize Phase 1 graph\n", __func__);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
+                ggml_backend_sched_reset(sched.get());
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate Phase 1 graph\n", __func__);
                     ret = GGML_STATUS_ALLOC_FAILED;
@@ -1552,6 +1551,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
+                ggml_backend_sched_reset(sched.get());
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
                     ret = GGML_STATUS_ALLOC_FAILED;
