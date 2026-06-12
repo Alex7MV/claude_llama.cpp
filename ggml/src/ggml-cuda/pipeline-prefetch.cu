@@ -37,7 +37,9 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     ggml_backend_cuda_set_stream(backend, transfer_stream_id);
 
     // Wait for MoE routing + threshold to complete before reading skip_mask
-    ggml_backend_event_wait(backend, moe_ready);
+    if (moe_ready) {
+        ggml_backend_event_wait(backend, moe_ready);
+    }
 
     cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(backend, transfer_stream_id);
 
@@ -46,7 +48,9 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     size_t mask_nbytes = ggml_nbytes(expert_mask);
     uint64_t * host_mask = (uint64_t *)malloc(mask_nbytes);
     if (!host_mask) {
-        ggml_backend_event_record(completion_event, backend);
+        if (completion_event) {
+            ggml_backend_event_record(completion_event, backend);
+        }
         ggml_backend_cuda_set_stream(backend, 0);
         return;
     }
@@ -62,7 +66,9 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     int32_t * host_remap = (int32_t *)malloc(remap_nbytes);
     if (!host_remap) {
         free(host_mask);
-        ggml_backend_event_record(completion_event, backend);
+        if (completion_event) {
+            ggml_backend_event_record(completion_event, backend);
+        }
         ggml_backend_cuda_set_stream(backend, 0);
         return;
     }
@@ -105,7 +111,9 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     free(host_remap);
 
     // Record completion event on transfer stream
-    ggml_backend_event_record(completion_event, backend);
+    if (completion_event) {
+        ggml_backend_event_record(completion_event, backend);
+    }
 
     // Restore backend to compute stream
     ggml_backend_cuda_set_stream(backend, 0);
