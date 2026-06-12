@@ -1449,6 +1449,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     int32_t total_kept = 0;
                     int32_t total_experts = 0;
 
+                    // Save kept_* pointers before potential fallback null-out
+                    auto saved_kept_gate = moe_weight_cache.kept_gate;
+                    auto saved_kept_up   = moe_weight_cache.kept_up;
+                    auto saved_kept_down = moe_weight_cache.kept_down;
+
                     for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
                         if (!moe_weight_cache.scratch_moe_ids[il] ||
                             !moe_weight_cache.scratch_moe_weights[il]) continue;
@@ -1482,8 +1487,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         total_kept += kept;
                         total_experts += (int32_t)model.hparams.n_expert;
 
+                        // Fallback: if threshold kept more than compact buffer can hold,
+                        // skip prefetch and use original DDR5 weights for this layer
+                        if (kept > moe_weight_cache.max_kept) {
+                            LLAMA_LOG_DEBUG("layer %d: kept %d > max_kept %d, falling back to DDR5\n",
+                                il, kept, moe_weight_cache.max_kept);
+                            moe_weight_cache.kept_gate[il] = nullptr;
+                            moe_weight_cache.kept_up[il]   = nullptr;
+                            moe_weight_cache.kept_down[il] = nullptr;
+                        }
+
                         // Compact expert copy: kept experts DDR5 → VRAM
-                        if (kept > 0 && (size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
+                        if (kept > 0 && kept <= moe_weight_cache.max_kept &&
+                            (size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
                             auto * src_gate = model.layers[il].ffn_gate_exps;
                             auto * src_up   = model.layers[il].ffn_up_exps;
                             auto * src_down = model.layers[il].ffn_down_exps;
@@ -1552,12 +1568,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                 if (!gf) {
                     LLAMA_LOG_ERROR("%s: failed to initialize Phase 2 graph\n", __func__);
+                    // Restore kept_* pointers for next ubatch (will retry)
+                    moe_weight_cache.kept_gate = saved_kept_gate;
+                    moe_weight_cache.kept_up   = saved_kept_up;
+                    moe_weight_cache.kept_down = saved_kept_down;
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
                 ggml_backend_sched_reset(sched.get());
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
+                    // Restore kept_* pointers for next ubatch (will retry)
+                    moe_weight_cache.kept_gate = saved_kept_gate;
+                    moe_weight_cache.kept_up   = saved_kept_up;
+                    moe_weight_cache.kept_down = saved_kept_down;
                     ret = GGML_STATUS_ALLOC_FAILED;
                     return nullptr;
                 }
@@ -1568,10 +1592,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
                     if (status != GGML_STATUS_SUCCESS) {
                         LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
+                        // Restore kept_* pointers for next ubatch (will retry)
+                        moe_weight_cache.kept_gate = saved_kept_gate;
+                        moe_weight_cache.kept_up   = saved_kept_up;
+                        moe_weight_cache.kept_down = saved_kept_down;
                         ret = status;
                         return nullptr;
                     }
                 }
+
+                // Restore kept_* pointers for next ubatch
+                moe_weight_cache.kept_gate = saved_kept_gate;
+                moe_weight_cache.kept_up   = saved_kept_up;
+                moe_weight_cache.kept_down = saved_kept_down;
 
                 ret = GGML_STATUS_SUCCESS;
                 return res;
@@ -1855,8 +1888,8 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
     const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
 
-    // Compact buffer: per-layer kept expert weights (capped at 16 — enough for threshold=0.95 + floor=3)
-    const int max_kept = std::min((int)n_expert, 16);
+    // Compact buffer: per-layer kept expert weights (capped at 6 — keeps VRAM ~7 GB for K2.6 Q4_0)
+    const int max_kept = std::min((int)n_expert, 6);
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
     const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
