@@ -1475,6 +1475,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         continue;
 #endif
 
+                        ggml_backend_synchronize(gpu);
+
                         // Sync kept_count D2H (4 bytes, ~1 microsecond)
                         int32_t kept = 0;
                         ggml_backend_tensor_get(moe_weight_cache.kept_count, &kept, 0, sizeof(int32_t));
