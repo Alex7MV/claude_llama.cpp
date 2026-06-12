@@ -1402,6 +1402,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (want_moe_cache && cparams.moe_two_phase && !cparams.warmup && moe_weight_cache.populated &&
                 moe_weight_cache.scratch_ffn_inp.size() > 0 && !want_pipeline) {
 
+                LLAMA_LOG_INFO("%s: Phase 1 start (%d tokens, %d experts_used)\n", __func__, (int)ubatch.n_tokens, (int)model.hparams.n_expert_used);
+
                 // ---- Phase 1: build routing+attention graph ----
                 moe_weight_cache.build_phase = 1;
                 gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
@@ -1427,8 +1429,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         return nullptr;
                     }
                 }
+                LLAMA_LOG_INFO("%s: Phase 1 compute OK\n", __func__);
 
                 // ---- Threshold + Expert Fetch ----
+                LLAMA_LOG_INFO("%s: threshold+fetch start\n", __func__);
                 ggml_backend_t gpu = nullptr;
                 for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched.get()); bi++) {
                     auto * b = ggml_backend_sched_get_backend(sched.get(), bi);
