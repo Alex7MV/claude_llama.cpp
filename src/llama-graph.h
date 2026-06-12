@@ -690,6 +690,10 @@ struct llm_graph_params {
             loras == other.loras &&
             cross == other.cross;
     }
+
+    // MoE two-phase graph building: set before constructing graph context
+    struct llama_moe_weight_cache * moe_cache = nullptr;
+    int build_phase = 0;
 };
 
 class llm_graph_result {
