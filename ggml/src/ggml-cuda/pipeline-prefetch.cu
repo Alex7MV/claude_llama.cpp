@@ -56,7 +56,7 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     bool mask_alloc = false;
     uint64_t * host_mask;
     if (host_mask_ptr) {
-        host_mask = (uint64_t *)host_mask_ptr;
+        host_mask = const_cast<uint64_t *>(host_mask_ptr);
     } else {
         host_mask = (uint64_t *)malloc(mask_nbytes);
         if (!host_mask) {
@@ -71,7 +71,7 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     // ---- Step 2: Read moe_remap from GPU → host (also tiny) ----
     int32_t * host_remap;
     if (host_remap_ptr) {
-        host_remap = (int32_t *)host_remap_ptr;
+        host_remap = const_cast<int32_t *>(host_remap_ptr);
     } else {
         host_remap = (int32_t *)malloc(remap_nbytes);
         if (!host_remap) {
