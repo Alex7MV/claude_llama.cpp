@@ -1511,15 +1511,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             auto * su = model.layers[il].ffn_up_exps;
                             auto * sd = model.layers[il].ffn_down_exps;
                             if (sg && su && sd) {
-                                const size_t sb[3] = {
+                                ggml_tensor * dst_arr[] = {
+                                    moe_weight_cache.kept_gate[il],
+                                    moe_weight_cache.kept_up[il],
+                                    moe_weight_cache.kept_down[il]
+                                };
+                                ggml_tensor * src_arr[] = { sg, su, sd };
+                                size_t sb[] = {
                                     ggml_row_size(sg->type, sg->ne[0] * sg->ne[1]),
                                     ggml_row_size(su->type, su->ne[0] * su->ne[1]),
                                     ggml_row_size(sd->type, sd->ne[0] * sd->ne[1]),
                                 };
                                 ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                                    (ggml_tensor *[3]){ moe_weight_cache.kept_gate[il],
-                                        moe_weight_cache.kept_up[il], moe_weight_cache.kept_down[il] },
-                                    (ggml_tensor *[3]){ sg, su, sd }, sb,
+                                    dst_arr, src_arr, sb,
                                     moe_weight_cache.expert_mask_vec[il],
                                     moe_weight_cache.remap_vec[il],
                                     nullptr, nullptr, gpu);
