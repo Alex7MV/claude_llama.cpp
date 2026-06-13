@@ -1435,11 +1435,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 // ---- Threshold + Expert Fetch ----
                 LLAMA_LOG_INFO("%s: threshold+fetch start\n", __func__);
                 ggml_backend_t gpu = nullptr;
+                ggml_backend_dev_t gpu_dev = nullptr;
                 for (int bi = 0; bi < ggml_backend_sched_get_n_backends(sched.get()); bi++) {
                     auto * b = ggml_backend_sched_get_backend(sched.get(), bi);
                     auto * dev = ggml_backend_get_device(b);
                     if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        gpu = b; break;
+                        gpu = b; gpu_dev = dev; break;
                     }
                 }
 
@@ -1459,6 +1460,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     GGML_ASSERT(n_moe <= 256);
                     int32_t kept_host[256];
                     memset(kept_host, 0, sizeof(kept_host));
+                    ggml_backend_event_t prefetch_done = nullptr;
 
                     // Phase 1a: launch ALL threshold kernels back-to-back.
                     // Each writes to its own expert_mask_vec[il], remap_vec[il], kept_counts[il].
@@ -1487,6 +1489,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 #ifdef GGML_USE_CUDA
                     ggml_backend_synchronize(gpu);
                     ggml_backend_tensor_get(moe_weight_cache.kept_count, kept_host, 0, n_moe * sizeof(int32_t));
+
+                    prefetch_done = ggml_backend_event_new(gpu_dev);
 #endif
 
                     // Phase 1c: prefetch all layers. Hot path: kept ≤ max_kept → compact VRAM.
@@ -1527,7 +1531,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     dst_arr, src_arr, sb,
                                     moe_weight_cache.expert_mask_vec[il],
                                     moe_weight_cache.remap_vec[il],
-                                    nullptr, nullptr, gpu);
+                                    nullptr, prefetch_done, gpu);
                             }
 #endif
                         } else if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
@@ -1536,6 +1540,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             moe_weight_cache.kept_down[il] = nullptr;
                         }
                     }
+
+                    // Sync: stream 0 (Phase B) waits for stream 2 (prefetch H2D) to complete
+#ifdef GGML_USE_CUDA
+                    if (prefetch_done) {
+                        ggml_backend_event_wait(gpu, prefetch_done);
+                        ggml_backend_event_free(prefetch_done);
+                    }
+#endif
 
                     // Update sparsity stats
                     if (total_experts > 0) {
