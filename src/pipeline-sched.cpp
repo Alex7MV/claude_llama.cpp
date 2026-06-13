@@ -1099,6 +1099,7 @@ void llama_pipeline_sched_compute(struct llama_pipeline_sched * p, int n_layer) 
                     sc->expert_mask,
                     p->remap_tensor,
                     sc->moe_kept_count,
+                    0,                      // layer_idx (1-element kept tensor)
                     p->moe_threshold,
                     p->moe_floor,
                     p->backend);

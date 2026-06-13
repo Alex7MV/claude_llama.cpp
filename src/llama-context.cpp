@@ -1451,15 +1451,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 if (gpu) {
                     const int64_t n_layer = model.hparams.n_layer;
                     const int64_t n_layer_dense_lead = model.hparams.n_layer_dense_lead;
+                    const int first_il = (int)n_layer_dense_lead;
+                    const int n_moe = (int)n_layer - first_il;
                     int32_t total_kept = 0;
                     int32_t total_experts = 0;
 
-                    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
+                    GGML_ASSERT(n_moe <= 256);
+                    int32_t kept_host[256];
+                    memset(kept_host, 0, sizeof(kept_host));
+
+                    // Phase 1a: launch ALL threshold kernels asynchronously (no per-layer D2H sync)
+#ifdef GGML_USE_CUDA
+                    for (int il = first_il; il < (int)n_layer; il++) {
                         if (!moe_weight_cache.scratch_moe_ids[il] ||
                             !moe_weight_cache.scratch_moe_weights[il]) continue;
 
-                        // Launch cumulative threshold kernel on the GPU
-#ifdef GGML_USE_CUDA
                         ggml_backend_cuda_pipeline_moe_threshold(
                             moe_weight_cache.scratch_moe_ids[il],
                             moe_weight_cache.scratch_moe_weights[il],
@@ -1467,44 +1473,45 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             moe_weight_cache.expert_mask,
                             moe_weight_cache.remap,
                             moe_weight_cache.kept_count,
+                            il - first_il,  // layer_idx: which slot in kept_counts array
                             cparams.moe_threshold,
                             cparams.moe_floor,
                             gpu);
+                    }
 #else
-                        (void)gpu;
-                        int32_t kept = (int32_t)model.hparams.n_expert;
-                        moe_weight_cache.n_kept_last = kept;
-                        total_kept += kept;
-                        total_experts += (int32_t)model.hparams.n_expert;
-                        moe_weight_cache.compact_ready = false;
-                        continue;
+                    // Non-CUDA: all kept counts stay 0 → all layers fall back to DDR5
+                    (void)gpu;
 #endif
 
-                        // Sync kept_count D2H (4 bytes, ~1 microsecond)
-                        int32_t kept = 0;
-                        ggml_backend_tensor_get(moe_weight_cache.kept_count, &kept, 0, sizeof(int32_t));
+                    // Phase 1b: single batched D2H read of all kept_counts
+#ifdef GGML_USE_CUDA
+                    ggml_backend_tensor_get(moe_weight_cache.kept_count, kept_host, 0, n_moe * sizeof(int32_t));
+#endif
+
+                    // Phase 1c: process kept_counts → prefetch or DDR5 fallback
+                    for (int i = 0; i < n_moe; i++) {
+                        int il = first_il + i;
+                        if (!moe_weight_cache.scratch_moe_ids[il] ||
+                            !moe_weight_cache.scratch_moe_weights[il]) continue;
+
+                        int32_t kept = kept_host[i];
                         moe_weight_cache.n_kept_last = kept;
                         total_kept += kept;
                         total_experts += (int32_t)model.hparams.n_expert;
 
-                        // Fallback: if threshold kept more than compact buffer can hold,
-                        // skip prefetch and use original DDR5 weights for this layer
                         if (kept > moe_weight_cache.max_kept) {
+                            // Fallback: DDR5 weights (compact buffer too small for this layer)
                             LLAMA_LOG_DEBUG("layer %d: kept %d > max_kept %d, falling back to DDR5\n",
                                 il, kept, moe_weight_cache.max_kept);
                             moe_weight_cache.kept_gate[il] = nullptr;
                             moe_weight_cache.kept_up[il]   = nullptr;
                             moe_weight_cache.kept_down[il] = nullptr;
-                        }
-
-                        // Compact expert copy: kept experts DDR5 → VRAM
-                        if (kept > 0 && kept <= moe_weight_cache.max_kept &&
-                            (size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
+                        } else if (kept > 0 && (size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
+#ifdef GGML_USE_CUDA
                             auto * src_gate = model.layers[il].ffn_gate_exps;
                             auto * src_up   = model.layers[il].ffn_up_exps;
                             auto * src_down = model.layers[il].ffn_down_exps;
                             if (src_gate && src_up && src_down) {
-#ifdef GGML_USE_CUDA
                                 ggml_tensor * dst_arr[3] = {
                                     moe_weight_cache.kept_gate[il],
                                     moe_weight_cache.kept_up[il],
@@ -1516,20 +1523,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     ggml_row_size(src_up->type,   src_up->ne[0]   * src_up->ne[1]),
                                     ggml_row_size(src_down->type, src_down->ne[0] * src_down->ne[1])
                                 };
-                            ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                                dst_arr, src_arr, sb_arr,
-                                moe_weight_cache.expert_mask,
-                                moe_weight_cache.remap,
-                                nullptr,
-                                nullptr,
-                                gpu);
-#else
-                                (void)kept;
-                                (void)src_gate;
-                                (void)src_up;
-                                (void)src_down;
-#endif
+                                ggml_backend_cuda_pipeline_expert_skip_prefetch(
+                                    dst_arr, src_arr, sb_arr,
+                                    moe_weight_cache.expert_mask,
+                                    moe_weight_cache.remap,
+                                    nullptr,
+                                    nullptr,
+                                    gpu);
                             }
+#else
+                            (void)gpu;
+#endif
                         }
                     }
 
@@ -1539,7 +1543,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         moe_weight_cache.n_skipped_experts += (total_experts - total_kept);
                         moe_weight_cache.cumulative_sparsity =
                             100.0 * (double)moe_weight_cache.n_skipped_experts /
-                                   (double)moe_weight_cache.n_total_experts;
+                                    (double)moe_weight_cache.n_total_experts;
                         if (++moe_weight_cache.stats_counter % 10 == 0) {
                             LLAMA_LOG_INFO("MoE cumulative sparsity: %.1f%% (kept avg %.1f/%lld experts per batch)\n",
                                 moe_weight_cache.cumulative_sparsity,
@@ -1550,7 +1554,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     // compact_ready only if at least one layer has compact buffers
                     moe_weight_cache.compact_ready = false;
-                    for (int _il = (int)n_layer_dense_lead; _il < (int)n_layer; _il++) {
+                    for (int _il = first_il; _il < (int)n_layer; _il++) {
                         if ((size_t)_il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[_il]) {
                             moe_weight_cache.compact_ready = true;
                             break;
@@ -1891,10 +1895,11 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_expert_mask = (size_t)n_mask_words * sizeof(uint64_t);
     const size_t s_remap       = ggml_row_size(GGML_TYPE_I32, n_expert);
     const size_t s_kept_count  = ggml_row_size(GGML_TYPE_I32, 1);
-    const size_t total_threshold = s_expert_mask + s_remap + s_kept_count;
+    const size_t s_kept_counts = s_kept_count * n_moe_layers;
+    const size_t total_threshold = s_expert_mask + s_remap + s_kept_counts;
 
-    // Compact buffer: per-layer kept expert weights (hardcoded 4 to fit ~4500 MiB on 32 GB VRAM)
-    const int max_kept = 4;
+    // Compact buffer: per-layer kept expert weights (floor=3, so 3 slots = no fallback for typical case)
+    const int max_kept = 3;
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
     const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
@@ -1965,7 +1970,7 @@ void llama_context::init_moe_weight_cache() {
     // Threshold tensors
     moe_weight_cache.expert_mask = make_scratch_tensor(GGML_TYPE_I8, n_mask_words * (int64_t)sizeof(uint64_t), 1, 1, s_expert_mask);
     moe_weight_cache.remap       = make_scratch_tensor(GGML_TYPE_I32, n_expert, 1, 1, s_remap);
-    moe_weight_cache.kept_count  = make_scratch_tensor(GGML_TYPE_I32, 1, 1, 1, s_kept_count);
+    moe_weight_cache.kept_count  = make_scratch_tensor(GGML_TYPE_I32, (int)n_moe_layers, 1, 1, s_kept_counts);
 
     ggml_backend_synchronize(gpu);
 

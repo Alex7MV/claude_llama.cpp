@@ -116,13 +116,16 @@ GGML_BACKEND_API void ggml_backend_cuda_pipeline_expert_skip_prefetch(
 // Launched on compute stream after Phase A routing produces moe_ids/moe_weights.
 // Reads per-expert contributions, sorts descending, finds 0.95 threshold with
 // floor(3), builds skip_mask bitmask and remap table, renormalizes weights.
+// Hyper-sparse MoE: cumulative weight threshold kernel.
+// kept_counts is a 1D [n_layers] I32 tensor — each call writes to kept_counts[layer_idx].
 GGML_BACKEND_API void ggml_backend_cuda_pipeline_moe_threshold(
     struct ggml_tensor  * moe_ids,
     struct ggml_tensor  * moe_weights_in,
     struct ggml_tensor  * moe_weights_out,
     struct ggml_tensor  * skip_mask,
     struct ggml_tensor  * remap,
-    struct ggml_tensor  * kept_count,
+    struct ggml_tensor  * kept_counts,
+    int                   layer_idx,
     float                 threshold,
     int                   floor_experts,
     ggml_backend_t        backend);

@@ -620,7 +620,8 @@ void ggml_backend_cuda_pipeline_moe_threshold(
     struct ggml_tensor  * moe_weights_out,
     struct ggml_tensor  * skip_mask,
     struct ggml_tensor  * remap,
-    struct ggml_tensor  * kept_count,
+    struct ggml_tensor  * kept_counts,
+    int                   layer_idx,
     float                 threshold,
     int                   floor_experts,
     ggml_backend_t        backend) {
@@ -643,13 +644,16 @@ void ggml_backend_cuda_pipeline_moe_threshold(
     dim3 grid_dims(1, 1, 1);
     dim3 block_dims(32, 1, 1);
 
+    // kept_counts[layer_idx] = split (the number of kept experts)
+    int32_t * kept_ptr = (int32_t *)kept_counts->data + layer_idx;
+
     cumulative_threshold_kernel<<<grid_dims, block_dims, shmem_bytes, stream>>>(
         (const int32_t *)moe_ids->data,
         (const float   *)moe_weights_in->data,
         (float         *)moe_weights_out->data,
         (uint64_t      *)skip_mask->data,
         (int32_t       *)remap->data,
-        (int32_t       *)kept_count->data,
+        kept_ptr,
         n_tokens,
         n_expert_used,
         n_expert,
