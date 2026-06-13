@@ -1485,6 +1485,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     // Phase 1b: single batched D2H read of all kept_counts
 #ifdef GGML_USE_CUDA
+                    ggml_backend_synchronize(gpu);
                     ggml_backend_tensor_get(moe_weight_cache.kept_count, kept_host, 0, n_moe * sizeof(int32_t));
 #endif
 
