@@ -70,10 +70,10 @@ struct llama_moe_weight_cache {
     std::vector<ggml_tensor *> kept_up;    // [n_embd, n_ff_exp, max_kept]
     std::vector<ggml_tensor *> kept_down;  // [n_ff_exp, n_embd, max_kept]
 
-    // v2 threshold outputs (GPU scratch buffer; remap ≈1 KB D2H copy is negligible)
-    ggml_tensor * expert_mask  = nullptr;   // [ceil(n_expert/64)] u64 skip bitmask
-    ggml_tensor * remap        = nullptr;   // [n_expert] i32 original→compact slot
-    ggml_tensor * kept_count   = nullptr;   // [n_moe_layers] i32 kept counts
+    // v2 threshold outputs (per-layer: each threshold writes to its own slot)
+    std::vector<ggml_tensor *> expert_mask_vec; // [ceil(n_expert/64)] u64 skip bitmask per layer
+    std::vector<ggml_tensor *> remap_vec;       // [n_expert] i32 original→compact slot per layer
+    ggml_tensor * kept_count   = nullptr;       // [n_moe_layers] i32 kept counts
 
     // v2 per-layer sparsity tracking
     int32_t n_kept_last = 0;          // kept count from last threshold run

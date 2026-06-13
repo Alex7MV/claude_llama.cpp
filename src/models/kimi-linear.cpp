@@ -293,11 +293,12 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
             cb(cur, "ffn_norm", il);
 
-            if (moe_cache->compact_ready && (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il]) {
+            if (moe_cache->compact_ready && (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il] &&
+                (size_t)il < moe_cache->remap_vec.size() && moe_cache->remap_vec[il]) {
                 int64_t n_expert_used = hparams.n_expert_used;
                 ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
                 ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
-                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap, cached_ids);
+                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap_vec[il], cached_ids);
                 ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens);
                 ggml_tensor * moe_out = build_moe_ffn(cur, moe_cache->kept_up[il], moe_cache->kept_gate[il],
                     moe_cache->kept_down[il], moe_cache->max_kept, n_expert_used, LLM_FFN_SILU, il,
@@ -578,7 +579,8 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             // v2 Phase 2: compact FFN with cached routing
             if (build_phase == 2 && moe_cache && moe_cache->compact_ready &&
                 (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il] &&
-                moe_cache->scratch_moe_ids[il] && moe_cache->remap) {
+                moe_cache->scratch_moe_ids[il] &&
+                (size_t)il < moe_cache->remap_vec.size() && moe_cache->remap_vec[il]) {
 
                 int64_t n_expert_used = hparams.n_expert_used;
                 int64_t n_tokens_layer = n_tokens;
@@ -586,7 +588,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 // Remap original expert IDs → compact buffer slots
                 ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
                 ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
-                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap, cached_ids);
+                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap_vec[il], cached_ids);
                 cb(remapped_ids, "ffn_moe_remapped_ids", il);
 
                 // Reshape weights for cached-routing overload
