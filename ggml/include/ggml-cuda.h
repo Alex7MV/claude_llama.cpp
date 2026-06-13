@@ -108,6 +108,8 @@ GGML_BACKEND_API void ggml_backend_cuda_pipeline_expert_skip_prefetch(
     size_t                slice_bytes[3],
     struct ggml_tensor  * expert_mask,
     struct ggml_tensor  * moe_remap,
+    const uint64_t      * host_mask,
+    const int32_t       * host_remap,
     ggml_backend_event_t  moe_ready,
     ggml_backend_event_t  completion_event,
     ggml_backend_t        backend);

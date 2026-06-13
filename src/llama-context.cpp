@@ -1462,6 +1462,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     memset(kept_host, 0, sizeof(kept_host));
                     ggml_backend_event_t prefetch_done = nullptr;
 
+                    const int64_t nexp = model.hparams.n_expert;
+                    const size_t s_expert_mask = (size_t)((nexp + 63) / 64) * sizeof(uint64_t);
+                    const size_t s_remap = (size_t)nexp * sizeof(int32_t);
+                    const size_t total_mask_nbytes = (size_t)n_moe * s_expert_mask;
+                    const size_t total_remap_nbytes = (size_t)n_moe * s_remap;
+                    std::vector<uint64_t> host_masks_batch(total_mask_nbytes / sizeof(uint64_t));
+                    std::vector<int32_t> host_remaps_batch(total_remap_nbytes / sizeof(int32_t));
+
                     // Phase 1a: launch ALL threshold kernels back-to-back.
                     // Each writes to its own expert_mask_vec[il], remap_vec[il], kept_counts[il].
 #ifdef GGML_USE_CUDA
@@ -1485,11 +1493,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     (void)gpu;
 #endif
 
-                    // Phase 1b: single batched D2H read of all kept_counts
+                    // Phase 1b: batched D2H reads — all kept_counts, masks, remaps
 #ifdef GGML_USE_CUDA
                     ggml_backend_synchronize(gpu);
-                    ggml_backend_tensor_get(moe_weight_cache.kept_count, kept_host, 0, n_moe * sizeof(int32_t));
+                    {
+                        ggml_backend_cuda_set_stream(gpu, 2);
+                        cudaStream_t bs = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(gpu, 2);
 
+                        cudaMemcpyAsync(kept_host, moe_weight_cache.kept_count->data,
+                            n_moe * sizeof(int32_t), cudaMemcpyDeviceToHost, bs);
+                        cudaMemcpyAsync(host_masks_batch.data(),
+                            moe_weight_cache.expert_mask_vec[first_il]->data,
+                            total_mask_nbytes, cudaMemcpyDeviceToHost, bs);
+                        cudaMemcpyAsync(host_remaps_batch.data(),
+                            moe_weight_cache.remap_vec[first_il]->data,
+                            total_remap_nbytes, cudaMemcpyDeviceToHost, bs);
+
+                        cudaStreamSynchronize(bs);
+                        ggml_backend_cuda_set_stream(gpu, 0);
+                    }
                     prefetch_done = ggml_backend_event_new(gpu_dev);
 #endif
 
@@ -1527,10 +1549,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     ggml_row_size(su->type, su->ne[0] * su->ne[1]),
                                     ggml_row_size(sd->type, sd->ne[0] * sd->ne[1]),
                                 };
+                                const uint64_t * hm = host_masks_batch.data() + i * (s_expert_mask / sizeof(uint64_t));
+                                const int32_t  * hr = host_remaps_batch.data() + i * (s_remap / sizeof(int32_t));
                                 ggml_backend_cuda_pipeline_expert_skip_prefetch(
                                     dst_arr, src_arr, sb,
                                     moe_weight_cache.expert_mask_vec[il],
                                     moe_weight_cache.remap_vec[il],
+                                    hm, hr,
                                     nullptr, prefetch_done, gpu);
                             }
 #endif
@@ -1979,9 +2004,38 @@ void llama_context::init_moe_weight_cache() {
         moe_weight_cache.kept_gate[il] = make_scratch_tensor(ref_gate->type, ref_gate->ne[0], ref_gate->ne[1], max_kept, s_kept_gate);
         moe_weight_cache.kept_up[il]   = make_scratch_tensor(ref_up->type,   ref_up->ne[0],   ref_up->ne[1],   max_kept, s_kept_up);
         moe_weight_cache.kept_down[il] = make_scratch_tensor(ref_down->type, ref_down->ne[0], ref_down->ne[1], max_kept, s_kept_down);
-        // Per-layer threshold outputs — each threshold writes to its own slot
-        moe_weight_cache.expert_mask_vec[il] = make_scratch_tensor(GGML_TYPE_I8, n_mask_words * (int64_t)sizeof(uint64_t), 1, 1, s_expert_mask);
-        moe_weight_cache.remap_vec[il]       = make_scratch_tensor(GGML_TYPE_I32, n_expert, 1, 1, s_remap);
+    }
+
+    // Contiguous blocks for batched D2H of threshold outputs
+    const int first_moe = (int)n_layer_dense_lead;
+    ggml_tensor * masks_block = make_scratch_tensor(GGML_TYPE_I8,
+        n_mask_words * (int64_t)sizeof(uint64_t), (int)n_moe_layers, 1,
+        n_moe_layers * s_expert_mask);
+    ggml_tensor * remaps_block = make_scratch_tensor(GGML_TYPE_I32,
+        n_expert, (int)n_moe_layers, 1,
+        n_moe_layers * s_remap);
+
+    // Per-layer views into contiguous blocks
+    for (int il = first_moe; il < (int)n_layer; il++) {
+        int idx = il - first_moe;
+        moe_weight_cache.expert_mask_vec[il] = ggml_new_tensor_2d(
+            moe_weight_cache.ctx_scratch, GGML_TYPE_I8,
+            n_mask_words * (int64_t)sizeof(uint64_t), 1);
+        if (moe_weight_cache.expert_mask_vec[il]) {
+            moe_weight_cache.expert_mask_vec[il]->data =
+                (uint8_t *)masks_block->data + idx * s_expert_mask;
+            moe_weight_cache.expert_mask_vec[il]->buffer = moe_weight_cache.scratch_buf;
+            moe_weight_cache.expert_mask_vec[il]->flags |= GGML_TENSOR_FLAG_INPUT;
+        }
+        moe_weight_cache.remap_vec[il] = ggml_new_tensor_2d(
+            moe_weight_cache.ctx_scratch, GGML_TYPE_I32,
+            n_expert, 1);
+        if (moe_weight_cache.remap_vec[il]) {
+            moe_weight_cache.remap_vec[il]->data =
+                (uint8_t *)remaps_block->data + idx * s_remap;
+            moe_weight_cache.remap_vec[il]->buffer = moe_weight_cache.scratch_buf;
+            moe_weight_cache.remap_vec[il]->flags |= GGML_TENSOR_FLAG_INPUT;
+        }
     }
 
     // Threshold kept_counts array (batched D2H)

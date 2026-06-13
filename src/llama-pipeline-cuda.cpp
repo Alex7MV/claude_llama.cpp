@@ -21,6 +21,7 @@ static void deepseek_skip_prefetch_callback(
     ggml_backend_cuda_pipeline_expert_skip_prefetch(
         dst_tensors, src_tensors, slice_bytes,
         expert_mask, moe_remap,
+        NULL, NULL,
         moe_ready, completion_event, backend);
 }
 
