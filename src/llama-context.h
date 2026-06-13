@@ -85,7 +85,11 @@ struct llama_moe_weight_cache {
     int build_phase = 0;          // 0=full, 1=routing-only, 2=compact FFN
     bool populated = false;   // full cache populated
     bool compact_ready = false; // compact buffer has valid kept experts
-};
+    int compact_active = 0;   // 0 or 1: which compact buffer is used for Phase B compute
+    uint8_t * compact_base[2] = {nullptr, nullptr}; // base addresses in scratch_buf
+    size_t s_kept_gate = 0;  // bytes per layer for gate compact
+    size_t s_kept_up   = 0;  // bytes per layer for up compact
+    size_t per_layer_compact = 0; // s_kept_gate + s_kept_up + s_kept_down
 #endif
 
 struct llama_context {

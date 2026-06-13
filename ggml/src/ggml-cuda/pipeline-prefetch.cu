@@ -45,6 +45,11 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
 
     cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(backend, transfer_stream_id);
 
+    // Read n_expert from moe_remap shape: [n_expert] i32
+    int n_expert = (int)(ggml_nbytes(moe_remap) / (int)sizeof(int32_t));
+    size_t remap_nbytes = ggml_nbytes(moe_remap);
+    bool remap_alloc = false;
+
     // ---- Step 1: Read expert_mask from GPU → host (D2H async, tiny) ----
     // expert_mask is [ceil(n_expert/64)] u64 → max 9 uint64 = 72 bytes
     size_t mask_nbytes = ggml_nbytes(expert_mask);
@@ -63,12 +68,7 @@ void ggml_backend_cuda_pipeline_expert_skip_prefetch(
         cudaStreamSynchronize(stream);
     }
 
-    // Read n_expert from moe_remap shape: [n_expert] i32
-    int n_expert = (int)(ggml_nbytes(moe_remap) / (int)sizeof(int32_t));
-
     // ---- Step 2: Read moe_remap from GPU → host (also tiny) ----
-    size_t remap_nbytes = ggml_nbytes(moe_remap);
-    bool remap_alloc = false;
     int32_t * host_remap;
     if (host_remap_ptr) {
         host_remap = (int32_t *)host_remap_ptr;

@@ -1515,8 +1515,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     prefetch_done = ggml_backend_event_new(gpu_dev);
 #endif
 
-                    // Phase 1c: prefetch all layers. Hot path: kept ≤ max_kept → compact VRAM.
-                    // Cold path (kept > max_kept, rare): DDR5 fallback.
+                    // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
+                    //           then prefetch all layers. Hot path: kept ≤ max_kept → compact VRAM.
+                    //           Cold path (kept > max_kept, rare): DDR5 fallback.
+                    {
+                        const int active = moe_weight_cache.compact_active;
+                        const size_t skg = moe_weight_cache.s_kept_gate;
+                        const size_t sku = moe_weight_cache.s_kept_up;
+                        const size_t plc = moe_weight_cache.per_layer_compact;
+                        for (int _il = first_il, _idx = 0; _il < (int)n_layer; _il++, _idx++) {
+                            if ((size_t)_il < moe_weight_cache.kept_gate.size() && moe_weight_cache.kept_gate[_il]) {
+                                uint8_t * base = moe_weight_cache.compact_base[active] + _idx * plc;
+                                moe_weight_cache.kept_gate[_il]->data = base;
+                                moe_weight_cache.kept_up[_il]->data   = base + skg;
+                                moe_weight_cache.kept_down[_il]->data = base + skg + sku;
+                            }
+                        }
+                    }
                     for (int i = 0; i < n_moe; i++) {
                         int il = first_il + i;
                         if (!moe_weight_cache.scratch_moe_ids[il] ||
@@ -1641,6 +1656,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         return nullptr;
                     }
                 }
+
+                // Toggle compact buffer for next token's prefetch/FFN
+                moe_weight_cache.compact_active ^= 1;
 
                 // Restore kept_* pointers for next ubatch
                 moe_weight_cache.kept_gate = saved_kept_gate;
@@ -1946,7 +1964,7 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_down = slice_down * max_kept;
     const size_t total_compact = n_moe_layers * (s_kept_gate + s_kept_up + s_kept_down);
 
-    const size_t total_v2_sz = total_scratch + total_compact + total_threshold;
+    const size_t total_v2_sz = total_scratch + total_compact * 2 + total_threshold;
     moe_weight_cache.scratch_buf = ggml_backend_alloc_buffer(gpu, total_v2_sz);
     if (!moe_weight_cache.scratch_buf) {
         LLAMA_LOG_WARN("%s: failed to allocate v2 scratch+compact buffer (%zu MB total, max_kept=%d), falling back to single-phase DDR5\n",
@@ -1997,14 +2015,27 @@ void llama_context::init_moe_weight_cache() {
     moe_weight_cache.expert_mask_vec.resize(n_layer, nullptr);
     moe_weight_cache.remap_vec.resize(n_layer, nullptr);
 
+    // Pass 1: Non-compact per-layer scratch (routing + ffn_inp)
     for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
         moe_weight_cache.scratch_ffn_inp[il]    = make_scratch_tensor(GGML_TYPE_F32, hparams.n_embd, n_tokens, 1, s_ffn_inp);
         moe_weight_cache.scratch_moe_ids[il]     = make_scratch_tensor(GGML_TYPE_I32, n_expert_used, n_tokens, 1, s_moe_ids);
         moe_weight_cache.scratch_moe_weights[il] = make_scratch_tensor(GGML_TYPE_F32, n_expert_used, n_tokens, 1, s_moe_weights);
+    }
+
+    // Pass 2: Compact buffer A — per-layer kept expert weight tensors
+    moe_weight_cache.compact_base[0] = scratch_base + scratch_offset;
+    for (int il = (int)n_layer_dense_lead; il < (int)n_layer; il++) {
         moe_weight_cache.kept_gate[il] = make_scratch_tensor(ref_gate->type, ref_gate->ne[0], ref_gate->ne[1], max_kept, s_kept_gate);
         moe_weight_cache.kept_up[il]   = make_scratch_tensor(ref_up->type,   ref_up->ne[0],   ref_up->ne[1],   max_kept, s_kept_up);
         moe_weight_cache.kept_down[il] = make_scratch_tensor(ref_down->type, ref_down->ne[0], ref_down->ne[1], max_kept, s_kept_down);
     }
+    moe_weight_cache.s_kept_gate = s_kept_gate;
+    moe_weight_cache.s_kept_up   = s_kept_up;
+    moe_weight_cache.per_layer_compact = s_kept_gate + s_kept_up + s_kept_down;
+
+    // Pass 3: Compact buffer B — reserved space (no tensor objects, just advance offset)
+    moe_weight_cache.compact_base[1] = scratch_base + scratch_offset;
+    scratch_offset += n_moe_layers * moe_weight_cache.per_layer_compact;
 
     // Contiguous blocks for batched D2H of threshold outputs
     const int first_moe = (int)n_layer_dense_lead;
@@ -2043,7 +2074,7 @@ void llama_context::init_moe_weight_cache() {
 
     ggml_backend_synchronize(gpu);
 
-    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, max_kept=%d, pool=%zuMB (scratch=%zuMB + compact=%zuMB + threshold)\n",
+    LLAMA_LOG_INFO("%s: MoE cache initialized (v2 two-phase): %ld layers, max_kept=%d, pool=%zuMB (scratch=%zuMB + compact×2=%zuMB + threshold)\n",
         __func__, n_moe_layers, max_kept,
         total_v2_sz / (1024 * 1024),
         total_scratch / (1024 * 1024), total_compact / (1024 * 1024));
