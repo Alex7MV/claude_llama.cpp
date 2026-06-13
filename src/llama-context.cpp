@@ -1934,11 +1934,6 @@ void llama_context::init_moe_weight_cache() {
     auto * scratch_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.scratch_buf);
     size_t scratch_offset = 0;
 
-    // Align to 256 bits (32 bytes) for CUDA vectorized loads
-    auto align_offset = [&]() {
-        scratch_offset = (scratch_offset + 31) & ~(size_t)31;
-    };
-
     auto make_scratch_tensor = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, size_t sz) -> ggml_tensor * {
         ggml_tensor * t;
         if (ne2 > 1) {
@@ -1947,7 +1942,6 @@ void llama_context::init_moe_weight_cache() {
             t = ggml_new_tensor_2d(moe_weight_cache.ctx_scratch, type, ne0, ne1);
         }
         if (t) {
-            align_offset();
             t->data   = scratch_base + scratch_offset;
             t->buffer = moe_weight_cache.scratch_buf;
             t->flags |= GGML_TENSOR_FLAG_INPUT;
