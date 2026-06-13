@@ -278,6 +278,11 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
 
+        // Phase 4 per-layer pipeline: skip non-target layers
+        if (moe_cache && moe_cache->build_layer_only >= 0 && il != moe_cache->build_layer_only) {
+            continue;
+        }
+
 #ifdef LLAMA_DEEPSEEK_PIPELINE
         // Phase 2: skip dense layers (already computed in Phase 1),
         // skip attention for MoE layers, run compact FFN with cached routing.

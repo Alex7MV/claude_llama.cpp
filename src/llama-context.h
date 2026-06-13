@@ -90,6 +90,9 @@ struct llama_moe_weight_cache {
     size_t s_kept_gate = 0;  // bytes per layer for gate compact
     size_t s_kept_up   = 0;  // bytes per layer for up compact
     size_t per_layer_compact = 0; // s_kept_gate + s_kept_up + s_kept_down
+
+    // Phase 4: per-layer FFN graphs for async pipeline
+    int build_layer_only = -1; // -1 = all layers, else target MoE layer index
 };
 #endif
 

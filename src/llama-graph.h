@@ -694,6 +694,7 @@ struct llm_graph_params {
     // MoE two-phase graph building: set before constructing graph context
     struct llama_moe_weight_cache * moe_cache = nullptr;
     int build_phase = 0;
+    int build_layer_only = -1; // -1 = all layers, else target MoE layer index
 };
 
 class llm_graph_result {

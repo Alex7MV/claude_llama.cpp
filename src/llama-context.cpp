@@ -1524,8 +1524,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 #endif
 
                     // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
-                    //           then prefetch all layers. Hot path: kept ≤ max_kept → compact VRAM.
-                    //           Cold path (kept > max_kept, rare): DDR5 fallback.
+                    //           then warm-up prefetch for layer 0.
+                    //           Full per-layer prefetch is pipelined with Phase 4 compute below.
                     {
                         const int active = moe_weight_cache.compact_active;
                         const size_t skg = moe_weight_cache.s_kept_gate;
@@ -1540,31 +1540,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
                     }
-                    for (int i = 0; i < n_moe; i++) {
-                        int il = first_il + i;
-                        if (!moe_weight_cache.scratch_moe_ids[il] ||
-                            !moe_weight_cache.scratch_moe_weights[il]) continue;
-
-                        const int32_t kept = kept_host[i];
-                        moe_weight_cache.n_kept_last = kept;
-                        total_kept += kept;
-                        total_experts += (int32_t)model.hparams.n_expert;
-
-                        // Hot path: kept ≤ max_kept → expert_skip_prefetch → compact VRAM
-                        if (kept > 0 && kept <= moe_weight_cache.max_kept
-                            && moe_weight_cache.kept_up[il]
-                            && moe_weight_cache.expert_mask_vec[il]
-                            && moe_weight_cache.remap_vec[il])
+                    // Warm-up prefetch for layer 0 only; remaining layers prefetched during Phase 4 pipeline
+                    {
+                        const int i0 = 0, il0 = first_il + i0;
+                        const int32_t kept0 = kept_host[i0];
+                        if (kept0 > 0 && kept0 <= moe_weight_cache.max_kept
+                            && moe_weight_cache.kept_up[il0]
+                            && moe_weight_cache.expert_mask_vec[il0]
+                            && moe_weight_cache.remap_vec[il0])
                         {
 #ifdef GGML_USE_CUDA
-                            auto * sg = model.layers[il].ffn_gate_exps;
-                            auto * su = model.layers[il].ffn_up_exps;
-                            auto * sd = model.layers[il].ffn_down_exps;
+                            auto * sg = model.layers[il0].ffn_gate_exps;
+                            auto * su = model.layers[il0].ffn_up_exps;
+                            auto * sd = model.layers[il0].ffn_down_exps;
                             if (sg && su && sd) {
                                 ggml_tensor * dst_arr[] = {
-                                    moe_weight_cache.kept_gate[il],
-                                    moe_weight_cache.kept_up[il],
-                                    moe_weight_cache.kept_down[il]
+                                    moe_weight_cache.kept_gate[il0],
+                                    moe_weight_cache.kept_up[il0],
+                                    moe_weight_cache.kept_down[il0]
                                 };
                                 ggml_tensor * src_arr[] = { sg, su, sd };
                                 size_t sb[] = {
@@ -1572,32 +1565,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     ggml_row_size(su->type, su->ne[0] * su->ne[1]),
                                     ggml_row_size(sd->type, sd->ne[0] * sd->ne[1]),
                                 };
-                                const uint64_t * hm = host_masks_batch.data() + i * (s_expert_mask / sizeof(uint64_t));
-                                const int32_t  * hr = host_remaps_batch.data() + i * (s_remap / sizeof(int32_t));
+                                const uint64_t * hm0 = host_masks_batch.data() + 0 * (s_expert_mask / sizeof(uint64_t));
+                                const int32_t  * hr0 = host_remaps_batch.data() + 0 * (s_remap / sizeof(int32_t));
                                 ggml_backend_cuda_pipeline_expert_skip_prefetch(
                                     dst_arr, src_arr, sb,
-                                    moe_weight_cache.expert_mask_vec[il],
-                                    moe_weight_cache.remap_vec[il],
-                                    hm, hr,
+                                    moe_weight_cache.expert_mask_vec[il0],
+                                    moe_weight_cache.remap_vec[il0],
+                                    hm0, hr0,
                                     nullptr, prefetch_done, gpu);
                             }
 #endif
-                        } else if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
-                            moe_weight_cache.kept_gate[il] = nullptr;
-                            moe_weight_cache.kept_up[il]   = nullptr;
-                            moe_weight_cache.kept_down[il] = nullptr;
                         }
                     }
 
-                    // Sync: stream 0 (Phase B) waits for stream 2 (prefetch H2D) to complete
-#ifdef GGML_USE_CUDA
-                    if (prefetch_done) {
-                        ggml_backend_event_wait(gpu, prefetch_done);
-                        ggml_backend_event_free(prefetch_done);
-                    }
-#endif
+                    // Update sparsity stats and compact_ready from all layers
+                    moe_weight_cache.compact_ready = false;
+                    for (int i = 0; i < n_moe; i++) {
+                        int il = first_il + i;
+                        if (!moe_weight_cache.scratch_moe_ids[il] ||
+                            !moe_weight_cache.scratch_moe_weights[il]) continue;
 
-                    // Update sparsity stats
+                        const int32_t kept = kept_host[i];
+                        total_kept += kept;
+                        total_experts += (int32_t)model.hparams.n_expert;
+
+                        if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
+                            moe_weight_cache.kept_gate[il] = nullptr;
+                            moe_weight_cache.kept_up[il]   = nullptr;
+                            moe_weight_cache.kept_down[il] = nullptr;
+                        } else if ((size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
+                            moe_weight_cache.compact_ready = true;
+                        }
+                    }
                     if (total_experts > 0) {
                         moe_weight_cache.n_total_experts += total_experts;
                         moe_weight_cache.n_skipped_experts += (total_experts - total_kept);
@@ -1607,12 +1606,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (++moe_weight_cache.stats_counter % 10 == 0) {
                             LLAMA_LOG_INFO("MoE cumulative sparsity: %.1f%% (kept avg %.1f/%lld experts per batch)\n",
                                 moe_weight_cache.cumulative_sparsity,
-                                (double)total_kept / (double)((int)n_layer - (int)n_layer_dense_lead),
+                                (double)total_kept / (double)n_moe,
                                 (long long)model.hparams.n_expert);
                         }
                     }
 
-                    // compact_ready only if at least one layer has compact buffers
+                    // ---- Phase 4: Per-layer async pipeline ----
+                    // Overlap per-layer compact FFN compute (stream 0) with prefetch of next layer (stream 2)
+                    // using a single alternating event for synchronization.
+                    // Clear Phase 1 graph from res to avoid recomputing attention nodes.
+                    res->reset();
+                    {
+                    // Initialize compact_ready from per-layer nullptr states
                     moe_weight_cache.compact_ready = false;
                     for (int _il = first_il; _il < (int)n_layer; _il++) {
                         if ((size_t)_il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[_il]) {
@@ -1620,48 +1625,150 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             break;
                         }
                     }
-                }
 
-                // ---- Phase 2: build compact FFN graph ----
-                // Clear Phase 1 graph nodes to prevent attention set_rows from leaking into
-                // the compact FFN graph.  Scratch data (routing results, ffn_inp) lives in
-                // moe_weight_cache, not in res, so it survives the reset.
-                res->reset();
-                moe_weight_cache.build_phase = 2;
-                gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+                    const int n_moe_pipe = (int)n_layer - (int)n_layer_dense_lead;
+                    int total_kept_pipe = 0;
+                    int total_exp_pipe = 0;
 
-                if (!gf) {
-                    LLAMA_LOG_ERROR("%s: failed to initialize Phase 2 graph\n", __func__);
-                    // Restore kept_* pointers for next ubatch (will retry)
-                    moe_weight_cache.kept_gate = saved_kept_gate;
-                    moe_weight_cache.kept_up   = saved_kept_up;
-                    moe_weight_cache.kept_down = saved_kept_down;
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
-                }
-                ggml_backend_sched_reset(sched.get());
-                if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-                    LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
-                    // Restore kept_* pointers for next ubatch (will retry)
-                    moe_weight_cache.kept_gate = saved_kept_gate;
-                    moe_weight_cache.kept_up   = saved_kept_up;
-                    moe_weight_cache.kept_down = saved_kept_down;
-                    ret = GGML_STATUS_ALLOC_FAILED;
-                    return nullptr;
-                }
+                    // Build, allocate, and execute per-layer pipeline
+                    ggml_backend_event_t pipe_event = prefetch_done; // reuse warm-up event
 
-                res->set_inputs(&ubatch);
+                    for (int i = 0; i < n_moe_pipe; i++) {
+                        int il = first_il + i;
+                        const int32_t kept = kept_host[i];
+                        total_kept_pipe += kept;
+                        total_exp_pipe += (int32_t)model.hparams.n_expert;
 
-                {
-                    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-                    if (status != GGML_STATUS_SUCCESS) {
-                        LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
-                        // Restore kept_* pointers for next ubatch (will retry)
-                        moe_weight_cache.kept_gate = saved_kept_gate;
-                        moe_weight_cache.kept_up   = saved_kept_up;
-                        moe_weight_cache.kept_down = saved_kept_down;
-                        ret = status;
-                        return nullptr;
+                        bool is_last = (i == n_moe_pipe - 1);
+                        bool use_compact = (kept > 0 && kept <= moe_weight_cache.max_kept
+                            && moe_weight_cache.kept_up[il]
+                            && moe_weight_cache.expert_mask_vec[il]
+                            && moe_weight_cache.remap_vec[il]);
+
+                        // Wait for THIS layer's prefetch to complete
+                        if (i > 0) {
+                            // Wait for event from previous layer's prefetch
+                            ggml_backend_event_wait(gpu, pipe_event);
+                        }
+                        // For i == 0: warm-up prefetch event already recorded in prefetch_done.
+                        // If skipped, event is unrecorded — wait is harmless (CUDA returns immediately
+                        // if event never recorded, but skip_prefetch wasn't called so no data needed).
+
+                        // Build and execute per-layer compact FFN graph
+                        bool should_compute = use_compact || kept <= moe_weight_cache.max_kept;
+                        if (should_compute) {
+                            moe_weight_cache.build_layer_only = il;
+                            moe_weight_cache.build_phase = 2;
+
+                            // Non-last layers use a temp result to avoid overwriting res
+                            llm_graph_result layer_res(GGML_DEFAULT_GRAPH_SIZE);
+                            llm_graph_result * compute_res = is_last ? res : &layer_res;
+                            llm_graph_params pipe_params = gparams;
+                            pipe_params.res = compute_res;
+                            pipe_params.moe_cache = &moe_weight_cache;
+
+                            ggml_cgraph * layer_gf = model.build_graph(
+                                pipe_params, nullptr, nullptr, &moe_weight_cache);
+
+                                if (!layer_gf) {
+                                LLAMA_LOG_ERROR("%s: failed to build Phase 4 layer %d graph\n", __func__, il);
+                                moe_weight_cache.kept_gate = saved_kept_gate;
+                                moe_weight_cache.kept_up   = saved_kept_up;
+                                moe_weight_cache.kept_down = saved_kept_down;
+                                if (pipe_event) {
+                                    ggml_backend_event_free(pipe_event);
+                                }
+                                ret = GGML_STATUS_FAILED;
+                                return nullptr;
+                            }
+
+                            ggml_backend_sched_reset(sched.get());
+                            if (!ggml_backend_sched_alloc_graph(sched.get(), layer_gf)) {
+                                LLAMA_LOG_ERROR("%s: failed to allocate Phase 4 layer %d graph\n", __func__, il);
+                                moe_weight_cache.kept_gate = saved_kept_gate;
+                                moe_weight_cache.kept_up   = saved_kept_up;
+                                moe_weight_cache.kept_down = saved_kept_down;
+                                if (pipe_event) {
+                                    ggml_backend_event_free(pipe_event);
+                                }
+                                ret = GGML_STATUS_ALLOC_FAILED;
+                                return nullptr;
+                            }
+
+                            compute_res->set_inputs(&ubatch);
+
+                            {
+                                const auto status = graph_compute(layer_gf, ubatch.n_tokens > 1);
+                                if (status != GGML_STATUS_SUCCESS) {
+                                    LLAMA_LOG_ERROR("%s: Phase 4 layer %d compute failed: %d\n", __func__, il, status);
+                                    moe_weight_cache.kept_gate = saved_kept_gate;
+                                    moe_weight_cache.kept_up   = saved_kept_up;
+                                    moe_weight_cache.kept_down = saved_kept_down;
+                                    if (pipe_event) {
+                                        ggml_backend_event_free(pipe_event);
+                                    }
+                                    ret = status;
+                                    return nullptr;
+                                }
+                            }
+
+                            moe_weight_cache.build_layer_only = -1;
+                        }
+
+                        // Prefetch next layer's weights (H2D on stream 2) while current layer computes
+                        if (i + 1 < n_moe_pipe) {
+                            int il_next = first_il + i + 1;
+                            const int32_t kept_next = kept_host[i + 1];
+
+                            if (kept_next > 0 && kept_next <= moe_weight_cache.max_kept
+                                && moe_weight_cache.kept_up[il_next]
+                                && moe_weight_cache.expert_mask_vec[il_next]
+                                && moe_weight_cache.remap_vec[il_next])
+                            {
+#ifdef GGML_USE_CUDA
+                                auto * sg = model.layers[il_next].ffn_gate_exps;
+                                auto * su = model.layers[il_next].ffn_up_exps;
+                                auto * sd = model.layers[il_next].ffn_down_exps;
+                                if (sg && su && sd) {
+                                    ggml_tensor * dst_arr[] = {
+                                        moe_weight_cache.kept_gate[il_next],
+                                        moe_weight_cache.kept_up[il_next],
+                                        moe_weight_cache.kept_down[il_next]
+                                    };
+                                    ggml_tensor * src_arr[] = { sg, su, sd };
+                                    size_t sb[] = {
+                                        ggml_row_size(sg->type, sg->ne[0] * sg->ne[1]),
+                                        ggml_row_size(su->type, su->ne[0] * su->ne[1]),
+                                        ggml_row_size(sd->type, sd->ne[0] * sd->ne[1]),
+                                    };
+                                    const uint64_t * hm_n = host_masks_batch.data() + (i + 1) * (s_expert_mask / sizeof(uint64_t));
+                                    const int32_t  * hr_n = host_remaps_batch.data() + (i + 1) * (s_remap / sizeof(int32_t));
+                                    ggml_backend_cuda_pipeline_expert_skip_prefetch(
+                                        dst_arr, src_arr, sb,
+                                        moe_weight_cache.expert_mask_vec[il_next],
+                                        moe_weight_cache.remap_vec[il_next],
+                                        hm_n, hr_n,
+                                        nullptr, pipe_event, gpu);
+                                }
+#endif
+                            }
+                        }
+                    }
+
+                    // Free the pipelining event (created in Phase 1b as prefetch_done).
+                    // All waits are satisfied by this point (each i > 0 waited before compute;
+                    // the last prefetch recorded but no subsequent compute needs to wait).
+                    if (pipe_event) {
+                        ggml_backend_event_free(pipe_event);
+                    }
+
+                    // Update sparsity stats
+                    if (total_exp_pipe > 0) {
+                        moe_weight_cache.n_total_experts += total_exp_pipe;
+                        moe_weight_cache.n_skipped_experts += (total_exp_pipe - total_kept_pipe);
+                        moe_weight_cache.cumulative_sparsity =
+                            100.0 * (double)moe_weight_cache.n_skipped_experts /
+                                    (double)moe_weight_cache.n_total_experts;
                     }
                 }
 
@@ -1675,7 +1782,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                 ret = GGML_STATUS_SUCCESS;
                 return res;
-            } else
+            }
+        }
 #endif
         {
             // Single-phase: full graph (v1 cache or original weights)

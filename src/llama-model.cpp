@@ -2136,6 +2136,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params, struct l
     if (moe_cache) {
         params_copy.moe_cache   = moe_cache;
         params_copy.build_phase = moe_cache->build_phase;
+        params_copy.build_layer_only = moe_cache->build_layer_only;
     }
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params_copy);
 
