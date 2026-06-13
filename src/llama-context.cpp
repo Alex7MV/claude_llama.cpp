@@ -1488,52 +1488,47 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ggml_backend_tensor_get(moe_weight_cache.kept_count, kept_host, 0, n_moe * sizeof(int32_t));
 #endif
 
-                    // Phase 1c: prefetch all layers sequentially (shared CUDA stream 2
-                    // serializes H2D copies anyway; per-layer expert_mask/remap are independent).
+                    // Phase 1c: prefetch all layers. Hot path: kept ≤ max_kept → compact VRAM.
+                    // Cold path (kept > max_kept, rare): DDR5 fallback.
                     for (int i = 0; i < n_moe; i++) {
                         int il = first_il + i;
                         if (!moe_weight_cache.scratch_moe_ids[il] ||
                             !moe_weight_cache.scratch_moe_weights[il]) continue;
 
-                        int32_t kept = kept_host[i];
+                        const int32_t kept = kept_host[i];
                         moe_weight_cache.n_kept_last = kept;
                         total_kept += kept;
                         total_experts += (int32_t)model.hparams.n_expert;
 
-                        if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
-                            // Fallback: DDR5 weights
-                            LLAMA_LOG_DEBUG("layer %d: kept %d > max_kept %d, falling back to DDR5\n",
-                                il, kept, moe_weight_cache.max_kept);
-                            moe_weight_cache.kept_gate[il] = nullptr;
-                            moe_weight_cache.kept_up[il]   = nullptr;
-                            moe_weight_cache.kept_down[il] = nullptr;
-                        } else if (kept > 0 && moe_weight_cache.kept_up[il]
+                        // Hot path: kept ≤ max_kept → expert_skip_prefetch → compact VRAM
+                        if (kept > 0 && kept <= moe_weight_cache.max_kept
+                            && moe_weight_cache.kept_up[il]
                             && moe_weight_cache.expert_mask_vec[il]
-                            && moe_weight_cache.remap_vec[il]) {
+                            && moe_weight_cache.remap_vec[il])
+                        {
 #ifdef GGML_USE_CUDA
-                            auto * src_gate = model.layers[il].ffn_gate_exps;
-                            auto * src_up   = model.layers[il].ffn_up_exps;
-                            auto * src_down = model.layers[il].ffn_down_exps;
-                            if (src_gate && src_up && src_down) {
-                                size_t sb[3] = {
-                                    ggml_row_size(src_gate->type, src_gate->ne[0] * src_gate->ne[1]),
-                                    ggml_row_size(src_up->type,   src_up->ne[0]   * src_up->ne[1]),
-                                    ggml_row_size(src_down->type, src_down->ne[0] * src_down->ne[1]),
+                            auto * sg = model.layers[il].ffn_gate_exps;
+                            auto * su = model.layers[il].ffn_up_exps;
+                            auto * sd = model.layers[il].ffn_down_exps;
+                            if (sg && su && sd) {
+                                const size_t sb[3] = {
+                                    ggml_row_size(sg->type, sg->ne[0] * sg->ne[1]),
+                                    ggml_row_size(su->type, su->ne[0] * su->ne[1]),
+                                    ggml_row_size(sd->type, sd->ne[0] * sd->ne[1]),
                                 };
                                 ggml_backend_cuda_pipeline_expert_skip_prefetch(
                                     (ggml_tensor *[3]){ moe_weight_cache.kept_gate[il],
                                         moe_weight_cache.kept_up[il], moe_weight_cache.kept_down[il] },
-                                    (ggml_tensor *[3]){ src_gate, src_up, src_down },
-                                    sb,
-                                    moe_weight_cache.expert_mask_vec[il],  // per-layer mask
-                                    moe_weight_cache.remap_vec[il],        // per-layer remap
-                                    nullptr,
-                                    nullptr,
-                                    gpu);
+                                    (ggml_tensor *[3]){ sg, su, sd }, sb,
+                                    moe_weight_cache.expert_mask_vec[il],
+                                    moe_weight_cache.remap_vec[il],
+                                    nullptr, nullptr, gpu);
                             }
-#else
-                            (void)gpu;
 #endif
+                        } else if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
+                            moe_weight_cache.kept_gate[il] = nullptr;
+                            moe_weight_cache.kept_up[il]   = nullptr;
+                            moe_weight_cache.kept_down[il] = nullptr;
                         }
                     }
 
@@ -1898,8 +1893,8 @@ void llama_context::init_moe_weight_cache() {
     const size_t s_kept_counts = s_kept_count * n_moe_layers;
     const size_t total_threshold = n_moe_layers * (s_expert_mask + s_remap) + s_kept_counts;
 
-    // Compact buffer: per-layer kept expert weights (floor=3, so 3 slots = no fallback for typical case)
-    const int max_kept = 3;
+    // Compact buffer: per-layer kept expert weights (6 slots ≈ 7-8 GB pool, fits RTX 5090 32 GB with 15.2 GB model + KV)
+    const int max_kept = 6;
     moe_weight_cache.max_kept = max_kept;
     const size_t slice_gate = ggml_row_size(ref_gate->type, ref_gate->ne[0] * ref_gate->ne[1]);
     const size_t slice_up   = ggml_row_size(ref_up->type,   ref_up->ne[0]   * ref_up->ne[1]);
@@ -1935,6 +1930,11 @@ void llama_context::init_moe_weight_cache() {
     auto * scratch_base = (uint8_t *)ggml_backend_buffer_get_base(moe_weight_cache.scratch_buf);
     size_t scratch_offset = 0;
 
+    // Align to 256 bits (32 bytes) for CUDA vectorized loads
+    auto align_offset = [&]() {
+        scratch_offset = (scratch_offset + 31) & ~(size_t)31;
+    };
+
     auto make_scratch_tensor = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, size_t sz) -> ggml_tensor * {
         ggml_tensor * t;
         if (ne2 > 1) {
@@ -1943,6 +1943,7 @@ void llama_context::init_moe_weight_cache() {
             t = ggml_new_tensor_2d(moe_weight_cache.ctx_scratch, type, ne0, ne1);
         }
         if (t) {
+            align_offset();
             t->data   = scratch_base + scratch_offset;
             t->buffer = moe_weight_cache.scratch_buf;
             t->flags |= GGML_TENSOR_FLAG_INPUT;
