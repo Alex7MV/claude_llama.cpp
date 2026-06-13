@@ -31,6 +31,14 @@ extern "C" {
     void ggml_bw_pipeline_gpu_dispatch(void * user_data, const struct ggml_pipeline_slot_info * slot);
     void * ggml_bw_pipeline_get_stream(void);
 }
+
+// Forward declarations for CUDA runtime API used in MoE weight cache (D2H transfers).
+// ggml-cuda.h returns cudaStream_t as void* to avoid exposing CUDA types, so we follow the same pattern.
+extern "C" {
+    int cudaMemcpyAsync(void * dst, const void * src, size_t count, int kind, void * stream);
+    int cudaStreamSynchronize(void * stream);
+}
+constexpr int cudaMemcpyDeviceToHost = 2;
 #endif
 
 
@@ -1498,7 +1506,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     ggml_backend_synchronize(gpu);
                     {
                         ggml_backend_cuda_set_stream(gpu, 2);
-                        cudaStream_t bs = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(gpu, 2);
+                        void * bs = ggml_backend_cuda_get_stream_ptr(gpu, 2);
 
                         cudaMemcpyAsync(kept_host, moe_weight_cache.kept_count->data,
                             n_moe * sizeof(int32_t), cudaMemcpyDeviceToHost, bs);
