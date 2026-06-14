@@ -1520,6 +1520,51 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         cudaStreamSynchronize(bs);
                         ggml_backend_cuda_set_stream(gpu, 0);
                     }
+                    // Sanity check: verify all kept expert indices are within [0, nexp + shared_bias)
+                    // Builds inverse remap (compact slot → original expert ID) from the
+                    // forward remap (expert ID → compact slot) produced by the threshold kernel.
+                    // Clamps any OOB index to 0 to prevent silent GPU OOB in subsequent set_rows.
+                    // shared_bias = 1 if the model has a separate shared expert that could appear
+                    // as an additional index in the MoE weight tensor (index == nexp).
+                    {
+                        // Verify weight tensor dimensionality matches nexp
+                        if (n_moe > 0 && (size_t)first_il < model.layers.size() && model.layers[first_il].ffn_gate_exps) {
+                            const int wexpert = (int)model.layers[first_il].ffn_gate_exps->ne[2];
+                            if (wexpert != (int)nexp) {
+                                fprintf(stderr, "WARN: nexp=%lld but weight tensor ne[2]=%d, adjusting bound\n",
+                                    (long long)nexp, wexpert);
+                            }
+                        }
+                        const int64_t shared_bias = (model.hparams.n_expert_shared > 0) ? 1 : 0;
+                        const int max_expert = (int)(nexp + shared_bias);
+                        const int n_mask_words = (int)((nexp + 63) / 64);
+                        for (int _i_sa = 0; _i_sa < n_moe; _i_sa++) {
+                            const int32_t kept_il = kept_host[_i_sa];
+                            if (kept_il <= 0) continue;
+                            const int32_t * layer_remap_sa = host_remaps_batch.data() + _i_sa * nexp;
+                            const uint64_t * layer_mask_sa = host_masks_batch.data() + _i_sa * n_mask_words;
+                            std::vector<int32_t> expert_for_slot(kept_il, -1);
+                            for (int _e = 0; _e < (int)nexp; _e++) {
+                                if (_e / 64 >= n_mask_words) break;
+                                bool skipped = (layer_mask_sa[_e / 64] >> (_e % 64)) & 1ULL;
+                                if (!skipped) {
+                                    int slot = layer_remap_sa[_e];
+                                    if (slot >= 0 && slot < kept_il) {
+                                        expert_for_slot[slot] = _e;
+                                    }
+                                }
+                            }
+                            for (int _j = 0; _j < kept_il; _j++) {
+                                int eid = expert_for_slot[_j];
+                                if (eid < 0 || eid >= max_expert) {
+                                    fprintf(stderr, "ALARM: Layer %d, Slot %d, Bad Index %d (clamped to 0)\n",
+                                        first_il + _i_sa, _j, eid);
+                                    expert_for_slot[_j] = 0;
+                                }
+                            }
+                        }
+                    }
+
                     prefetch_done = ggml_backend_event_new(gpu_dev);
 #endif
 
@@ -1645,6 +1690,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         && model.layers[first_il].ffn_up_exps
                         && model.layers[first_il].ffn_down_exps;
 
+                    // Synchronize GPU before accessing threshold kernel outputs in graph.
+                    // Phase 1 compute + threshold kernels ran on stream 0, synced at line 1506,
+                    // but add a final sync here to ensure ALL GPU writes (including renormalized
+                    // weights in scratch_moe_weights) are visible before Phase 2 compute dispatches.
+                    ggml_backend_synchronize(gpu);
+
                     // Build, allocate, and execute per-layer pipeline
                     ggml_backend_event_t pipe_event = prefetch_done; // reuse warm-up event
                     // Wait for warm-up prefetch (stream 2) before i=0 compute (stream 0)
@@ -1680,7 +1731,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         // For i > 0: pipe_event was recorded by the previous layer's prefetch on stream 2.
 
                         // Build and execute per-layer compact FFN graph
-                        bool should_compute = use_compact || (kept > 0 && kept <= moe_weight_cache.max_kept);
+                        // NOTE: when kept == 0 there are ZERO experts to select;
+                        // set_rows in the routing code would receive dst->ne[1] == 0 and crash.
+                        // Explicitly guard against this case.
+                        bool should_compute = (kept > 0) && (use_compact || (kept <= moe_weight_cache.max_kept));
                         // Last layer always computes to produce logits (DDR5 fallback if compact unavailable)
                         if (is_last && !should_compute) {
                             should_compute = true;
