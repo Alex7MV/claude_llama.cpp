@@ -1589,7 +1589,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         total_kept += kept;
                         total_experts += (int32_t)model.hparams.n_expert;
 
-                        if (kept > moe_weight_cache.max_kept && moe_weight_cache.kept_up[il]) {
+                        if ((kept == 0 || kept > moe_weight_cache.max_kept) && moe_weight_cache.kept_up[il]) {
                             moe_weight_cache.kept_gate[il] = nullptr;
                             moe_weight_cache.kept_up[il]   = nullptr;
                             moe_weight_cache.kept_down[il] = nullptr;
@@ -1627,17 +1627,42 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
 
                     const int n_moe_pipe = (int)n_layer - (int)n_layer_dense_lead;
-                    int total_kept_pipe = 0;
-                    int total_exp_pipe = 0;
+
+                    // NOTE: Semi-static graph — build_graph is called per-layer inside the loop.
+                    // Each iteration creates a fresh ~100-node sub-graph via build_graph +
+                    // sched_reset + sched_alloc_graph. This adds ~0.2ms CPU overhead per layer.
+                    // For 58 MoE layers: ~11ms per decode. Future optimization: cache per-layer
+                    // graphs with persistent ggml_context and skip rebuild on topology match.
+
+                    // Determine whether warm-up prefetch actually ran
+                    // Must match all conditions in the warm-up block (lines ~1547–1578)
+                    const bool warmup_did_prefetch =
+                        kept_host[0] > 0 && kept_host[0] <= moe_weight_cache.max_kept
+                        && moe_weight_cache.kept_up[first_il]
+                        && moe_weight_cache.expert_mask_vec[first_il]
+                        && moe_weight_cache.remap_vec[first_il]
+                        && model.layers[first_il].ffn_gate_exps
+                        && model.layers[first_il].ffn_up_exps
+                        && model.layers[first_il].ffn_down_exps;
 
                     // Build, allocate, and execute per-layer pipeline
                     ggml_backend_event_t pipe_event = prefetch_done; // reuse warm-up event
+                    // Wait for warm-up prefetch (stream 2) before i=0 compute (stream 0)
+                    // Only wait if event was actually recorded — unrecorded event blocks CPU forever
+                    if (prefetch_done && warmup_did_prefetch) {
+                        ggml_backend_event_wait(gpu, prefetch_done);
+                    }
+
+                    // Track whether pipe_event has ever been recorded (warm-up or in-loop)
+                    // Used to avoid event_wait on unrecorded event which deadlocks CPU
+                    bool pipe_event_recorded = warmup_did_prefetch;
+
+                    // Single temp result for non-last layers (object pooling)
+                    llm_graph_result tmp_res(GGML_DEFAULT_GRAPH_SIZE);
 
                     for (int i = 0; i < n_moe_pipe; i++) {
                         int il = first_il + i;
                         const int32_t kept = kept_host[i];
-                        total_kept_pipe += kept;
-                        total_exp_pipe += (int32_t)model.hparams.n_expert;
 
                         bool is_last = (i == n_moe_pipe - 1);
                         bool use_compact = (kept > 0 && kept <= moe_weight_cache.max_kept
@@ -1646,23 +1671,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             && moe_weight_cache.remap_vec[il]);
 
                         // Wait for THIS layer's prefetch to complete
-                        if (i > 0) {
+                        // Only wait if event was recorded — unrecorded event blocks CPU forever
+                        if (i > 0 && pipe_event && pipe_event_recorded) {
                             // Wait for event from previous layer's prefetch
                             ggml_backend_event_wait(gpu, pipe_event);
                         }
-                        // For i == 0: warm-up prefetch event already recorded in prefetch_done.
-                        // If skipped, event is unrecorded — wait is harmless (CUDA returns immediately
-                        // if event never recorded, but skip_prefetch wasn't called so no data needed).
+                        // For i == 0: warm-up prefetch already waited above — skip redundant wait.
+                        // For i > 0: pipe_event was recorded by the previous layer's prefetch on stream 2.
 
                         // Build and execute per-layer compact FFN graph
-                        bool should_compute = use_compact || kept <= moe_weight_cache.max_kept;
+                        bool should_compute = use_compact || (kept > 0 && kept <= moe_weight_cache.max_kept);
+                        // Last layer always computes to produce logits (DDR5 fallback if compact unavailable)
+                        if (is_last && !should_compute) {
+                            should_compute = true;
+                        }
                         if (should_compute) {
                             moe_weight_cache.build_layer_only = il;
                             moe_weight_cache.build_phase = 2;
 
-                            // Non-last layers use a temp result to avoid overwriting res
-                            llm_graph_result layer_res(GGML_DEFAULT_GRAPH_SIZE);
-                            llm_graph_result * compute_res = is_last ? res : &layer_res;
+                            // Non-last layers reuse tmp_res (object pooling)
+                            if (!is_last) tmp_res.reset();
+                            llm_graph_result * compute_res = is_last ? res : &tmp_res;
                             llm_graph_params pipe_params = gparams;
                             pipe_params.res = compute_res;
                             pipe_params.moe_cache = &moe_weight_cache;
@@ -1695,7 +1724,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 return nullptr;
                             }
 
-                            compute_res->set_inputs(&ubatch);
+                            // Phase 2 sub-graphs only reference scratch tensors and weights,
+                            // never input tensors (embd, pos, kv_mask) — skip set_inputs
+                            if (moe_weight_cache.build_phase != 2) {
+                                compute_res->set_inputs(&ubatch);
+                            }
 
                             {
                                 const auto status = graph_compute(layer_gf, ubatch.n_tokens > 1);
@@ -1749,6 +1782,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                         moe_weight_cache.remap_vec[il_next],
                                         hm_n, hr_n,
                                         nullptr, pipe_event, gpu);
+                                    pipe_event_recorded = true;
                                 }
 #endif
                             }
@@ -1762,14 +1796,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         ggml_backend_event_free(pipe_event);
                     }
 
-                    // Update sparsity stats
-                    if (total_exp_pipe > 0) {
-                        moe_weight_cache.n_total_experts += total_exp_pipe;
-                        moe_weight_cache.n_skipped_experts += (total_exp_pipe - total_kept_pipe);
-                        moe_weight_cache.cumulative_sparsity =
-                            100.0 * (double)moe_weight_cache.n_skipped_experts /
-                                    (double)moe_weight_cache.n_total_experts;
-                    }
+                    // Sparsity stats already updated in pre-loop above — avoid double-count
                 }
 
                 // Toggle compact buffer for next token's prefetch/FFN
