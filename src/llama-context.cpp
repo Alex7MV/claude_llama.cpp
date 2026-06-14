@@ -1372,6 +1372,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    auto force_inputs_to_cpu = [&](struct ggml_cgraph * g) -> void {
+        if (!backend_cpu) return;
+        for (int i = 0; i < g->n_leafs; i++) {
+            if (g->leafs[i]->flags & GGML_TENSOR_FLAG_INPUT) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), g->leafs[i], backend_cpu);
+            }
+        }
+    };
+
     if (!graph_reuse_disable && !cparams.moe_two_phase && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1422,6 +1431,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     return nullptr;
                 }
                 ggml_backend_sched_reset(sched.get());
+                force_inputs_to_cpu(gf);
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate Phase 1 graph\n", __func__);
                     ret = GGML_STATUS_ALLOC_FAILED;
@@ -1766,6 +1776,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
 
                             ggml_backend_sched_reset(sched.get());
+                            force_inputs_to_cpu(layer_gf);
                             if (!ggml_backend_sched_alloc_graph(sched.get(), layer_gf)) {
                                 LLAMA_LOG_ERROR("%s: failed to allocate Phase 4 layer %d graph\n", __func__, il);
                                 moe_weight_cache.kept_gate = saved_kept_gate;
@@ -1923,6 +1934,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        force_inputs_to_cpu(gf);
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
