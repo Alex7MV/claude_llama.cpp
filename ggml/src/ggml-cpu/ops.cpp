@@ -4776,7 +4776,17 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            static int warn_count = 0;
+            if (warn_count < 10) {
+                fprintf(stderr, "WARN: get_rows_q OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld\n",
+                        (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                        (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+                        (long long)i01, (long long)ne01);
+                warn_count++;
+            }
+            continue;
+        }
 
         dequantize_row_q(
                 (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -4817,7 +4827,17 @@ static void ggml_compute_forward_get_rows_f16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            static int warn_count = 0;
+            if (warn_count < 10) {
+                fprintf(stderr, "WARN: get_rows_f16 OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld\n",
+                        (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                        (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+                        (long long)i01, (long long)ne01);
+                warn_count++;
+            }
+            continue;
+        }
 
         ggml_cpu_fp16_to_fp32(
             (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -4858,7 +4878,17 @@ static void ggml_compute_forward_get_rows_bf16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            static int warn_count = 0;
+            if (warn_count < 10) {
+                fprintf(stderr, "WARN: get_rows_bf16 OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld\n",
+                        (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                        (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+                        (long long)i01, (long long)ne01);
+                warn_count++;
+            }
+            continue;
+        }
 
         ggml_cpu_bf16_to_fp32(
             (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -4899,7 +4929,17 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            static int warn_count = 0;
+            if (warn_count < 10) {
+                fprintf(stderr, "WARN: get_rows OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld\n",
+                        (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                        (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+                        (long long)i01, (long long)ne01);
+                warn_count++;
+            }
+            continue;
+        }
 
         ggml_vec_cpy_f32(nc,
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
