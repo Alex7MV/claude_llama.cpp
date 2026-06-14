@@ -1458,6 +1458,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                 res->set_inputs(&ubatch);
 
+                // Sync GPU before compute to ensure prior CUDA work is visible
+                // before CPU set_rows/get_rows OOB diagnostics
+                ggml_backend_sched_synchronize(sched.get());
                 {
                     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
                     if (status != GGML_STATUS_SUCCESS) {
@@ -1663,10 +1666,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         total_experts += (int32_t)model.hparams.n_expert;
 
                         if ((kept == 0 || kept > moe_weight_cache.max_kept) && moe_weight_cache.kept_up[il]) {
-                            moe_weight_cache.kept_gate[il] = nullptr;
-                            moe_weight_cache.kept_up[il]   = nullptr;
-                            moe_weight_cache.kept_down[il] = nullptr;
-                        } else if ((size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
+                            // FIXME: temporarily disabled for debugging
+                            //moe_weight_cache.kept_gate[il] = nullptr;
+                            //moe_weight_cache.kept_up[il]   = nullptr;
+                            //moe_weight_cache.kept_down[il] = nullptr;
+                        }
+                        if ((size_t)il < moe_weight_cache.kept_up.size() && moe_weight_cache.kept_up[il]) {
                             moe_weight_cache.compact_ready = true;
                         }
                     }
@@ -1759,10 +1764,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         // For i > 0: pipe_event was recorded by the previous layer's prefetch on stream 2.
 
                         // Build and execute per-layer compact FFN graph
-                        // NOTE: when kept == 0 there are ZERO experts to select;
-                        // set_rows in the routing code would receive dst->ne[1] == 0 and crash.
-                        // Explicitly guard against this case.
-                        bool should_compute = (kept > 0) && (use_compact || (kept <= moe_weight_cache.max_kept));
+                        // NOTE: when kept == 0 the compact buffer has ZERO rows,
+                        //       the FFN build_lora_mm_id will read 0 weights → no-op.
+                        // FIXME: temporarily disabled kept==0 guard for debugging
+                        bool should_compute = true
+                            && (use_compact || (kept <= moe_weight_cache.max_kept));
                         // Last layer always computes to produce logits (DDR5 fallback if compact unavailable)
                         if (is_last && !should_compute) {
                             should_compute = true;
@@ -1813,6 +1819,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 compute_res->set_inputs(&ubatch);
                             }
 
+                            ggml_backend_sched_synchronize(sched.get());
                             {
                                 const auto status = graph_compute(layer_gf, ubatch.n_tokens > 1);
                                 if (status != GGML_STATUS_SUCCESS) {
@@ -1970,6 +1977,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+
+        // Debug: verify k_idxs is written correctly before GPU attention reads it
+        if (backend_cpu) {
+            for (auto & inp : res->inputs) {
+                auto * base = inp.get();
+                ggml_tensor * t = nullptr;
+                if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) t = akv->self_k_idxs;
+                else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) t = ak->self_k_idxs;
+                else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) t = dsa->self_k_idxs_mla;
+                if (t && t->data) {
+                    int64_t * d = (int64_t *)t->data;
+                    int64_t n = t->ne[0];
+                    fprintf(stderr, "DBG: k_idxs[0..%lld] = %lld %lld %lld\n",
+                            (long long)n-1,
+                            (long long)(n>0?d[0]:0),
+                            (long long)(n>1?d[1]:0),
+                            (long long)(n>2?d[2]:0));
+                }
+            }
+        }
     }
 
 #ifdef LLAMA_DEEPSEEK_PIPELINE
@@ -2004,6 +2031,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 #endif
 
+    ggml_backend_sched_synchronize(sched.get());
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
