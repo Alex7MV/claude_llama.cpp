@@ -1372,11 +1372,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    auto force_inputs_to_cpu = [&](struct ggml_cgraph * g) -> void {
+    auto force_idxs_to_cpu = [&]() -> void {
         if (!backend_cpu) return;
-        for (int i = 0; i < g->n_leafs; i++) {
-            if (g->leafs[i]->flags & GGML_TENSOR_FLAG_INPUT) {
-                ggml_backend_sched_set_tensor_backend(sched.get(), g->leafs[i], backend_cpu);
+        auto force = [&](ggml_tensor * t) {
+            if (t) ggml_backend_sched_set_tensor_backend(sched.get(), t, backend_cpu);
+        };
+        for (auto & inp : res->inputs) {
+            auto * base = inp.get();
+            if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
+                force(akv->self_k_idxs); force(akv->self_v_idxs);
+            } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
+                force(ak->self_k_idxs);
+            } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
+                force(dsa->self_k_idxs_mla); force(dsa->self_k_idxs_lid);
+            } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
+                force(iswa->self_k_idxs); force(iswa->self_v_idxs);
+                force(iswa->self_k_idxs_swa); force(iswa->self_v_idxs_swa);
+            } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
+                force(hyb->inp_attn->self_k_idxs); force(hyb->inp_attn->self_v_idxs);
+            } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
+                force(hybk->inp_attn->self_k_idxs);
+            } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
+                force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
+                force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
             }
         }
     };
@@ -1431,7 +1449,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     return nullptr;
                 }
                 ggml_backend_sched_reset(sched.get());
-                force_inputs_to_cpu(gf);
+                force_idxs_to_cpu();
                 if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                     LLAMA_LOG_ERROR("%s: failed to allocate Phase 1 graph\n", __func__);
                     ret = GGML_STATUS_ALLOC_FAILED;
@@ -1776,7 +1794,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
 
                             ggml_backend_sched_reset(sched.get());
-                            force_inputs_to_cpu(layer_gf);
+                            force_idxs_to_cpu();
                             if (!ggml_backend_sched_alloc_graph(sched.get(), layer_gf)) {
                                 LLAMA_LOG_ERROR("%s: failed to allocate Phase 4 layer %d graph\n", __func__, il);
                                 moe_weight_cache.kept_gate = saved_kept_gate;
@@ -1935,7 +1953,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        force_inputs_to_cpu(gf);
+        force_idxs_to_cpu();
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
