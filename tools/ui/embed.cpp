@@ -122,11 +122,16 @@ int main(int argc, char ** argv) {
             if (!read_file(path, bytes)) {
                 return 1;
             }
-            cpp += fmt("static const unsigned char asset_%d_data[] = {", i);
-            append_bytes_hex(cpp, bytes);
+            if (!bytes.empty()) {
+                cpp += fmt("static const unsigned char asset_%d_data[] = {", i);
+                append_bytes_hex(cpp, bytes);
+                cpp += "};\n";
+            } else {
+                cpp += fmt("static const unsigned char * asset_%d_data = nullptr;\n", i);
+            }
             const auto hash = fnv_hash(bytes.data(), bytes.size());
 
-            cpp += fmt("};\nstatic const size_t        asset_%d_size = %lu;\n",
+            cpp += fmt("static const size_t        asset_%d_size = %lu;\n",
                        i, static_cast<unsigned long>(bytes.size()));
             cpp += fmt("static const char        asset_%d_etag[] = \"\\\"0x%016lx\\\"\";\n\n",
                        i, static_cast<unsigned long>(hash));
