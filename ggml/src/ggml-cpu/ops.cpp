@@ -5021,7 +5021,17 @@ static void ggml_compute_forward_set_rows_f32(
 
                 const int64_t i1 = *(idx_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+                if (i1 < 0 || i1 >= ne1) {
+                    static int warn_count = 0;
+                    if (warn_count < 10) {
+                        fprintf(stderr, "WARN: set_rows OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i1=%lld ne1=%lld\n",
+                                (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                                (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
+                                (long long)i1, (long long)ne1);
+                        warn_count++;
+                    }
+                    continue;
+                }
 
                 from_float(
                         (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),

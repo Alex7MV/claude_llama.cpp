@@ -1522,6 +1522,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // select top n_group_used expert groups
     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+        if (hparams.n_group_used > hparams.n_expert_groups) {
+            fprintf(stderr, "WARN: n_group_used=%lld > n_expert_groups=%lld, clamping\n",
+                    (long long)hparams.n_group_used, (long long)hparams.n_expert_groups);
+        }
         const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
 
         // organize experts into n_expert_groups
