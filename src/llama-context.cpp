@@ -1395,6 +1395,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
                 force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
                 force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
+            } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
+                force(oid->out_ids);
             }
         }
     };
