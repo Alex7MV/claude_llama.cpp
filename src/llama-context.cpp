@@ -1739,7 +1739,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         }
                         moe_weight_cache.phase2_sched = ggml_backend_sched_new(
                             be_vec.data(), buft_vec.data(), nbe,
-                            4096, cparams.pipeline_parallel, cparams.op_offload);
+                            32768, cparams.pipeline_parallel, cparams.op_offload);
                         LLAMA_LOG_INFO("%s: created dedicated Phase 2 scheduler\n", __func__);
                     }
 
