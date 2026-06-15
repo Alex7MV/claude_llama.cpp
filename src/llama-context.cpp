@@ -1603,10 +1603,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
 
                     prefetch_done = ggml_backend_event_new(gpu_dev);
-                    const int64_t t_rb_done = ggml_time_us();
 #endif
 
-                    // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
+                // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
                     //           then prefetch ALL layers (no pipelining — single Phase 2 graph).
                     {
                         const int active = moe_weight_cache.compact_active;
