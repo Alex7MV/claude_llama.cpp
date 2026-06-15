@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
+#include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 
@@ -96,6 +97,9 @@ struct llama_moe_weight_cache {
 
     // Phase 2 cached graph reuse (generation only, n_tokens==1)
     ggml_cgraph * phase2_gf = nullptr;
+    ggml_tensor * phase2_t_logits = nullptr;
+    ggml_tensor * phase2_t_embd   = nullptr;
+    std::vector<llm_graph_input_ptr> phase2_inputs;
 };
 #endif
 
