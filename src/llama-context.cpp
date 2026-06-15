@@ -1623,7 +1623,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         }
                     }
                     // Prefetch ALL MoE layers (synchronous — single Phase 2 graph uses all compact buffers)
-                    for (int _i = 0; _i < n_moe_pipe; _i++) {
+                    for (int _i = 0; _i < n_moe; _i++) {
                         const int _il = first_il + _i;
                         const int32_t _kept = kept_host[_i];
                         if (_kept > 0 && _kept <= (int32_t)moe_weight_cache.max_kept
