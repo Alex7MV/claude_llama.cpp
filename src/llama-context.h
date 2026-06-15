@@ -107,7 +107,7 @@ struct llama_moe_weight_cache {
     void * cuda_graph_exec = nullptr; // cudaGraphExec_t
     bool   cuda_graph_captured = false;
 #endif
-    bool   cuda_graph_mode = true; // disable compact_active toggle, use graph replay
+    bool   cuda_graph_mode = false; // requires stable tensor ptrs — broken by sched_reset
 };
 #endif
 
