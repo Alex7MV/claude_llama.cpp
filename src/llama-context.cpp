@@ -1439,6 +1439,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (want_moe_cache && cparams.moe_two_phase && !cparams.warmup && moe_weight_cache.populated &&
                 moe_weight_cache.scratch_ffn_inp.size() > 0 && !want_pipeline) {
 
+                const int64_t t_p1_start = ggml_time_us();
                 LLAMA_LOG_INFO("%s: Phase 1 start (%d tokens, %d experts_used)\n", __func__, (int)ubatch.n_tokens, (int)model.hparams.n_expert_used);
 
                 // ---- Phase 1: build routing+attention graph ----
@@ -1471,7 +1472,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         return nullptr;
                     }
                 }
-                LLAMA_LOG_INFO("%s: Phase 1 compute OK\n", __func__);
+                const int64_t t_p1_compute = ggml_time_us();
+                LLAMA_LOG_INFO("%s: Phase 1 OK (%ld us)\n", __func__, t_p1_compute - t_p1_start);
 
                 // ---- Threshold + Expert Fetch ----
                 LLAMA_LOG_INFO("%s: threshold+fetch start\n", __func__);
@@ -1510,6 +1512,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const size_t total_remap_nbytes = (size_t)n_moe * s_remap;
                     std::vector<uint64_t> host_masks_batch(total_mask_nbytes / sizeof(uint64_t));
                     std::vector<int32_t> host_remaps_batch(total_remap_nbytes / sizeof(int32_t));
+
+                    const int64_t t_rb_start = ggml_time_us();
 
                     // Phase 1a: launch ALL threshold kernels back-to-back.
                     // Each writes to its own expert_mask_vec[il], remap_vec[il], kept_counts[il].
@@ -1599,6 +1603,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
 
                     prefetch_done = ggml_backend_event_new(gpu_dev);
+                    const int64_t t_rb_done = ggml_time_us();
 #endif
 
                     // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
@@ -1654,6 +1659,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 #endif
                         }
                     }
+                    const int64_t t_rb_prefetch = ggml_time_us();
+                    LLAMA_LOG_INFO("%s: readback+prefetch %ld us\n", __func__, t_rb_prefetch - t_rb_start);
 
                     // Update sparsity stats and compact_ready from all layers
                     moe_weight_cache.compact_ready = false;
@@ -1694,14 +1701,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     // Build ONE graph that processes ALL layers (dense + MoE),
                     // with attention + compact FFN for MoE layers.
                     // inpL propagates correctly through the layer loop.
-                    res->reset();
                     {
+                    const int64_t t_p2_start = ggml_time_us();
+
                     // Wait for ALL prefetches to complete before building graph
                     if (prefetch_done) {
                         ggml_backend_event_wait(gpu, prefetch_done);
                         ggml_backend_event_free(prefetch_done);
                         prefetch_done = nullptr;
                     }
+                    const int64_t t_p2_wait = ggml_time_us();
+
+                    // Build, alloc, compute
+                    res->reset();
 
                     ggml_backend_sched_reset(sched.get());
 
@@ -1710,6 +1722,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     ggml_cgraph * phase2_gf = model.build_graph(
                         gparams, nullptr, nullptr, &moe_weight_cache);
+                    const int64_t t_p2_build = ggml_time_us();
 
                     if (!phase2_gf) {
                         LLAMA_LOG_ERROR("%s: failed to build Phase 2 graph\n", __func__);
@@ -1730,6 +1743,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         ret = GGML_STATUS_ALLOC_FAILED;
                         return nullptr;
                     }
+                    const int64_t t_p2_alloc = ggml_time_us();
 
                     // Single graph includes attention which needs input tensors (embd, pos)
                     res->set_inputs(&ubatch);
@@ -1746,8 +1760,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             return nullptr;
                         }
                     }
-
-                    LLAMA_LOG_INFO("%s: Phase 2 compute OK (%d layers)\n", __func__, (int)(n_layer - n_layer_dense_lead));
+                    const int64_t t_p2_done = ggml_time_us();
+                    LLAMA_LOG_INFO("phase2_timing: wait=%ld build=%ld alloc=%ld compute=%ld total=%ld us\n",
+                        t_p2_wait - t_p2_start,
+                        t_p2_build - t_p2_wait,
+                        t_p2_alloc - t_p2_build,
+                        t_p2_done - t_p2_alloc,
+                        t_p2_done - t_p2_start);
 
                     // Sparsity stats already updated in pre-loop above — avoid double-count
                 }

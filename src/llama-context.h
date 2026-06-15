@@ -93,6 +93,9 @@ struct llama_moe_weight_cache {
 
     // Phase 4: per-layer FFN graphs for async pipeline
     int build_layer_only = -1; // -1 = all layers, else target MoE layer index
+
+    // Phase 2 cached graph reuse (generation only, n_tokens==1)
+    ggml_cgraph * phase2_gf = nullptr;
 };
 #endif
 
