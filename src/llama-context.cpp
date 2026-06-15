@@ -1810,6 +1810,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         res->set_inputs(&ubatch);
 
                         if (do_capture) {
+                            // Clear INPUT flags on all tensors to avoid
+                            // ggml_backend_event_synchronize during capture
+                            for (int i = 0; i < phase2_gf->n_nodes; i++) {
+                                if (phase2_gf->nodes[i]) phase2_gf->nodes[i]->flags &= ~GGML_TENSOR_FLAG_INPUT;
+                            }
+                            for (int i = 0; i < phase2_gf->n_leafs; i++) {
+                                if (phase2_gf->leafs[i]) phase2_gf->leafs[i]->flags &= ~GGML_TENSOR_FLAG_INPUT;
+                            }
+
                             // CUDA graph capture on dedicated scheduler
                             void* stream = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_cuda_set_stream(gpu, 0);
