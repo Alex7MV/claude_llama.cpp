@@ -283,63 +283,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             continue;
         }
 
-#ifdef LLAMA_DEEPSEEK_PIPELINE
-        // Phase 2: skip dense layers (already computed in Phase 1),
-        // skip attention for MoE layers, run compact FFN with cached routing.
-        if (build_phase == 2) {
-            if ((uint32_t)il < hparams.n_layer_dense_lead) {
-                // Dense layer: full output from Phase 1 passes through unchanged
-                continue;
-            }
-            if (!moe_cache || (size_t)il >= moe_cache->scratch_ffn_inp.size() || !moe_cache->scratch_ffn_inp[il]) {
-                continue;
-            }
-            ggml_tensor * ffn_inp = moe_cache->scratch_ffn_inp[il];
-            cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
-            cb(cur, "ffn_norm", il);
 
-            if (moe_cache->compact_ready && (size_t)il < moe_cache->kept_up.size() && moe_cache->kept_up[il] &&
-                (size_t)il < moe_cache->remap_vec.size() && moe_cache->remap_vec[il]) {
-                int64_t n_expert_used = hparams.n_expert_used;
-                ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
-                ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
-                ggml_tensor * remapped_ids = ggml_get_rows(ctx0, moe_cache->remap_vec[il], cached_ids);
-                ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens);
-                ggml_tensor * moe_out = build_moe_ffn(cur, moe_cache->kept_up[il], moe_cache->kept_gate[il],
-                    moe_cache->kept_down[il], moe_cache->max_kept, n_expert_used, LLM_FFN_SILU, il,
-                    remapped_ids, cached_w_3d, layer.ffn_gate_up_exps,
-                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s);
-                ggml_tensor * ffn_shexp = build_ffn(cur, layer.ffn_up_shexp, NULL, NULL,
-                    layer.ffn_gate_shexp, NULL, NULL, layer.ffn_down_shexp, NULL, NULL,
-                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-                cur = ggml_add(ctx0, moe_out, ffn_shexp);
-                cur = ggml_add(ctx0, cur, ffn_inp);
-                cur = build_cvec(cur, il);
-                cb(cur, "l_out", il);
-                inpL = cur;
-            } else if ((size_t)il < moe_cache->scratch_moe_ids.size() && moe_cache->scratch_moe_ids[il]) {
-                // Fallback: no compact buffer, use original DDR5 weights with cached routing
-                int64_t n_expert_used = hparams.n_expert_used;
-                ggml_tensor * cached_ids = moe_cache->scratch_moe_ids[il];
-                ggml_tensor * cached_w = moe_cache->scratch_moe_weights[il];
-                ggml_tensor * cached_w_3d = ggml_reshape_3d(ctx0, cached_w, 1, n_expert_used, n_tokens);
-                ggml_tensor * moe_out = build_moe_ffn(cur,
-                    layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps,
-                    hparams.n_expert, n_expert_used, LLM_FFN_SILU, il,
-                    cached_ids, cached_w_3d, layer.ffn_gate_up_exps,
-                    layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s);
-                ggml_tensor * ffn_shexp = build_ffn(cur, layer.ffn_up_shexp, NULL, NULL,
-                    layer.ffn_gate_shexp, NULL, NULL, layer.ffn_down_shexp, NULL, NULL,
-                    NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-                cur = ggml_add(ctx0, moe_out, ffn_shexp);
-                cur = ggml_add(ctx0, cur, ffn_inp);
-                cur = build_cvec(cur, il);
-                cb(cur, "l_out", il);
-                inpL = cur;
-            }
-            continue;
-        }
-#endif
 
         // Attention Norm
         cur = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
@@ -545,16 +489,9 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         cb(ffn_inp, "ffn_inp", il);
 
 #ifdef LLAMA_DEEPSEEK_PIPELINE
-        // v2 two-phase: Phase 1 saves ffn_inp to scratch; Phase 2 reads it back
-        if (build_phase == 2 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
+        // Phase 1: save ffn_inp to scratch for Phase 2 (only used for routing data now)
+        if (build_phase == 1 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
             moe_cache->scratch_ffn_inp[il]) {
-            // Phase 2: skip attention, read saved ffn_inp from Phase 1 scratch
-            ffn_inp = moe_cache->scratch_ffn_inp[il];
-            // inpSA is unused in Phase 2 (no residual needed here for attention)
-            cur = ffn_inp; // start FFN from saved input
-        } else if (build_phase == 1 && moe_cache && (size_t)il < moe_cache->scratch_ffn_inp.size() &&
-                   moe_cache->scratch_ffn_inp[il]) {
-            // Phase 1: save ffn_inp to scratch for Phase 2
             // Scratch buffer is sized for max ubatch; use view to match current n_tokens
             ggml_tensor * dst_ffn_inp = ggml_view_2d(ctx0, moe_cache->scratch_ffn_inp[il],
                 n_embd, n_tokens,
