@@ -4,6 +4,7 @@
 #include "ggml-backend-pipeline.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+#include <cuda_runtime.h>
 #endif
 #include "llama-arch.h"
 #include "llama-graph.h"
