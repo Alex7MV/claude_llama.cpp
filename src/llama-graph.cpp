@@ -224,11 +224,6 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
         for (int i = 0; i < n_tokens; ++i) {
             data[i] = i;
         }
-
-        fprintf(stderr, "%s: DEBUG inp_out_ids=%s data=%p ne0=%lld n_tokens=%lld first4=[%d %d %d %d]\n", __func__,
-            out_ids->name, (void*)out_ids->data, (long long)out_ids->ne[0],
-            (long long)n_tokens, data[0], data[1], data[2], data[3]);
-
         return;
     }
 
@@ -241,10 +236,6 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
             data[n_outputs++] = i;
         }
     }
-
-    fprintf(stderr, "%s: DEBUG inp_out_ids=%s data=%p ne0=%lld n_tokens=%lld n_outputs=%d first4=[%d %d %d %d]\n", __func__,
-        out_ids->name, (void*)out_ids->data, (long long)out_ids->ne[0],
-        (long long)n_tokens, n_outputs, data[0], data[1], data[2], data[3]);
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
