@@ -1744,7 +1744,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
 
                     // Sparsity stats already updated in pre-loop above — avoid double-count
-                }
 
                 // Toggle compact buffer for next token's prefetch/FFN
                 moe_weight_cache.compact_active ^= 1;
