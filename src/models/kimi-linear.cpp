@@ -283,20 +283,6 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             continue;
         }
 
-        // Phase 2 attention skip: read ffn_inp from Phase 1 scratch, bypass attention ops
-        ggml_tensor * ffn_inp = nullptr;
-        if (build_phase == 2 && moe_cache && moe_cache->skip_phase2_attn &&
-            (size_t)il < moe_cache->scratch_ffn_inp.size() && moe_cache->scratch_ffn_inp[il]) {
-            ffn_inp = ggml_view_2d(ctx0, moe_cache->scratch_ffn_inp[il],
-                n_embd, n_tokens,
-                moe_cache->scratch_ffn_inp[il]->nb[1], 0);
-            if (il == n_layer - 1 && inp_out_ids) {
-                ffn_inp = ggml_get_rows(ctx0, ffn_inp, inp_out_ids);
-            }
-            cb(ffn_inp, "ffn_inp_scratch", il);
-            goto phase2_skip_attn_done;
-        }
-
 
 
         // Attention Norm
@@ -499,7 +485,7 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         }
 
         // Residual → ffn_inp (input to FFN)
-        ffn_inp = ggml_add(ctx0, cur, inpSA);
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
 #ifdef LLAMA_DEEPSEEK_PIPELINE
@@ -513,8 +499,6 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, ffn_inp, dst_ffn_inp));
         }
 #endif
-
-phase2_skip_attn_done:
 
         // FFN Norm
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
