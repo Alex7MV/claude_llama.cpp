@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-backend.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -4932,10 +4933,15 @@ static void ggml_compute_forward_get_rows_f32(
         if (i01 < 0 || i01 >= ne01) {
             static int warn_count = 0;
             if (warn_count < 10) {
-                fprintf(stderr, "WARN: get_rows OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld\n",
+                const int32_t * s1d = (const int32_t *)src1->data;
+                const char * buf_name = src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "NULL";
+                fprintf(stderr, "WARN: get_rows OOB: dst=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] i01=%lld ne01=%lld | src1=%s data=%p buf=%s ne10=%lld nb10=%lld ne11=%lld first4=[%d %d %d %d]\n",
                         (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
                         (long long)ne00, (long long)ne01, (long long)ne02, (long long)ne03,
-                        (long long)i01, (long long)ne01);
+                        (long long)i01, (long long)ne01,
+                        src1->name, (void*)src1->data, buf_name,
+                        (long long)ne10, (long long)nb10, (long long)ne11,
+                        s1d ? s1d[0] : -1, s1d ? s1d[1] : -1, s1d ? s1d[2] : -1, s1d ? s1d[3] : -1);
                 warn_count++;
             }
             continue;

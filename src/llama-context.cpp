@@ -1397,6 +1397,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
             } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
                 force(oid->out_ids);
+                auto * bt = ggml_backend_sched_get_tensor_backend(sched.get(), oid->out_ids);
+                fprintf(stderr, "%s: DEBUG force_idxs_to_cpu inp_out_ids=%s data=%p ne0=%lld backend=%s\n", __func__,
+                    oid->out_ids->name, (void*)oid->out_ids->data,
+                    (long long)oid->out_ids->ne[0],
+                    bt ? ggml_backend_name(bt) : "NULL");
             }
         }
     };
