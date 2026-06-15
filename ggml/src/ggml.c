@@ -7289,15 +7289,6 @@ int ggml_graph_n_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->n_nodes;
 }
 
-int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
-    return cgraph->n_leafs;
-}
-
-struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
-    if (i < 0) return cgraph->leafs[cgraph->n_leafs + i];
-    return cgraph->leafs[i];
-}
-
 void ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
     GGML_ASSERT(cgraph->size > cgraph->n_nodes);
     cgraph->nodes[cgraph->n_nodes] = tensor;
