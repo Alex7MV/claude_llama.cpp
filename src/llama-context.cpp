@@ -4,7 +4,21 @@
 #include "ggml-backend-pipeline.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
-#include <cuda_runtime.h>
+
+// Minimal CUDA graph API declarations (cuda_runtime.h not in include path)
+typedef void* cudaGraph_t;
+typedef void* cudaGraphExec_t;
+#define cudaSuccess 0
+#define cudaStreamCaptureModeGlobal 0
+
+extern "C" {
+int  cudaStreamBeginCapture(void* stream, int mode);
+int  cudaStreamEndCapture(void* stream, cudaGraph_t* pGraph);
+int  cudaGraphInstantiate(cudaGraphExec_t* pExec, cudaGraph_t graph, const char*, const char*, unsigned int);
+int  cudaGraphLaunch(cudaGraphExec_t exec, void* stream);
+int  cudaGraphDestroy(cudaGraph_t graph);
+const char* cudaGetErrorString(int error);
+}
 #endif
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -1751,7 +1765,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const bool do_capture = (ubatch.n_tokens == 1 && moe_weight_cache.cuda_graph_mode);
                     if (do_capture && moe_weight_cache.cuda_graph_captured) {
                         // Replay captured CUDA graph
-                        cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                        void* stream = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         ggml_backend_cuda_set_stream(gpu, 0);
                         auto cuda_err = cudaGraphLaunch((cudaGraphExec_t)moe_weight_cache.cuda_graph_exec, stream);
                         if (cuda_err != cudaSuccess) {
@@ -1764,10 +1778,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                         if (do_capture && !moe_weight_cache.cuda_graph_captured) {
                             // First generation token — try to capture
-                            cudaStream_t stream = (cudaStream_t)ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                            void* stream = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_cuda_set_stream(gpu, 0);
 
-                            cudaError_t cuda_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+                            int cuda_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
                             if (cuda_err == cudaSuccess) {
                                 const auto status = graph_compute(phase2_gf, false);
                                 if (status != GGML_STATUS_SUCCESS) {
