@@ -2109,6 +2109,7 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
     ggml_set_input(cur);
+    ggml_set_output(cur); // prevent gallocr from aliasing this memory with MoE routing scratch
 
     res->add_input(std::move(inp));
 
