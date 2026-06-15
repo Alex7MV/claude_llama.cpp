@@ -101,14 +101,6 @@ struct llama_moe_weight_cache {
     ggml_tensor * phase2_t_embd   = nullptr;
     std::vector<llm_graph_input_ptr> phase2_inputs;
     bool   skip_phase2_attn = false; // skip attention in Phase 2 — use Phase 1 ffn_inp (experimental)
-
-    // CUDA graph capture for Phase 2 (generation only, n_tokens == 1)
-#ifdef GGML_USE_CUDA
-    void * cuda_graph_exec = nullptr; // cudaGraphExec_t
-    bool   cuda_graph_captured = false;
-    ggml_backend_sched_t phase2_sched = nullptr; // dedicated scheduler (stable allocations)
-#endif
-    bool   cuda_graph_mode = true; // enable CUDA graph capture + replay
 };
 #endif
 
