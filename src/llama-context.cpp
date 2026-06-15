@@ -2697,8 +2697,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
 #ifdef GGML_USE_CUDA
-                // CUDA graph replay may detect null backend — use saved DMA pointer
-                if (!backend_res && moe_weight_cache.phase2_logits_data) {
+                // CUDA graph replay: use direct cudaMemcpy (buffer type may mismatch)
+                if (moe_weight_cache.cuda_graph_captured && moe_weight_cache.phase2_logits_data) {
                     cudaMemcpy(logits_out, moe_weight_cache.phase2_logits_data,
                         n_outputs*n_vocab*sizeof(float), cudaMemcpyDeviceToHost);
                 } else
