@@ -1698,7 +1698,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     // ---- Phase 2: Single graph with all layers ----
                     // inpL propagates correctly through the layer loop.
-                    // First token builds and caches the graph; subsequent tokens reuse it.
                     {
                     const int64_t t_p2_start = ggml_time_us();
 
@@ -1710,64 +1709,38 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
                     const int64_t t_p2_wait = ggml_time_us();
 
-                    ggml_cgraph * phase2_gf;
-                    const bool use_cached = (moe_weight_cache.phase2_gf && ubatch.n_tokens == 1);
+                    // Build, alloc, compute — always (no caching for now)
+                    res->reset();
 
-                    if (use_cached) {
-                        // CACHE HIT — skip build, reuse graph.  Restore cached state
-                        // after Phase 1's build_graph + outer reset() cleared res->inputs.
-                        phase2_gf = moe_weight_cache.phase2_gf;
+                    ggml_backend_sched_reset(sched.get());
 
-                        // Phase 1 set its own inputs; clear them and restore Phase 2's
-                        res->inputs.clear();
-                        res->inputs = std::move(moe_weight_cache.phase2_inputs);
-                        res->t_logits = moe_weight_cache.phase2_t_logits;
-                        res->t_embd   = moe_weight_cache.phase2_t_embd;
+                    moe_weight_cache.build_layer_only = -1;
+                    moe_weight_cache.build_phase = 2;
 
-                        ggml_backend_sched_reset(sched.get());
-                        force_idxs_to_cpu();
-                        if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
-                            LLAMA_LOG_ERROR("%s: failed to alloc cached Phase 2 graph\n", __func__);
-                            moe_weight_cache.kept_gate = saved_kept_gate;
-                            moe_weight_cache.kept_up   = saved_kept_up;
-                            moe_weight_cache.kept_down = saved_kept_down;
-                            ret = GGML_STATUS_ALLOC_FAILED;
-                            return nullptr;
-                        }
-                    } else {
-                        // BUILD — first time or prompt eval (n_tokens > 1)
-                        res->reset();
+                    ggml_cgraph * phase2_gf = model.build_graph(
+                        gparams, nullptr, nullptr, &moe_weight_cache);
 
-                        ggml_backend_sched_reset(sched.get());
-
-                        moe_weight_cache.build_layer_only = -1;
-                        moe_weight_cache.build_phase = 2;
-
-                        phase2_gf = model.build_graph(
-                            gparams, nullptr, nullptr, &moe_weight_cache);
-
-                        if (!phase2_gf) {
-                            LLAMA_LOG_ERROR("%s: failed to build Phase 2 graph\n", __func__);
-                            moe_weight_cache.kept_gate = saved_kept_gate;
-                            moe_weight_cache.kept_up   = saved_kept_up;
-                            moe_weight_cache.kept_down = saved_kept_down;
-                            ret = GGML_STATUS_FAILED;
-                            return nullptr;
-                        }
-
-                        ggml_backend_sched_reset(sched.get());
-                        force_idxs_to_cpu();
-                        if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
-                            LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
-                            moe_weight_cache.kept_gate = saved_kept_gate;
-                            moe_weight_cache.kept_up   = saved_kept_up;
-                            moe_weight_cache.kept_down = saved_kept_down;
-                            ret = GGML_STATUS_ALLOC_FAILED;
-                            return nullptr;
-                        }
+                    if (!phase2_gf) {
+                        LLAMA_LOG_ERROR("%s: failed to build Phase 2 graph\n", __func__);
+                        moe_weight_cache.kept_gate = saved_kept_gate;
+                        moe_weight_cache.kept_up   = saved_kept_up;
+                        moe_weight_cache.kept_down = saved_kept_down;
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
                     }
-                    const int64_t t_p2_alloc = ggml_time_us();
 
+                    ggml_backend_sched_reset(sched.get());
+                    force_idxs_to_cpu();
+                    if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
+                        LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
+                        moe_weight_cache.kept_gate = saved_kept_gate;
+                        moe_weight_cache.kept_up   = saved_kept_up;
+                        moe_weight_cache.kept_down = saved_kept_down;
+                        ret = GGML_STATUS_ALLOC_FAILED;
+                        return nullptr;
+                    }
+
+                    // Single graph includes attention which needs input tensors (embd, pos)
                     res->set_inputs(&ubatch);
 
                     ggml_backend_sched_synchronize(sched.get());
@@ -1782,24 +1755,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             return nullptr;
                         }
                     }
-                    const int64_t t_p2_done = ggml_time_us();
-                    LLAMA_LOG_INFO("phase2_timing: %s wait=%ld alloc=%ld compute=%ld total=%ld us\n",
-                        use_cached ? "reuse" : "build",
-                        t_p2_wait - t_p2_start,
-                        t_p2_alloc - t_p2_wait,
-                        t_p2_done - t_p2_alloc,
-                        t_p2_done - t_p2_start);
 
-                    // Cache Phase 2 graph + state for reuse on subsequent tokens
-                    if (!use_cached && ubatch.n_tokens == 1) {
-                        moe_weight_cache.phase2_gf       = phase2_gf;
-                        moe_weight_cache.phase2_t_logits = res->t_logits;
-                        moe_weight_cache.phase2_t_embd   = res->t_embd;
-                        moe_weight_cache.phase2_inputs   = std::move(res->inputs);
-                    } else if (use_cached) {
-                        // Save inputs back for next call
-                        moe_weight_cache.phase2_inputs = std::move(res->inputs);
-                    }
+                    const int64_t t_p2_done = ggml_time_us();
+                    LLAMA_LOG_INFO("phase2_timing: wait=%ld compute=%ld total=%ld us\n",
+                        t_p2_wait - t_p2_start,
+                        t_p2_done - t_p2_wait,
+                        t_p2_done - t_p2_start);
 
                     // Sparsity stats already updated in pre-loop above — avoid double-count
                 }
