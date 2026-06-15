@@ -1766,6 +1766,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                             moe_weight_cache.phase2_t_logits = res->t_logits;
                                             moe_weight_cache.phase2_t_embd   = res->t_embd;
                                             moe_weight_cache.phase2_inputs   = std::move(res->inputs);
+                                            // Save GPU addr for direct read
+                                            if (res->t_logits)
+                                                moe_weight_cache.phase2_logits_data = res->t_logits->data;
                                         } else fprintf(stderr, "cuda: instantiate fail\n");
                                     } else fprintf(stderr, "cuda: endCapture fail\n");
                                 } else { cudaStreamEndCapture(st, nullptr); ret = s; return nullptr; }
@@ -2684,7 +2687,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-            GGML_ASSERT(backend_res != nullptr);
+
             GGML_ASSERT(logits.data != nullptr);
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
@@ -2692,7 +2695,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+#ifdef GGML_USE_CUDA
+                // CUDA graph replay may detect null backend — use saved DMA pointer
+                if (!backend_res && moe_weight_cache.phase2_logits_data) {
+                    cudaMemcpy(logits_out, moe_weight_cache.phase2_logits_data,
+                        n_outputs*n_vocab*sizeof(float), cudaMemcpyDeviceToHost);
+                } else
+#endif
+                {
+                    GGML_ASSERT(backend_res != nullptr);
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
