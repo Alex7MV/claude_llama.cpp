@@ -15,7 +15,9 @@ extern "C" {
     int  cudaGraphLaunch(cudaGraphExec_t, void*);
     int  cudaGraphDestroy(cudaGraph_t);
     const char* cudaGetErrorString(int);
+    int  cudaMemcpy(void*, const void*, size_t, int);
 }
+#define cudaMemcpyDeviceToHost 2
 #endif
 #include "llama-arch.h"
 #include "llama-graph.h"
