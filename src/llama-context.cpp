@@ -1770,6 +1770,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             cudaError_t cuda_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
                             if (cuda_err == cudaSuccess) {
                                 const auto status = graph_compute(phase2_gf, false);
+                                if (status != GGML_STATUS_SUCCESS) {
+                                    cudaStreamEndCapture(stream, nullptr); // abandon capture
+                                    LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
+                                    moe_weight_cache.kept_gate = saved_kept_gate;
+                                    moe_weight_cache.kept_up   = saved_kept_up;
+                                    moe_weight_cache.kept_down = saved_kept_down;
+                                    ret = status;
+                                    return nullptr;
+                                }
                                 cudaGraph_t graph;
                                 cuda_err = cudaStreamEndCapture(stream, &graph);
                                 if (cuda_err == cudaSuccess) {
@@ -1785,11 +1794,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     }
                                 } else {
                                     fprintf(stderr, "cuda_graph: endCapture failed: %s\n", cudaGetErrorString(cuda_err));
-                                    // Capture failed — graph may be invalid, need to abort and redo
-                                    auto status = graph_compute(phase2_gf, false);
-                                    if (status != GGML_STATUS_SUCCESS) {
-                                        ret = status; return nullptr;
-                                    }
                                 }
                             } else {
                                 fprintf(stderr, "cuda_graph: beginCapture failed: %s\n", cudaGetErrorString(cuda_err));
