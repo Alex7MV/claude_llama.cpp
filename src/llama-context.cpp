@@ -4,6 +4,18 @@
 #include "ggml-backend-pipeline.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+// Minimal CUDA graph API (avoids cuda_runtime.h include issues)
+typedef void* cudaGraph_t;
+typedef void* cudaGraphExec_t;
+#define cudaSuccess 0
+extern "C" {
+    int  cudaStreamBeginCapture(void*, int);
+    int  cudaStreamEndCapture(void*, cudaGraph_t*);
+    int  cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, const char*, const char*, unsigned int);
+    int  cudaGraphLaunch(cudaGraphExec_t, void*);
+    int  cudaGraphDestroy(cudaGraph_t);
+    const char* cudaGetErrorString(int);
+}
 #endif
 #include "llama-arch.h"
 #include "llama-graph.h"
