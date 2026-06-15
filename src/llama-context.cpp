@@ -1723,132 +1723,172 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         prefetch_done = nullptr;
                     }
                     const int64_t t_p2_build0 = ggml_time_us();
+                    int64_t t_p2_build = 0, t_p2_alloc = 0;
 
-                    // Build, alloc, compute
-                    res->reset();
-
-                    ggml_backend_sched_reset(sched.get());
-
-                    moe_weight_cache.build_layer_only = -1;
-                    moe_weight_cache.build_phase = 2;
-
-                    ggml_cgraph * phase2_gf = model.build_graph(
-                        gparams, nullptr, nullptr, &moe_weight_cache);
-                    const int64_t t_p2_build = ggml_time_us();
-
-                    if (!phase2_gf) {
-                        LLAMA_LOG_ERROR("%s: failed to build Phase 2 graph\n", __func__);
-                        moe_weight_cache.kept_gate = saved_kept_gate;
-                        moe_weight_cache.kept_up   = saved_kept_up;
-                        moe_weight_cache.kept_down = saved_kept_down;
-                        ret = GGML_STATUS_FAILED;
-                        return nullptr;
-                    }
-
-                    ggml_backend_sched_reset(sched.get());
-                    force_idxs_to_cpu();
-                    if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
-                        LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
-                        moe_weight_cache.kept_gate = saved_kept_gate;
-                        moe_weight_cache.kept_up   = saved_kept_up;
-                        moe_weight_cache.kept_down = saved_kept_down;
-                        ret = GGML_STATUS_ALLOC_FAILED;
-                        return nullptr;
-                    }
-                    const int64_t t_p2_alloc = ggml_time_us();
-
-// Single graph includes attention which needs input tensors (embd, pos)
-                    res->set_inputs(&ubatch);
-
-                    {
 #ifdef GGML_USE_CUDA
+                    // Create dedicated scheduler for Phase 2 (stable allocations for CUDA graph)
                     const bool do_capture = (ubatch.n_tokens == 1 && moe_weight_cache.cuda_graph_mode);
+                    if (do_capture && !moe_weight_cache.phase2_sched) {
+                        // Copy main scheduler's backends
+                        int nbe = ggml_backend_sched_get_n_backends(sched.get());
+                        std::vector<ggml_backend_t> be_vec;
+                        std::vector<ggml_backend_buffer_type_t> buft_vec;
+                        for (int i = 0; i < nbe; i++) {
+                            be_vec.push_back(ggml_backend_sched_get_backend(sched.get(), i));
+                            buft_vec.push_back(ggml_backend_sched_get_backend_buffer_type(sched.get(), i));
+                        }
+                        moe_weight_cache.phase2_sched = ggml_backend_sched_new(
+                            be_vec.data(), buft_vec.data(), nbe,
+                            4096, cparams.pipeline_parallel, cparams.op_offload);
+                        LLAMA_LOG_INFO("%s: created dedicated Phase 2 scheduler\n", __func__);
+                    }
+
+                    ggml_cgraph * phase2_gf;
+                    ggml_backend_sched_t p2sched = do_capture ? moe_weight_cache.phase2_sched : sched.get();
+
                     if (do_capture && moe_weight_cache.cuda_graph_captured) {
-                        // Replay captured CUDA graph
+                        // CACHE HIT — restore state, update inputs, replay CUDA graph
+                        phase2_gf = moe_weight_cache.phase2_gf;
+
+                        // Clear Phase 1's inputs, restore Phase 2's
+                        res->inputs.clear();
+                        res->inputs = std::move(moe_weight_cache.phase2_inputs);
+                        res->t_logits = moe_weight_cache.phase2_t_logits;
+                        res->t_embd   = moe_weight_cache.phase2_t_embd;
+
+                        res->set_inputs(&ubatch);
+
                         void* stream = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         ggml_backend_cuda_set_stream(gpu, 0);
-                        auto cuda_err = cudaGraphLaunch((cudaGraphExec_t)moe_weight_cache.cuda_graph_exec, stream);
+                        int cuda_err = cudaGraphLaunch((cudaGraphExec_t)moe_weight_cache.cuda_graph_exec, stream);
                         if (cuda_err != cudaSuccess) {
                             LLAMA_LOG_ERROR("%s: cudaGraphLaunch failed: %s\n", __func__, cudaGetErrorString(cuda_err));
                         }
-                        ggml_backend_sched_synchronize(sched.get());
-                    } else {
-                        // Normal compute (or capture attempt)
-                        ggml_backend_sched_synchronize(sched.get());
+                        ggml_backend_sched_synchronize(p2sched);
 
-                        if (do_capture && !moe_weight_cache.cuda_graph_captured) {
-                            // First generation token — try to capture
+                        // Save inputs back for next call
+                        moe_weight_cache.phase2_inputs = std::move(res->inputs);
+                    } else {
+                        // BUILD — first time, or prompt eval, or capture disabled
+                        res->reset();
+
+                        ggml_backend_sched_reset(p2sched);
+
+                        moe_weight_cache.build_layer_only = -1;
+                        moe_weight_cache.build_phase = 2;
+
+                        // Build with dedicated scheduler (if capturing) or main scheduler
+                        llm_graph_params gparams_copy = gparams;
+                        gparams_copy.sched = p2sched;
+                        phase2_gf = model.build_graph(
+                            gparams_copy, nullptr, nullptr, &moe_weight_cache);
+                        t_p2_build = ggml_time_us();
+
+                        if (!phase2_gf) {
+                            LLAMA_LOG_ERROR("%s: failed to build Phase 2 graph\n", __func__);
+                            moe_weight_cache.kept_gate = saved_kept_gate;
+                            moe_weight_cache.kept_up   = saved_kept_up;
+                            moe_weight_cache.kept_down = saved_kept_down;
+                            ret = GGML_STATUS_FAILED;
+                            return nullptr;
+                        }
+
+                        ggml_backend_sched_reset(p2sched);
+                        force_idxs_to_cpu();
+                        if (!ggml_backend_sched_alloc_graph(p2sched, phase2_gf)) {
+                            LLAMA_LOG_ERROR("%s: failed to allocate Phase 2 graph\n", __func__);
+                            moe_weight_cache.kept_gate = saved_kept_gate;
+                            moe_weight_cache.kept_up   = saved_kept_up;
+                            moe_weight_cache.kept_down = saved_kept_down;
+                            ret = GGML_STATUS_ALLOC_FAILED;
+                            return nullptr;
+                        }
+
+                        t_p2_alloc = ggml_time_us();
+
+                        res->set_inputs(&ubatch);
+
+                        if (do_capture) {
+                            // CUDA graph capture on dedicated scheduler
                             void* stream = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_cuda_set_stream(gpu, 0);
+                            ggml_backend_sched_synchronize(p2sched);
 
                             int cuda_err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
                             if (cuda_err == cudaSuccess) {
                                 const auto status = graph_compute(phase2_gf, false);
-                                if (status != GGML_STATUS_SUCCESS) {
-                                    cudaStreamEndCapture(stream, nullptr); // abandon capture
-                                    LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
-                                    moe_weight_cache.kept_gate = saved_kept_gate;
-                                    moe_weight_cache.kept_up   = saved_kept_up;
-                                    moe_weight_cache.kept_down = saved_kept_down;
-                                    ret = status;
-                                    return nullptr;
-                                }
-                                cudaGraph_t graph;
-                                cuda_err = cudaStreamEndCapture(stream, &graph);
-                                if (cuda_err == cudaSuccess) {
-                                    cudaGraphExec_t exec;
-                                    cuda_err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                                if (status == GGML_STATUS_SUCCESS) {
+                                    cudaGraph_t graph;
+                                    cuda_err = cudaStreamEndCapture(stream, &graph);
                                     if (cuda_err == cudaSuccess) {
-                                        moe_weight_cache.cuda_graph_exec = (void*)exec;
-                                        moe_weight_cache.cuda_graph_captured = true;
-                                        cudaGraphDestroy(graph);
-                                        fprintf(stderr, "cuda_graph: captured Phase 2\n");
+                                        cudaGraphExec_t exec;
+                                        cuda_err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                                        if (cuda_err == cudaSuccess) {
+                                            moe_weight_cache.cuda_graph_exec = (void*)exec;
+                                            moe_weight_cache.cuda_graph_captured = true;
+                                            cudaGraphDestroy(graph);
+                                            fprintf(stderr, "cuda_graph: captured Phase 2\n");
+
+                                            // Cache graph + state for reuse
+                                            moe_weight_cache.phase2_gf       = phase2_gf;
+                                            moe_weight_cache.phase2_t_logits = res->t_logits;
+                                            moe_weight_cache.phase2_t_embd   = res->t_embd;
+                                            moe_weight_cache.phase2_inputs   = std::move(res->inputs);
+                                        } else {
+                                            fprintf(stderr, "cuda_graph: instantiate failed: %s\n", cudaGetErrorString(cuda_err));
+                                            moe_weight_cache.cuda_graph_captured = false;
+                                        }
                                     } else {
-                                        fprintf(stderr, "cuda_graph: instantiate failed: %s\n", cudaGetErrorString(cuda_err));
+                                        fprintf(stderr, "cuda_graph: endCapture failed: %s\n", cudaGetErrorString(cuda_err));
                                     }
                                 } else {
-                                    fprintf(stderr, "cuda_graph: endCapture failed: %s\n", cudaGetErrorString(cuda_err));
+                                    cudaStreamEndCapture(stream, nullptr);
+                                    LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
+                                    moe_weight_cache.kept_gate = saved_kept_gate; moe_weight_cache.kept_up = saved_kept_up; moe_weight_cache.kept_down = saved_kept_down;
+                                    ret = status; return nullptr;
                                 }
                             } else {
                                 fprintf(stderr, "cuda_graph: beginCapture failed: %s\n", cudaGetErrorString(cuda_err));
                                 // Fall back to normal compute
+                                ggml_backend_sched_synchronize(p2sched);
                                 const auto status = graph_compute(phase2_gf, false);
                                 if (status != GGML_STATUS_SUCCESS) {
                                     LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
-                                    moe_weight_cache.kept_gate = saved_kept_gate;
-                                    moe_weight_cache.kept_up   = saved_kept_up;
-                                    moe_weight_cache.kept_down = saved_kept_down;
-                                    ret = status;
-                                    return nullptr;
+                                    moe_weight_cache.kept_gate = saved_kept_gate; moe_weight_cache.kept_up = saved_kept_up; moe_weight_cache.kept_down = saved_kept_down;
+                                    ret = status; return nullptr;
                                 }
                             }
                         } else {
+                            // Non-capture path: normal compute (prompt eval or fallback)
+                            ggml_backend_sched_synchronize(p2sched);
                             const auto status = graph_compute(phase2_gf, ubatch.n_tokens > 1);
                             if (status != GGML_STATUS_SUCCESS) {
                                 LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
-                                moe_weight_cache.kept_gate = saved_kept_gate;
-                                moe_weight_cache.kept_up   = saved_kept_up;
-                                moe_weight_cache.kept_down = saved_kept_down;
-                                ret = status;
-                                return nullptr;
+                                moe_weight_cache.kept_gate = saved_kept_gate; moe_weight_cache.kept_up = saved_kept_up; moe_weight_cache.kept_down = saved_kept_down;
+                                ret = status; return nullptr;
                             }
                         }
                     }
 #else
+                    // Non-CUDA: normal build + compute
+                    ggml_cgraph * phase2_gf;
+                    int64_t t_p2_build = 0, t_p2_alloc = 0;
+                    res->reset();
+                    ggml_backend_sched_reset(sched.get());
+                    moe_weight_cache.build_layer_only = -1;
+                    moe_weight_cache.build_phase = 2;
+                    phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+                    t_p2_build = ggml_time_us();
+                    if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
+                    ggml_backend_sched_reset(sched.get());
+                    force_idxs_to_cpu();
+                    if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+                    t_p2_alloc = ggml_time_us();
+                    res->set_inputs(&ubatch);
                     ggml_backend_sched_synchronize(sched.get());
-                    {
-                        const auto status = graph_compute(phase2_gf, ubatch.n_tokens > 1);
-                        if (status != GGML_STATUS_SUCCESS) {
-                            LLAMA_LOG_ERROR("%s: Phase 2 compute failed: %d\n", __func__, status);
-                            moe_weight_cache.kept_gate = saved_kept_gate;
-                            moe_weight_cache.kept_up   = saved_kept_up;
-                            moe_weight_cache.kept_down = saved_kept_down;
-                            ret = status;
-                            return nullptr;
-                        }
-                    }
+                    { const auto status = graph_compute(phase2_gf, ubatch.n_tokens > 1);
+                      if (status != GGML_STATUS_SUCCESS) { ret = status; return nullptr; } }
 #endif
-                    }
                     const int64_t t_p2_done = ggml_time_us();
                     fprintf(stderr, "phase2: wait=%ld build=%ld alloc=%ld compute=%ld total=%ld us\n",
                         t_p2_build0 - t_p2_start,

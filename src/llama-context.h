@@ -106,8 +106,9 @@ struct llama_moe_weight_cache {
 #ifdef GGML_USE_CUDA
     void * cuda_graph_exec = nullptr; // cudaGraphExec_t
     bool   cuda_graph_captured = false;
+    ggml_backend_sched_t phase2_sched = nullptr; // dedicated scheduler (stable allocations)
 #endif
-    bool   cuda_graph_mode = false; // requires stable tensor ptrs — broken by sched_reset
+    bool   cuda_graph_mode = true; // enable CUDA graph capture + replay
 };
 #endif
 
