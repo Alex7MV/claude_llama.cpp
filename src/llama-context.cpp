@@ -1621,7 +1621,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 // Phase 1c: redirect kept tensor data pointers to the active compact buffer,
                     //           then prefetch ALL layers (no pipelining — single Phase 2 graph).
                     {
-                        const int active = moe_weight_cache.compact_active;
+                        const int active = 0; // force compact_base[0] — CUDA graph stable addresses
                         const size_t skg = moe_weight_cache.s_kept_gate;
                         const size_t sku = moe_weight_cache.s_kept_up;
                         const size_t plc = moe_weight_cache.per_layer_compact;
@@ -1800,11 +1800,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     { auto s = graph_compute(gf2, ubatch.n_tokens > 1); if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; } }
 #endif
 
-                // Toggle compact buffer (disabled for CUDA graph — need stable pointers)
-#ifdef GGML_USE_CUDA
-                if (!moe_weight_cache.cuda_graph_captured)
-#endif
-                moe_weight_cache.compact_active ^= 1;
+                // Toggle compact buffer (disabled — CUDA graph needs stable addresses)
+                // moe_weight_cache.compact_active ^= 1;
 
                 // Restore kept_* pointers for next ubatch
                 moe_weight_cache.kept_gate = saved_kept_gate;
