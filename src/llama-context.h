@@ -102,6 +102,7 @@ struct llama_moe_weight_cache {
 #ifdef GGML_USE_CUDA
     void * cuda_graph_exec = nullptr;
     bool   cuda_graph_captured = false;
+    void * phase2_logits_data = nullptr; // direct GPU addr for logit readback
 #endif
     bool   skip_phase2_attn = false; // skip attention in Phase 2 — use Phase 1 ffn_inp (experimental)
 };
