@@ -1735,7 +1735,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         std::vector<ggml_backend_buffer_type_t> buft_vec;
                         for (int i = 0; i < nbe; i++) {
                             be_vec.push_back(ggml_backend_sched_get_backend(sched.get(), i));
-                            buft_vec.push_back(ggml_backend_sched_get_backend_buffer_type(sched.get(), i));
+                            buft_vec.push_back(ggml_backend_get_default_buffer_type(be_vec.back()));
                         }
                         moe_weight_cache.phase2_sched = ggml_backend_sched_new(
                             be_vec.data(), buft_vec.data(), nbe,
@@ -1872,7 +1872,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 #else
                     // Non-CUDA: normal build + compute
                     ggml_cgraph * phase2_gf;
-                    int64_t t_p2_build = 0, t_p2_alloc = 0;
                     res->reset();
                     ggml_backend_sched_reset(sched.get());
                     moe_weight_cache.build_layer_only = -1;
