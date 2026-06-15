@@ -100,6 +100,7 @@ struct llama_moe_weight_cache {
     ggml_tensor * phase2_t_logits = nullptr;
     ggml_tensor * phase2_t_embd   = nullptr;
     std::vector<llm_graph_input_ptr> phase2_inputs;
+    bool   skip_phase2_attn = true; // skip attention in Phase 2 — use Phase 1 ffn_inp
 };
 #endif
 
