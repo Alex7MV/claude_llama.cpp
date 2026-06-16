@@ -171,7 +171,8 @@ struct phase2_hijack {
     void * stream = nullptr;          // cudaStream_t
 
     // CAPTURE: scan graph, match by name, allocate buffer, hijack data ptrs
-    void scan_and_hijack(ggml_cgraph * gf);
+    // Only hijacks tensors whose backend is CUDA (avoids CPU ops crashing on GPU addresses)
+    void scan_and_hijack(ggml_cgraph * gf, ggml_backend_sched_t sched);
 
     // REPLAY: scan graph, match by name, restore data ptrs from stored slots
     bool scan_and_update_snapshots(ggml_cgraph * gf);

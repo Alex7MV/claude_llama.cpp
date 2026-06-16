@@ -234,7 +234,7 @@ void phase2_hijack::allocate_slots(int /*max_il*/) {
             total, N_TYPES, n_layers);
 }
 
-void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
+void phase2_hijack::scan_and_hijack(ggml_cgraph * gf, ggml_backend_sched_t sched) {
     slot_scan_count = 0;
     int total_nodes = ggml_graph_n_nodes(gf);
     int total_leafs = ggml_graph_n_leafs(gf);
@@ -291,30 +291,46 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
         if (!buffer) return;
     }
 
-    // Pass 2a: hijack non-VIEW tensors
+    int skipped = 0;
+
+    // Pass 2a: hijack non-VIEW tensors (only if backend is CUDA)
     for (auto & m : matches) {
         int s_idx = slot_idx(m.il, m.type_id);
         if (s_idx < 0 || s_idx >= n_slots || !slots[s_idx].addr) continue;
+
+        ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m.t) : nullptr;
+        if (!be || !ggml_backend_is_cuda(be)) {
+            skipped++;
+            continue;
+        }
+
         m.t->data = slots[s_idx].addr;
         slot_scan_count++;
         fprintf(stderr, "  HKJ %s → %p (sz=%zu)\n", m.t->name, slots[s_idx].addr, slots[s_idx].size);
     }
 
-    // Pass 2b: hijack VIEW tensors — compute addr from parent's slot
+    // Pass 2b: hijack VIEW tensors — compute addr from parent's slot (only if backend is CUDA)
     for (auto & m : views) {
         int s_idx = slot_idx(m.il, m.type_id);
         if (s_idx < 0 || s_idx >= n_slots) continue;
         if (slots[s_idx].parent < 0) continue;
         int p_idx = slot_idx(m.il, slots[s_idx].parent);
         if (p_idx < 0 || p_idx >= n_slots || !slots[p_idx].addr) continue;
+
+        ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m.t) : nullptr;
+        if (!be || !ggml_backend_is_cuda(be)) {
+            skipped++;
+            continue;
+        }
+
         void * view_addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
         m.t->data = view_addr;
         slot_scan_count++;
         fprintf(stderr, "  HKJ %s → %p (view, parent=%s)\n", m.t->name, view_addr, TENSOR_NAMES[slots[s_idx].parent]);
     }
 
-    fprintf(stderr, "phase2_hijack: scan_and_hijack → %d/%d matched (%d layers)\n",
-            slot_scan_count, n_slots, max_il + 1);
+    fprintf(stderr, "phase2_hijack: scan_and_hijack → %d/%d matched, %d skipped (non-CUDA) (%d layers)\n",
+            slot_scan_count, n_slots, skipped, max_il + 1);
 }
 
 bool phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
@@ -2065,7 +2081,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                         if (do_cuda && !h2_hijack.captured) {
                             // CAPTURE — hijack tensor->data before capturing
-                            h2_hijack.scan_and_hijack(phase2_gf);
+                            h2_hijack.scan_and_hijack(phase2_gf, sched.get());
                             // Validate: expected ≈ n_layers * N_TYPES (dense lead layers
                             // produce no MoE names, so some slots remain empty).
                             const int expected = h2_hijack.n_layers * h2_hijack.N_TYPES;
