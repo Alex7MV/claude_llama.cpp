@@ -168,6 +168,19 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     int total_nodes = ggml_graph_n_nodes(gf);
     int total_leafs = ggml_graph_n_leafs(gf);
 
+    // Diagnostic dump of first 30 tensors
+    int total_t = total_leafs + total_nodes;
+    int dump_n = total_t < 30 ? total_t : 30;
+    for (int i = 0; i < dump_n; i++) {
+        ggml_tensor * t;
+        if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
+        const char * opname = ggml_op_name(t->op);
+        fprintf(stderr, "TENSOR[%d] op=%-20s ne=[%lld %lld %lld %lld] type=%d flags=0x%02x inp=%d\n",
+                i, opname,
+                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                (int)t->type, (int)t->flags, (int)(t->flags & GGML_TENSOR_FLAG_INPUT));
+    }
+
     // Combine leafs + nodes into one walk. INPUT tensors (tensor_pos 0-3)
     // live in leafs; computed tensors (tensor_pos 4-8) live in nodes.
     int total = total_leafs + total_nodes;
