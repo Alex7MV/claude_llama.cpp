@@ -2,7 +2,6 @@
 
 #include "ggml.h"
 #include "ggml-backend-pipeline.h"
-#include "ggml-impl.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 // Minimal CUDA graph API (avoids cuda_runtime.h include issues)
@@ -153,8 +152,8 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     snapshot_count = 0;
     int layer_idx = 0;
     int tensor_pos = 0;
-    int total_nodes = gf->n_nodes;
-    int total_leafs = gf->n_leafs;
+    int total_nodes = ggml_graph_n_nodes(gf);
+    int total_leafs = ggml_graph_n_leafs(gf);
 
     // Combine leafs + nodes into one walk. INPUT tensors (tensor_pos 0-3)
     // live in leafs; computed tensors (tensor_pos 4-8) live in nodes.
@@ -162,9 +161,9 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     for (int i = 0; i < total; i++) {
         ggml_tensor * dst;
         if (i < total_leafs) {
-            dst = gf->leafs[i];
+            dst = ggml_graph_leaf(gf, i);
         } else {
-            dst = gf->nodes[i - total_leafs];
+            dst = ggml_graph_node(gf, i - total_leafs);
         }
 
         if (layer_idx >= H2_N_LAYERS) break;
@@ -218,23 +217,23 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
         }
     }
     fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d layers=%d)\n",
-            snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs, layer_idx);
+            snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, ggml_graph_n_nodes(gf), ggml_graph_n_leafs(gf), layer_idx);
 }
 
 void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
     int idx = 0;
     int layer_idx = 0;
     int tensor_pos = 0;
-    int total_nodes = gf->n_nodes;
-    int total_leafs = gf->n_leafs;
+    int total_nodes = ggml_graph_n_nodes(gf);
+    int total_leafs = ggml_graph_n_leafs(gf);
     int total = total_leafs + total_nodes;
 
     for (int i = 0; i < total; i++) {
         ggml_tensor * dst;
         if (i < total_leafs) {
-            dst = gf->leafs[i];
+            dst = ggml_graph_leaf(gf, i);
         } else {
-            dst = gf->nodes[i - total_leafs];
+            dst = ggml_graph_node(gf, i - total_leafs);
         }
         if (layer_idx >= H2_N_LAYERS) break;
 
