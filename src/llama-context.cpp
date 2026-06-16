@@ -99,11 +99,15 @@ void llama_context::h2_destroy() {
 
 void phase2_hijack::init() {
     cudaMalloc(&base, H2_N_LAYERS * H2_LAYER_STRIDE);
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    stream = s;
 }
 
 void phase2_hijack::destroy() {
     if (cuda_graph_exec) { cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec); cuda_graph_exec = nullptr; }
     if (base)           { cudaFree(base); base = nullptr; }
+    if (stream)         { cudaStreamSynchronize((cudaStream_t)stream); cudaStreamDestroy((cudaStream_t)stream); stream = nullptr; }
 }
 
 void phase2_inject::init() {
@@ -146,6 +150,10 @@ void phase2_guard::destroy() {
 
 void phase2_guard::record(void * stream) {
     cudaEventRecord(phase1_done_event, stream);
+}
+
+void phase2_guard::wait(void * stream) {
+    cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)phase1_done_event, 0);
 }
 
 void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
@@ -1690,6 +1698,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         return nullptr;
                     }
                 }
+                // Synchronize Phase 1 GPU work before autonomous Phase 2 stream operations
+                ggml_backend_sched_synchronize(sched.get());
                 const int64_t t_p1_compute = ggml_time_us();
                 fprintf(stderr, "phase1: %ld us\n", t_p1_compute - t_p1_start);
 
@@ -1914,14 +1924,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         }
                     }
 
+                } // end if(gpu) — autonomous Phase 2 follows
+
 #ifdef GGML_USE_CUDA
                     const bool do_cuda = (ubatch.n_tokens == 1);
-                    fprintf(stderr, "DBG: do_cuda=%d captured=%d n_tokens=%d\n",
-                            (int)do_cuda, (int)h2_hijack.captured, ubatch.n_tokens);
                     ggml_cgraph * phase2_gf;
 
                     if (do_cuda && h2_hijack.captured) {
-                        fprintf(stderr, "DBG: entering REPLAY path\n");
                         // REPLAY — rebuild graph, restore tensor addresses,
                         // inject input data from host, launch CUDA graph.
 
@@ -1954,8 +1963,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
                         // 1. Get CUDA stream BEFORE any data copies
-                        void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                        ggml_backend_cuda_set_stream(gpu, 0);
+                        void* st = h2_hijack.stream;
 
                         // 2. D2D ffn_inp: Phase 1 GPU scratch → static buffer
                         //    Uses SAVED original pointers (before alloc_graph overwrote them).
@@ -2022,16 +2030,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                         if (do_cuda && !h2_hijack.captured) {
                             // CAPTURE — hijack tensor->data before capturing
-                            fprintf(stderr, "DBG: entering CAPTURE path\n");
+                            // Must capture on scheduler's stream (graph_compute uses it)
                             h2_hijack.scan_and_hijack(phase2_gf);
-                            void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                            ggml_backend_cuda_set_stream(gpu, 0);
+                            void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_sched_synchronize(sched.get());
-                            if (cudaStreamBeginCapture(st, 0) == cudaSuccess) {
+                            if (cudaStreamBeginCapture(capture_st, 0) == cudaSuccess) {
                                 auto s = graph_compute(phase2_gf, false);
                                 if (s == GGML_STATUS_SUCCESS) {
                                     cudaGraph_t g;
-                                    if (cudaStreamEndCapture(st, &g) == cudaSuccess) {
+                                    if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
                                         cudaGraphExec_t ex;
                                         if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
                                             h2_hijack.cuda_graph_exec = ex;
@@ -2048,7 +2055,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                                 moe_weight_cache.phase2_logits_data = res->t_logits->data;
                                         } else fprintf(stderr, "cuda: instantiate fail\n");
                                     } else fprintf(stderr, "cuda: endCapture fail\n");
-                                } else { cudaStreamEndCapture(st, nullptr); ret = s; return nullptr; }
+                                } else { cudaStreamEndCapture(capture_st, nullptr); ret = s; return nullptr; }
                             } else {
                                 fprintf(stderr, "cuda: beginCapture fail\n");
                                 ggml_backend_sched_synchronize(sched.get());
@@ -2274,8 +2281,8 @@ void llama_context::init_moe_weight_cache() {
     }
     if (!gpu) return;
 
-    if (model.n_gpu_layers() == 0) {
-        LLAMA_LOG_INFO("%s: no GPU layers offloaded, skipping MoE weight cache\n", __func__);
+    if (model.n_gpu_layers() == 0 && !cparams.moe_two_phase) {
+        LLAMA_LOG_INFO("%s: skipping MoE weight cache (no GPU layers, not two-phase)\n", __func__);
         return;
     }
 

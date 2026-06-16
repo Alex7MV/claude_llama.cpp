@@ -155,6 +155,7 @@ struct phase2_hijack {
     int    snapshot_count = 0;
     bool   captured = false;
     void * cuda_graph_exec = nullptr; // cudaGraphExec_t
+    void * stream = nullptr;          // cudaStream_t
 
     void* addr(int il, size_t off) const {
         return (char*)base + il * H2_LAYER_STRIDE + off;
@@ -196,6 +197,7 @@ struct phase2_guard {
     void init();
     void destroy();
     void record(void * stream);
+    void wait(void * stream); // cudaStreamWaitEvent
 };
 
 #endif // GGML_USE_CUDA
