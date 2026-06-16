@@ -1897,6 +1897,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     if (do_cuda && h2_hijack.captured) {
                         // REPLAY — rebuild graph, restore tensor addresses,
                         // inject input data from host, launch CUDA graph.
+
+                        // Save original scratch tensor pointers BEFORE alloc_graph
+                        // (alloc_graph may reassign them; we need Phase 1 output addresses).
+                        void * orig_ffn_inp[H2_N_LAYERS];
+                        void * orig_moe_ids[H2_N_LAYERS];
+                        void * orig_moe_weights[H2_N_LAYERS];
+                        for (int il = 0; il < H2_N_LAYERS; il++) {
+                            orig_ffn_inp[il]     = moe_weight_cache.scratch_ffn_inp[il]
+                                                    ? moe_weight_cache.scratch_ffn_inp[il]->data : nullptr;
+                            orig_moe_ids[il]      = moe_weight_cache.scratch_moe_ids[il]
+                                                    ? moe_weight_cache.scratch_moe_ids[il]->data : nullptr;
+                            orig_moe_weights[il]  = moe_weight_cache.scratch_moe_weights[il]
+                                                    ? moe_weight_cache.scratch_moe_weights[il]->data : nullptr;
+                        }
+
                         res->reset();
                         ggml_backend_sched_reset(sched.get());
                         moe_weight_cache.build_layer_only = -1;
@@ -1915,28 +1930,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         ggml_backend_cuda_set_stream(gpu, 0);
 
-                        // 2. D2D ffn_inp: copy from Phase 1 GPU scratch → static buffer
-                        //    MUST happen BEFORE restore_all() — after hijack,
-                        //    scratch_ffn_inp[il]->data points to OUR static buffer (self-copy).
+                        // 2. D2D ffn_inp: Phase 1 GPU scratch → static buffer
+                        //    Uses SAVED original pointers (before alloc_graph overwrote them).
                         for (int il = 0; il < H2_N_LAYERS; il++) {
-                            if (moe_weight_cache.scratch_ffn_inp[il]) {
+                            if (orig_ffn_inp[il]) {
                                 cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_INP),
-                                                moe_weight_cache.scratch_ffn_inp[il]->data,
+                                                orig_ffn_inp[il],
                                                 H2_SZ_INP, cudaMemcpyDeviceToDevice, st);
                             }
                         }
 
                         // 3. D2H moe_ids + moe_weights: GPU scratch → pinned CPU
-                        //    Same constraint: must happen before restore_all().
                         for (int il = 0; il < H2_N_LAYERS; il++) {
-                            if (moe_weight_cache.scratch_moe_ids[il]) {
+                            if (orig_moe_ids[il]) {
                                 cudaMemcpyAsync(h2_inject.host_moe_ids[il],
-                                                moe_weight_cache.scratch_moe_ids[il]->data,
+                                                orig_moe_ids[il],
                                                 H2_SZ_IDS, cudaMemcpyDeviceToHost, st);
                             }
-                            if (moe_weight_cache.scratch_moe_weights[il]) {
+                            if (orig_moe_weights[il]) {
                                 cudaMemcpyAsync(h2_inject.host_moe_w[il],
-                                                moe_weight_cache.scratch_moe_weights[il]->data,
+                                                orig_moe_weights[il],
                                                 H2_SZ_WEIGHTS, cudaMemcpyDeviceToHost, st);
                             }
                         }
@@ -1946,7 +1959,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         h2_hijack.restore_all();
 
                         // 5. H2D: pinned CPU buffers → static buffer (ids + weights)
-                        //    Uses h2_inject host buffers (unaffected by restore_all).
                         for (int il = 0; il < H2_N_LAYERS; il++) {
                             cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_IDS),
                                             h2_inject.host_moe_ids[il],
