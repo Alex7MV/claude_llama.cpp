@@ -404,13 +404,13 @@ void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
         else if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
         else if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) match = true;
         else if (tensor_pos == 7 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_N_EMBD) match = true;
-        else if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) { match = true; tensor_pos = -1; layer_idx++; }
+        else if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) { match = true; layer_idx++; }
 
         if (match && idx < snapshot_count) {
             snapshots[idx].t = dst;
             idx++;
+            tensor_pos = (tensor_pos == 8) ? 0 : tensor_pos + 1;
         }
-        tensor_pos++;
     }
 }
 ```
