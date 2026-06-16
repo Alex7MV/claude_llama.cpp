@@ -91,7 +91,10 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 #ifdef LLAMA_DEEPSEEK_PIPELINE
 
 void llama_context::h2_init() {
-    h2_hijack.init();
+    const auto & hparams = model.hparams;
+    int n_moe_layers = (int)hparams.n_layer - (int)hparams.n_layer_dense_lead;
+    if (n_moe_layers < 0) n_moe_layers = 0;
+    h2_hijack.init(n_moe_layers);
     h2_inject.init();
     h2_guard.init();
 }
@@ -102,47 +105,54 @@ void llama_context::h2_destroy() {
     h2_guard.destroy();
 }
 
-void phase2_hijack::init() {
-    cudaMalloc(&base, H2_N_LAYERS * H2_LAYER_STRIDE);
+void phase2_hijack::init(int n_moe_layers) {
+    n_layers = n_moe_layers;
+    n_slots = n_layers * N_TYPES;
+    slots = new slot[n_slots]();
+    if (!slots) { fprintf(stderr, "phase2_hijack: OOM for slots\n"); return; }
     cudaStream_t s;
     cudaStreamCreate(&s);
     stream = s;
+    captured = false;
+    buffer = nullptr;
+    buffer_size = 0;
 }
 
 void phase2_hijack::destroy() {
     if (cuda_graph_exec) { cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec); cuda_graph_exec = nullptr; }
-    if (base)           { cudaFree(base); base = nullptr; }
-    if (stream)         { cudaStreamSynchronize((cudaStream_t)stream); cudaStreamDestroy((cudaStream_t)stream); stream = nullptr; }
+    if (buffer)           { cudaFree(buffer); buffer = nullptr; }
+    if (stream)           { cudaStreamSynchronize((cudaStream_t)stream); cudaStreamDestroy((cudaStream_t)stream); stream = nullptr; }
+    delete[] slots; slots = nullptr;
+    n_slots = 0; n_layers = 0;
 }
 
 void phase2_inject::init() {
-    for (int i = 0; i < H2_N_LAYERS; i++) {
-        cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP,     cudaHostAllocDefault);
-        cudaHostAlloc((void**)&host_moe_ids[i],  H2_SZ_IDS,     cudaHostAllocDefault);
-        cudaHostAlloc((void**)&host_moe_w[i],    H2_SZ_WEIGHTS, cudaHostAllocDefault);
+    for (int i = 0; i < H2_N_LAYERS_MAX; i++) {
+        cudaHostAlloc((void**)&host_moe_ids[i],  sizeof(int)   * 32, cudaHostAllocDefault);
+        cudaHostAlloc((void**)&host_moe_w[i],    sizeof(float) * 32, cudaHostAllocDefault);
     }
 }
 
 void phase2_inject::destroy() {
-    for (int i = 0; i < H2_N_LAYERS; i++) {
-        if (host_ffn_inp[i])  { cudaFreeHost(host_ffn_inp[i]);  host_ffn_inp[i]  = nullptr; }
+    for (int i = 0; i < H2_N_LAYERS_MAX; i++) {
         if (host_moe_ids[i])  { cudaFreeHost(host_moe_ids[i]);  host_moe_ids[i]  = nullptr; }
         if (host_moe_w[i])    { cudaFreeHost(host_moe_w[i]);    host_moe_w[i]    = nullptr; }
     }
 }
 
-void phase2_inject::fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w) {
-    memcpy(host_ffn_inp[il], ffn_inp_src, H2_SZ_INP);
-    memcpy(host_moe_ids[il],  ids,         H2_SZ_IDS);
-    memcpy(host_moe_w[il],    w,           H2_SZ_WEIGHTS);
+void phase2_inject::fill_layer(int il, const int * ids, const float * w) {
+    if (il >= H2_N_LAYERS_MAX) return;
+    memcpy(host_moe_ids[il], ids, sizeof(int) * 32);
+    memcpy(host_moe_w[il],   w,   sizeof(float) * 32);
 }
 
-void phase2_inject::inject_all(const phase2_hijack & hijack, void * stream) {
-    for (int il = 0; il < H2_N_LAYERS; il++) {
-        cudaMemcpyAsync(hijack.addr(il, H2_OFF_INP),     host_ffn_inp[il], H2_SZ_INP,     cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(hijack.addr(il, H2_OFF_IDS),     host_moe_ids[il],  H2_SZ_IDS,     cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(hijack.addr(il, H2_OFF_WEIGHTS), host_moe_w[il],    H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, stream);
-    }
+void phase2_inject::inject_all(void * stream) {
+    // Inject moe_ids and moe_weights directly to the scratch buffer addresses.
+    // On REPLAY, the Phase 2 graph reads from the persistent scratch tensors,
+    // so we write directly to those fixed GPU addresses.
+    // Note: actual scratch buffer addresses are set by fill_layer caller
+    // via cudaMemcpyAsync. This function is kept for symmetry / future use.
+    (void)stream;
 }
 
 void phase2_guard::init() {
@@ -161,127 +171,181 @@ void phase2_guard::wait(void * stream) {
     cudaStreamWaitEvent((cudaStream_t)stream, (cudaEvent_t)phase1_done_event, 0);
 }
 
-void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
-    snapshot_count = 0;
-    int layer_idx = 0;
-    int tensor_pos = 0;
-    int total_nodes = ggml_graph_n_nodes(gf);
-    int total_leafs = ggml_graph_n_leafs(gf);
+// — name-based tensor matching — //
 
-    // Diagnostic dump of tensor signatures
-    int total_t = total_leafs + total_nodes;
-    int dump_n = total_t < 100 ? total_t : 100;
-    for (int i = 0; i < dump_n; i++) {
-        ggml_tensor * t;
-        if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
-        const char * opname = ggml_op_name(t->op);
-        fprintf(stderr, "TENSOR[%d] op=%-20s ne=[%lld %lld %lld %lld] type=%d flags=0x%02x inp=%d\n",
-                i, opname,
-                (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
-                (int)t->type, (int)t->flags, (int)(t->flags & GGML_TENSOR_FLAG_INPUT));
+std::pair<int,int> phase2_hijack::match_name(const char * name) const {
+    if (!name || !name[0]) return {-1, -1};
+    const char * dash = strrchr(name, '-');
+    if (!dash) return {-1, -1};
+    int il = 0;
+    for (const char * p = dash + 1; *p; p++) {
+        if (*p < '0' || *p > '9') return {-1, -1};
+        il = il * 10 + (*p - '0');
     }
-
-    // Combine leafs + nodes into one walk. INPUT tensors (tensor_pos 0-3)
-    // live in leafs; computed tensors (tensor_pos 4-8) live in nodes.
-    int total = total_leafs + total_nodes;
-    for (int i = 0; i < total; i++) {
-        ggml_tensor * dst;
-        if (i < total_leafs) {
-            dst = ggml_graph_leaf(gf, i);
-        } else {
-            dst = ggml_graph_node(gf, i - total_leafs);
-        }
-
-        if (layer_idx >= H2_N_LAYERS) break;
-
-        int64_t ne0 = dst->ne[0];
-
-        if (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_INP));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 1 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_I32) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_IDS));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 2 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_F32) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_WEIGHTS));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_RESIDUAL));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 4 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_GATE));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_UP));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_SILU));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 7 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_N_EMBD) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_DOWN));
-            tensor_pos++; continue;
-        }
-
-        if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) {
-            hijack_one(dst, addr(layer_idx, H2_OFF_OUT));
-            tensor_pos = 0;
-            layer_idx++;
+    size_t prefix_len = (size_t)(dash - name);
+    for (int t = 0; t < N_TYPES; t++) {
+        size_t pat_len = strlen(TENSOR_NAMES[t]);
+        if (prefix_len == pat_len && memcmp(name, TENSOR_NAMES[t], pat_len) == 0) {
+            return {t, il};
         }
     }
-    fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d layers=%d)\n",
-            snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, ggml_graph_n_nodes(gf), ggml_graph_n_leafs(gf), layer_idx);
+    return {-1, -1};
 }
 
-void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
-    int idx = 0;
-    int layer_idx = 0;
-    int tensor_pos = 0;
-    int total_nodes = ggml_graph_n_nodes(gf);
-    int total_leafs = ggml_graph_n_leafs(gf);
-    int total = total_leafs + total_nodes;
-
-    for (int i = 0; i < total; i++) {
-        ggml_tensor * dst;
-        if (i < total_leafs) {
-            dst = ggml_graph_leaf(gf, i);
-        } else {
-            dst = ggml_graph_node(gf, i - total_leafs);
-        }
-        if (layer_idx >= H2_N_LAYERS) break;
-
-        int64_t ne0 = dst->ne[0];
-        bool match = false;
-
-        if      (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) match = true;
-        else if (tensor_pos == 1 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_I32) match = true;
-        else if (tensor_pos == 2 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_F32) match = true;
-        else if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) match = true;
-        else if (tensor_pos == 4 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
-        else if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
-        else if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) match = true;
-        else if (tensor_pos == 7 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_N_EMBD) match = true;
-        else if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) { match = true; layer_idx++; }
-
-        if (match && idx < snapshot_count) {
-            snapshots[idx].t = dst;
-            idx++;
-            tensor_pos = (tensor_pos == 8) ? 0 : tensor_pos + 1;
+void phase2_hijack::allocate_slots(int max_il) {
+    size_t total = 0;
+    for (int i = 0; i < n_slots; i++) {
+        if (slots[i].size > 0 && slots[i].parent < 0) {
+            total = H2_ALIGN_UP(total);
+            total += slots[i].size;
         }
     }
+    if (total == 0) {
+        fprintf(stderr, "phase2_hijack: no slots to allocate\n");
+        return;
+    }
+    cudaError_t e = cudaMalloc(&buffer, total);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "phase2_hijack: cudaMalloc(%zu) failed: %s\n", total, cudaGetErrorString(e));
+        buffer = nullptr;
+        return;
+    }
+    buffer_size = total;
+    size_t offset = 0;
+    for (int i = 0; i < n_slots; i++) {
+        if (slots[i].size > 0 && slots[i].parent < 0) {
+            offset = H2_ALIGN_UP(offset);
+            slots[i].addr = (char*)buffer + offset;
+            offset += slots[i].size;
+        }
+    }
+    // Assign VIEW addresses: parent addr + stored offset
+    for (int i = 0; i < n_slots; i++) {
+        if (slots[i].parent >= 0 && slots[i].size > 0) {
+            int il = i / N_TYPES;
+            int p_idx = il * N_TYPES + slots[i].parent;
+            if (p_idx >= 0 && p_idx < n_slots && slots[p_idx].addr) {
+                slots[i].addr = (char*)slots[p_idx].addr + slots[i].offset;
+            }
+        }
+    }
+    fprintf(stderr, "phase2_hijack: allocated %zu byte buffer (%d types x %d layers)\n",
+            total, N_TYPES, n_layers);
+}
+
+void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
+    slot_scan_count = 0;
+    int total_nodes = ggml_graph_n_nodes(gf);
+    int total_leafs = ggml_graph_n_leafs(gf);
+    int total_t = total_leafs + total_nodes;
+    int max_il = 0;
+
+    // Pass 1: match all tensors by name, record sizes and orig data ptrs
+    struct Match { ggml_tensor * t; int type_id; int il; void * orig_data; };
+    std::vector<Match> matches, views;
+
+    for (int i = 0; i < total_t; i++) {
+        ggml_tensor * t;
+        if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
+        auto [type_id, il] = match_name(t->name);
+        if (type_id < 0 || type_id >= N_TYPES) continue;
+        if (il < 0 || il >= n_layers) continue;
+        if (il > max_il) max_il = il;
+
+        size_t sz = ggml_type_size(t->type);
+        for (int d = 0; d < 4; d++) sz *= t->ne[d] > 0 ? t->ne[d] : 1;
+
+        int s_idx = slot_idx(il, type_id);
+        if (s_idx < 0 || s_idx >= n_slots) continue;
+
+        // First time seeing this (layer, type): init slot
+        if (slots[s_idx].size == 0) {
+            slots[s_idx].size = H2_ALIGN_UP(sz);
+            slots[s_idx].addr = nullptr;
+            slots[s_idx].parent = (type_id == T_GATE || type_id == T_UP) ? T_GATE_UP : -1;
+            slots[s_idx].offset = 0;
+        }
+
+        if (slots[s_idx].parent >= 0 && t->view_src) {
+            // VIEW: compute byte offset from parent's original data
+            ptrdiff_t off = (char*)t->data - (char*)t->view_src->data;
+            slots[s_idx].offset = off;
+            Match m = {t, type_id, il, t->data};
+            views.push_back(m);
+        } else {
+            Match m = {t, type_id, il, t->data};
+            matches.push_back(m);
+        }
+    }
+
+    int total_matched = (int)(matches.size() + views.size());
+    if (total_matched == 0) {
+        fprintf(stderr, "phase2_hijack: no tensors matched by name!\n");
+        return;
+    }
+
+    // Allocate buffer lazily on first call
+    if (!buffer) {
+        allocate_slots(max_il + 1);
+        if (!buffer) return;
+    }
+
+    // Pass 2a: hijack non-VIEW tensors
+    for (auto & m : matches) {
+        int s_idx = slot_idx(m.il, m.type_id);
+        if (s_idx < 0 || s_idx >= n_slots || !slots[s_idx].addr) continue;
+        m.t->data = slots[s_idx].addr;
+        slot_scan_count++;
+        fprintf(stderr, "  HKJ %s → %p (sz=%zu)\n", m.t->name, slots[s_idx].addr, slots[s_idx].size);
+    }
+
+    // Pass 2b: hijack VIEW tensors — compute addr from parent's slot
+    for (auto & m : views) {
+        int s_idx = slot_idx(m.il, m.type_id);
+        if (s_idx < 0 || s_idx >= n_slots) continue;
+        if (slots[s_idx].parent < 0) continue;
+        int p_idx = slot_idx(m.il, slots[s_idx].parent);
+        if (p_idx < 0 || p_idx >= n_slots || !slots[p_idx].addr) continue;
+        void * view_addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
+        m.t->data = view_addr;
+        slot_scan_count++;
+        fprintf(stderr, "  HKJ %s → %p (view, parent=%s)\n", m.t->name, view_addr, TENSOR_NAMES[slots[s_idx].parent]);
+    }
+
+    fprintf(stderr, "phase2_hijack: scan_and_hijack → %d/%d matched (%d layers)\n",
+            slot_scan_count, n_slots, max_il + 1);
+}
+
+bool phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
+    int total_nodes = ggml_graph_n_nodes(gf);
+    int total_leafs = ggml_graph_n_leafs(gf);
+    int total_t = total_leafs + total_nodes;
+    int found = 0;
+
+    for (int i = 0; i < total_t; i++) {
+        ggml_tensor * t;
+        if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
+        auto [type_id, il] = match_name(t->name);
+        if (type_id < 0 || type_id >= N_TYPES) continue;
+        if (il < 0 || il >= n_layers) continue;
+
+        int s_idx = slot_idx(il, type_id);
+        if (s_idx < 0 || s_idx >= n_slots) continue;
+
+        void * target = slots[s_idx].addr;
+        if (!target) continue;
+
+        if (t->data != target) { t->data = target; }
+        found++;
+    }
+
+    return found > 0;
+}
+
+void phase2_hijack::restore_all() {
+    // Data pointers were already set by scan_and_hijack / scan_and_update_snapshots
+    // This is a no-op for the new design but maintained for API compatibility.
+    asm volatile("" ::: "memory");
 }
 
 #endif // LLAMA_DEEPSEEK_PIPELINE
@@ -804,10 +868,6 @@ static void extract_embd_pooled(
             } break;
         case LLAMA_POOLING_TYPE_UNSPECIFIED:
             {
-                // diagnostic: cuda_hijack scan stats
-                // quired = H2_N_LAYERS * N_TENSOR_TYPES
-                // fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d)\n",
-                //         snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs);
                 GGML_ABORT("unknown pooling type");
             } break;
     }
@@ -1950,22 +2010,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                     if (do_cuda && h2_hijack.captured) {
                         // REPLAY — rebuild graph, restore tensor addresses,
-                        // inject input data from host, launch CUDA graph.
-
-                        // Save original scratch tensor pointers BEFORE alloc_graph
-                        // (alloc_graph may reassign them; we need Phase 1 output addresses).
-                        void * orig_ffn_inp[H2_N_LAYERS];
-                        void * orig_moe_ids[H2_N_LAYERS];
-                        void * orig_moe_weights[H2_N_LAYERS];
-                        for (int il = 0; il < H2_N_LAYERS; il++) {
-                            orig_ffn_inp[il]     = moe_weight_cache.scratch_ffn_inp[il]
-                                                    ? moe_weight_cache.scratch_ffn_inp[il]->data : nullptr;
-                            orig_moe_ids[il]      = moe_weight_cache.scratch_moe_ids[il]
-                                                    ? moe_weight_cache.scratch_moe_ids[il]->data : nullptr;
-                            orig_moe_weights[il]  = moe_weight_cache.scratch_moe_weights[il]
-                                                    ? moe_weight_cache.scratch_moe_weights[il]->data : nullptr;
-                        }
-
+                        // set inputs, launch CUDA graph.
                         res->reset();
                         ggml_backend_sched_reset(sched.get());
                         moe_weight_cache.build_layer_only = -1;
@@ -1980,61 +2025,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        // 1. Get CUDA stream BEFORE any data copies
-                        void* st = h2_hijack.stream;
-
-                        // 2. D2D ffn_inp: Phase 1 GPU scratch → static buffer
-                        //    Uses SAVED original pointers (before alloc_graph overwrote them).
-                        for (int il = 0; il < H2_N_LAYERS; il++) {
-                            if (orig_ffn_inp[il]) {
-                                cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_INP),
-                                                orig_ffn_inp[il],
-                                                H2_SZ_INP, cudaMemcpyDeviceToDevice, st);
-                            }
-                        }
-
-                        // 3. D2H moe_ids + moe_weights: GPU scratch → pinned CPU
-                        for (int il = 0; il < H2_N_LAYERS; il++) {
-                            if (orig_moe_ids[il]) {
-                                cudaMemcpyAsync(h2_inject.host_moe_ids[il],
-                                                orig_moe_ids[il],
-                                                H2_SZ_IDS, cudaMemcpyDeviceToHost, st);
-                            }
-                            if (orig_moe_weights[il]) {
-                                cudaMemcpyAsync(h2_inject.host_moe_w[il],
-                                                orig_moe_weights[il],
-                                                H2_SZ_WEIGHTS, cudaMemcpyDeviceToHost, st);
-                            }
-                        }
-
-                        // 4. Restore all tensor->data to static addresses (now safe)
+                        // 1. Restore tensor->data to static buffer addresses
                         h2_hijack.scan_and_update_snapshots(phase2_gf);
-                        h2_hijack.restore_all();
 
-                        // 5. H2D: pinned CPU buffers → static buffer (ids + weights)
-                        for (int il = 0; il < H2_N_LAYERS; il++) {
-                            cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_IDS),
-                                            h2_inject.host_moe_ids[il],
-                                            H2_SZ_IDS, cudaMemcpyHostToDevice, st);
-                            cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_WEIGHTS),
-                                            h2_inject.host_moe_w[il],
-                                            H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, st);
-                        }
+                        // 2. Set input data (embeddings, positions, etc.) — writes to
+                        //    allocator-assigned addresses which should be deterministic.
+                        res->set_inputs(&ubatch);
 
-                        // 6. Record barrier after all copies are queued
+                        // 3. Record barrier (copies from Phase 1 scratch are handled
+                        //    directly by the persistent scratch tensors — no D2D needed)
+                        void* st = h2_hijack.stream;
                         h2_guard.record(st);
 
-                        // 7. Launch CUDA Graph
+                        // 4. Launch CUDA Graph
                         ggml_backend_sched_synchronize(sched.get());
                         int cu = cudaGraphLaunch(h2_hijack.cuda_graph_exec, st);
                         if (cu != cudaSuccess) fprintf(stderr, "cuda_replay: %s\n", cudaGetErrorString(cu));
                         ggml_backend_sched_synchronize(sched.get());
 
-                        // 6. Save logits data pointer for direct readback
+                        // 5. Save logits data pointer for direct readback
                         if (res->t_logits)
                             moe_weight_cache.phase2_logits_data = res->t_logits->data;
                     } else {
-                        // BUILD
+                        // BUILD (first iteration, or capture)
                         res->reset();
                         ggml_backend_sched_reset(sched.get());
                         moe_weight_cache.build_layer_only = -1;
@@ -2044,43 +2057,58 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         ggml_backend_sched_reset(sched.get());
                         force_idxs_to_cpu();
                         if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
-                        res->set_inputs(&ubatch);
+
+                        ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), 0);
+                        if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
+                        if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
                         if (do_cuda && !h2_hijack.captured) {
                             // CAPTURE — hijack tensor->data before capturing
-                            // Must capture on scheduler's stream (graph_compute uses it)
                             h2_hijack.scan_and_hijack(phase2_gf);
-                            void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                            ggml_backend_sched_synchronize(sched.get());
-                            if (cudaStreamBeginCapture(capture_st, 0) == cudaSuccess) {
-                                auto s = graph_compute(phase2_gf, false);
-                                if (s == GGML_STATUS_SUCCESS) {
-                                    cudaGraph_t g;
-                                    if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
-                                        cudaGraphExec_t ex;
-                                        if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
-                                            h2_hijack.cuda_graph_exec = ex;
-                                            h2_hijack.captured = true;
-                                            cudaGraphDestroy(g);
-                                            fprintf(stderr, "cuda: captured phase2 hijack\n");
-                                            moe_weight_cache.cuda_graph_captured = true;
-                                            moe_weight_cache.phase2_gf       = phase2_gf;
-                                            moe_weight_cache.phase2_t_logits = res->t_logits;
-                                            moe_weight_cache.phase2_t_embd   = res->t_embd;
-                                            moe_weight_cache.phase2_inputs   = std::move(res->inputs);
-                                            // Save GPU addr for direct read
-                                            if (res->t_logits)
-                                                moe_weight_cache.phase2_logits_data = res->t_logits->data;
-                                        } else fprintf(stderr, "cuda: instantiate fail\n");
-                                    } else fprintf(stderr, "cuda: endCapture fail\n");
-                                } else { cudaStreamEndCapture(capture_st, nullptr); ret = s; return nullptr; }
+                            // Validate: expected ≈ n_layers * N_TYPES (dense lead layers
+                            // produce no MoE names, so some slots remain empty).
+                            const int expected = h2_hijack.n_layers * h2_hijack.N_TYPES;
+                            if (h2_hijack.slot_scan_count < expected / 2) {
+                                fprintf(stderr, "cuda: CAPTURE ABORT — expected ~%d hijacks but got %d. "
+                                        "Check tensor name patterns for this architecture.\n",
+                                        expected, h2_hijack.slot_scan_count);
+                                // Fall through to normal compute
                             } else {
-                                fprintf(stderr, "cuda: beginCapture fail\n");
+                                // Set input data AFTER hijack so writes go to correct addresses
+                                res->set_inputs(&ubatch);
+                                void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                                 ggml_backend_sched_synchronize(sched.get());
-                                auto s = graph_compute(phase2_gf, false);
-                                if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                                if (cudaStreamBeginCapture(capture_st, 0) == cudaSuccess) {
+                                    auto s = graph_compute(phase2_gf, false);
+                                    if (s == GGML_STATUS_SUCCESS) {
+                                        cudaGraph_t g;
+                                        if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
+                                            cudaGraphExec_t ex;
+                                            if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
+                                                h2_hijack.cuda_graph_exec = ex;
+                                                h2_hijack.captured = true;
+                                                cudaGraphDestroy(g);
+                                                fprintf(stderr, "cuda: captured phase2 hijack (name-based)\n");
+                                                moe_weight_cache.cuda_graph_captured = true;
+                                                moe_weight_cache.phase2_gf       = phase2_gf;
+                                                moe_weight_cache.phase2_t_logits = res->t_logits;
+                                                moe_weight_cache.phase2_t_embd   = res->t_embd;
+                                                moe_weight_cache.phase2_inputs   = std::move(res->inputs);
+                                                if (res->t_logits)
+                                                    moe_weight_cache.phase2_logits_data = res->t_logits->data;
+                                            } else fprintf(stderr, "cuda: instantiate fail\n");
+                                        } else fprintf(stderr, "cuda: endCapture fail\n");
+                                    } else { cudaStreamEndCapture(capture_st, nullptr); ret = s; return nullptr; }
+                                } else {
+                                    fprintf(stderr, "cuda: beginCapture fail\n");
+                                    ggml_backend_sched_synchronize(sched.get());
+                                    auto s = graph_compute(phase2_gf, false);
+                                    if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                                }
                             }
                         } else {
+                            // Normal compute (no CUDA graph)
+                            res->set_inputs(&ubatch);
                             ggml_backend_sched_synchronize(sched.get());
                             auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
                             if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }

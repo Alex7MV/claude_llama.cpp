@@ -109,86 +109,108 @@ struct llama_moe_weight_cache {
 #endif
 
 // Static memory hijacking for MoE Phase 2 CUDA Graph.
-// Allocates a fixed VRAM buffer at model init, hijacks tensor->data pointers
+// Allocates a fixed VRAM buffer, hijacks tensor->data pointers
 // before CUDA Graph capture, and restores them before each replay.
+// Uses name-based tensor matching instead of position-based scanning,
+// so it works with any model architecture (DeepSeek-V3, Kimi-K2, etc.).
 #ifdef GGML_USE_CUDA
 
-#define H2_FFN_DIM       2048
-#define H2_N_EMBD        7168
 #define H2_ALIGN         256
 #define H2_ALIGN_UP(x)   (((x) + (H2_ALIGN - 1)) & ~(H2_ALIGN - 1))
-
-#define H2_SZ_INP        H2_ALIGN_UP(H2_N_EMBD * 2)
-#define H2_SZ_IDS        H2_ALIGN_UP(8 * 4)
-#define H2_SZ_WEIGHTS    H2_ALIGN_UP(8 * 4)
-#define H2_SZ_RESIDUAL   H2_ALIGN_UP(H2_N_EMBD * 2)
-#define H2_SZ_GATE       H2_ALIGN_UP(H2_FFN_DIM * 2)
-#define H2_SZ_UP         H2_ALIGN_UP(H2_FFN_DIM * 2)
-#define H2_SZ_SILU       H2_ALIGN_UP(H2_FFN_DIM * 2)
-#define H2_SZ_DOWN       H2_ALIGN_UP(H2_N_EMBD * 2)
-#define H2_SZ_OUT        H2_ALIGN_UP(H2_N_EMBD * 2)
-
-#define H2_OFF_INP       0x00000
-#define H2_OFF_IDS       0x03800
-#define H2_OFF_WEIGHTS   0x03900
-#define H2_OFF_RESIDUAL  0x03A00
-#define H2_OFF_GATE      0x07200
-#define H2_OFF_UP        0x08200
-#define H2_OFF_SILU      0x09200
-#define H2_OFF_DOWN      0x0A200
-#define H2_OFF_OUT       0x0DA00
-
-#define H2_LAYER_STRIDE  0x11200
-#define H2_N_LAYERS      61
+#define H2_N_LAYERS_MAX  128
 
 struct phase2_hijack {
-    static constexpr int N_TENSOR_TYPES = 9;
-    static constexpr int MAX_SNAPSHOTS = H2_N_LAYERS * N_TENSOR_TYPES;
-
-    struct entry {
-        ggml_tensor * t;
-        void        * static_addr;
+    // Name patterns matched in order — MUST match Phase 2 FFN subgraph
+    // ffn_moe_gate_up  = fused gate+up MUL_MAT_ID output
+    // ffn_moe_gate     = first-half VIEW of gate_up (ffn_dim)
+    // ffn_moe_up       = second-half VIEW of gate_up (ffn_dim)
+    // ffn_moe_swiglu   = activation output (ffn_dim × n_expert_used)
+    // ffn_moe_down     = down-proj MUL_MAT_ID output (n_embd × n_expert_used)
+    // ffn_moe_weighted = weighted expert output (n_embd × n_expert_used)
+    // ffn_moe_out      = summed expert output (n_embd)
+    static constexpr const char * TENSOR_NAMES[7] = {
+        "ffn_moe_gate_up",
+        "ffn_moe_gate",
+        "ffn_moe_up",
+        "ffn_moe_swiglu",
+        "ffn_moe_down",
+        "ffn_moe_weighted",
+        "ffn_moe_out",
+    };
+    enum TypeId : int {
+        T_GATE_UP   = 0,
+        T_GATE      = 1,
+        T_UP        = 2,
+        T_SWIGLU    = 3,
+        T_DOWN      = 4,
+        T_WEIGHTED  = 5,
+        T_OUT       = 6,
+        N_TYPES     = 7,
     };
 
-    void * base = nullptr;
-    entry  snapshots[MAX_SNAPSHOTS];
-    int    snapshot_count = 0;
+    // Per-(layer, type) slot: where in the static buffer
+    struct slot {
+        void * addr;       // GPU address in static buffer
+        size_t size;       // allocated size (H2_ALIGN_UP of actual tensor size)
+        int    parent;     // TypeId of parent tensor for VIEWs (-1 if not a VIEW)
+        ptrdiff_t offset;  // byte offset from parent's addr (for VIEWs)
+    };
+
+    // Static GPU buffer
+    void * buffer = nullptr;
+    size_t buffer_size = 0;
+    int    n_layers = 0;
+
+    // Pre-computed slot info indexed by [il * N_TYPES + type_id]
+    slot * slots = nullptr;
+    int    n_slots = 0;
+    int    slot_scan_count = 0; // number of successful slot lookups during last scan
+
     bool   captured = false;
     void * cuda_graph_exec = nullptr; // cudaGraphExec_t
     void * stream = nullptr;          // cudaStream_t
 
-    void* addr(int il, size_t off) const {
-        return (char*)base + il * H2_LAYER_STRIDE + off;
-    }
-
-    void hijack_one(ggml_tensor * t, void * static_addr) {
-        snapshots[snapshot_count].t           = t;
-        snapshots[snapshot_count].static_addr = static_addr;
-        t->data = static_addr;
-        snapshot_count++;
-    }
-
-    void restore_all() {
-        for (int i = 0; i < snapshot_count; i++)
-            snapshots[i].t->data = snapshots[i].static_addr;
-        asm volatile("" ::: "memory");
-    }
-
-    void init();
-    void destroy();
+    // CAPTURE: scan graph, match by name, allocate buffer, hijack data ptrs
     void scan_and_hijack(ggml_cgraph * gf);
-    void scan_and_update_snapshots(ggml_cgraph * gf);
+
+    // REPLAY: scan graph, match by name, restore data ptrs from stored slots
+    bool scan_and_update_snapshots(ggml_cgraph * gf);
+
+    // Set all matched tensors to their slot addresses
+    void restore_all();
+
+    // Lifetime
+    void init(int n_moe_layers);
+    void destroy();
+
+private:
+    // Parse tensor name "prefix-{il}" → (type_id, il) or (-1, -1)
+    std::pair<int,int> match_name(const char * name) const;
+
+    // Allocate once: compute sizes from first scan, cudaMalloc, assign offsets
+    void allocate_slots(int max_il);
+
+    // Get slot index: il * N_TYPES + type_id
+    int slot_idx(int il, int type_id) const { return il * N_TYPES + type_id; }
 };
 
 struct phase2_inject {
-    void * host_ffn_inp[H2_N_LAYERS];
-    int  * host_moe_ids[H2_N_LAYERS];
-    float * host_moe_w[H2_N_LAYERS];
+    void * host_moe_ids[H2_N_LAYERS_MAX];
+    float * host_moe_w[H2_N_LAYERS_MAX];
 
     void init();
     void destroy();
-    void fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w);
-    void inject_all(const phase2_hijack & hijack, void * stream);
+    void fill_layer(int il, const int * ids, const float * w);
+    void inject_all(void * stream);
+};
+
+struct phase2_guard {
+    void * phase1_done_event = nullptr; // cudaEvent_t
+
+    void init();
+    void destroy();
+    void record(void * stream);
+    void wait(void * stream); // cudaStreamWaitEvent
 };
 
 struct phase2_guard {
