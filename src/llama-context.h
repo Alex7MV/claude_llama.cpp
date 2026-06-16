@@ -108,6 +108,127 @@ struct llama_moe_weight_cache {
 };
 #endif
 
+// Static memory hijacking for MoE Phase 2 CUDA Graph.
+// Allocates a fixed VRAM buffer at model init, hijacks tensor->data pointers
+// before CUDA Graph capture, and restores them before each replay.
+#ifdef GGML_USE_CUDA
+
+#define H2_FFN_DIM       2048
+#define H2_N_EMBD        7168
+#define H2_ALIGN         256
+#define H2_ALIGN_UP(x)   (((x) + (H2_ALIGN - 1)) & ~(H2_ALIGN - 1))
+
+#define H2_SZ_INP        H2_ALIGN_UP(H2_N_EMBD * 2)
+#define H2_SZ_IDS        H2_ALIGN_UP(8 * 4)
+#define H2_SZ_WEIGHTS    H2_ALIGN_UP(8 * 4)
+#define H2_SZ_RESIDUAL   H2_ALIGN_UP(H2_N_EMBD * 2)
+#define H2_SZ_GATE       H2_ALIGN_UP(H2_FFN_DIM * 2)
+#define H2_SZ_UP         H2_ALIGN_UP(H2_FFN_DIM * 2)
+#define H2_SZ_SILU       H2_ALIGN_UP(H2_FFN_DIM * 2)
+#define H2_SZ_DOWN       H2_ALIGN_UP(H2_N_EMBD * 2)
+#define H2_SZ_OUT        H2_ALIGN_UP(H2_N_EMBD * 2)
+
+#define H2_OFF_INP       0x00000
+#define H2_OFF_IDS       0x03800
+#define H2_OFF_WEIGHTS   0x03900
+#define H2_OFF_RESIDUAL  0x03A00
+#define H2_OFF_GATE      0x07200
+#define H2_OFF_UP        0x08200
+#define H2_OFF_SILU      0x09200
+#define H2_OFF_DOWN      0x0A200
+#define H2_OFF_OUT       0x0DA00
+
+#define H2_LAYER_STRIDE  0x11200
+#define H2_N_LAYERS      61
+
+struct phase2_hijack {
+    static constexpr int N_TENSOR_TYPES = 9;
+    static constexpr int MAX_SNAPSHOTS = H2_N_LAYERS * N_TENSOR_TYPES;
+
+    struct entry {
+        ggml_tensor * t;
+        void        * static_addr;
+    };
+
+    void * base = nullptr;
+    entry  snapshots[MAX_SNAPSHOTS];
+    int    snapshot_count = 0;
+    bool   captured = false;
+    cudaGraphExec_t cuda_graph_exec = nullptr;
+
+    void* addr(int il, size_t off) {
+        return (char*)base + il * H2_LAYER_STRIDE + off;
+    }
+
+    void init() {
+        cudaMalloc(&base, H2_N_LAYERS * H2_LAYER_STRIDE);
+    }
+
+    void destroy() {
+        if (cuda_graph_exec) { cudaGraphExecDestroy(cuda_graph_exec); cuda_graph_exec = nullptr; }
+        if (base)           { cudaFree(base); base = nullptr; }
+    }
+
+    void hijack_one(ggml_tensor * t, void * addr) {
+        snapshots[snapshot_count].t           = t;
+        snapshots[snapshot_count].static_addr = addr;
+        t->data = addr;
+        snapshot_count++;
+    }
+
+    void restore_all() {
+        for (int i = 0; i < snapshot_count; i++)
+            snapshots[i].t->data = snapshots[i].static_addr;
+        asm volatile("" ::: "memory");
+    }
+
+    void scan_and_hijack(ggml_cgraph * gf);
+    void scan_and_update_snapshots(ggml_cgraph * gf);
+};
+
+struct phase2_inject {
+    void * host_ffn_inp[H2_N_LAYERS];
+    int    host_moe_ids[H2_N_LAYERS][8];
+    float  host_moe_w[H2_N_LAYERS][8];
+
+    void init() {
+        for (int i = 0; i < H2_N_LAYERS; i++)
+            cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP, cudaHostAllocDefault);
+    }
+
+    void destroy() {
+        for (int i = 0; i < H2_N_LAYERS; i++)
+            if (host_ffn_inp[i]) { cudaFreeHost(host_ffn_inp[i]); host_ffn_inp[i] = nullptr; }
+    }
+
+    void fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w) {
+        memcpy(host_ffn_inp[il], ffn_inp_src, H2_SZ_INP);
+        memcpy(host_moe_ids[il],  ids,         H2_SZ_IDS);
+        memcpy(host_moe_w[il],    w,           H2_SZ_WEIGHTS);
+    }
+
+    void inject_all(const phase2_hijack & hijack, cudaStream_t stream) {
+        for (int il = 0; il < H2_N_LAYERS; il++) {
+            cudaMemcpyAsync(hijack.addr(il, H2_OFF_INP),     host_ffn_inp[il], H2_SZ_INP,     cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(hijack.addr(il, H2_OFF_IDS),     host_moe_ids[il],  H2_SZ_IDS,     cudaMemcpyHostToDevice, stream);
+            cudaMemcpyAsync(hijack.addr(il, H2_OFF_WEIGHTS), host_moe_w[il],    H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, stream);
+        }
+    }
+};
+
+struct phase2_guard {
+    cudaEvent_t phase1_done_event = nullptr;
+
+    void init() { cudaEventCreate(&phase1_done_event); }
+    void destroy() { if (phase1_done_event) { cudaEventDestroy(phase1_done_event); phase1_done_event = nullptr; } }
+
+    void record(cudaStream_t stream) {
+        cudaEventRecord(phase1_done_event, stream);
+    }
+};
+
+#endif // GGML_USE_CUDA
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -416,6 +537,15 @@ private:
 
     // Initialize the MoE weight cache by copying all expert weights to GPU
     void init_moe_weight_cache();
+
+#ifdef GGML_USE_CUDA
+    phase2_hijack h2_hijack;
+    phase2_inject h2_inject;
+    phase2_guard  h2_guard;
+
+    void h2_init();
+    void h2_destroy();
+#endif
 #endif
 
     bool sched_need_reserve = true;
