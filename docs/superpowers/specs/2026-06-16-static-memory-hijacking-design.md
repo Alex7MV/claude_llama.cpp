@@ -123,6 +123,7 @@ struct phase2_hijack {
                       ggml_tensor * gate,  ggml_tensor * up,
                       ggml_tensor * silu,  ggml_tensor * down,
                       ggml_tensor * out) {
+        assert(snapshot_count < MAX_SNAPSHOTS); // guard against layer count mismatch
         auto * e = &snapshots[snapshot_count];
         e[0] = {inp,      addr(il, H2_OFF_INP)};      inp->data      = e[0].static_addr;
         e[1] = {ids,      addr(il, H2_OFF_IDS)};      ids->data      = e[1].static_addr;
@@ -139,6 +140,7 @@ struct phase2_hijack {
     void restore_all() {
         for (int i = 0; i < snapshot_count; i++)
             snapshots[i].t->data = snapshots[i].static_addr;
+        asm volatile("" ::: "memory"); // compiler barrier: no reorder past cudaGraphLaunch
     }
 
     void destroy() {
@@ -321,3 +323,15 @@ Total code delta: ~100 lines.
 | Phase 1 tensor data races with Phase 2 reads | Same CUDA stream — implicit ordering via stream serialization |
 | `ggml_set_input` or `ggml_set_output` resets tensor->data | `restore_all()` is the LAST thing before `cudaGraphLaunch` — any prior resets are overwritten |
 | Future ggml refactoring breaks the hijack contract | Isolated in ~100 lines with clear call points; easy to audit and update |
+
+## Deployment Notes
+
+### NUMA Affinity (EPYC Turin)
+
+On dual-socket EPYC systems, pin the llama.cpp process to the NUMA node physically closest to the RTX 5090's PCIe slot:
+
+```bash
+numactl --cpunodebind=0 --membind=0 ./llama-cli ...
+```
+
+This eliminates cross-socket memory traffic during `fill_from_phase1()` host-side memcpy operations and D2H threshold readbacks, providing 2-3% additional throughput.
