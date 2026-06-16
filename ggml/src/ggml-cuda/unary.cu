@@ -295,6 +295,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
     cudaStream_t stream = ctx.stream();
 
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
     GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
@@ -304,6 +305,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
 
     if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
         GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
         GGML_ASSERT(src1->ne[0] == nc);
         GGML_ASSERT(src0->type == src1->type);

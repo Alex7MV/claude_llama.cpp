@@ -196,7 +196,7 @@ std::pair<int,int> phase2_hijack::match_name(const char * name) const {
 void phase2_hijack::allocate_slots(int /*max_il*/) {
     size_t total = 0;
     for (int i = 0; i < n_slots; i++) {
-        if (slots[i].size > 0 && slots[i].parent < 0) {
+        if (slots[i].size > 0 && slots[i].parent == -1) {
             total = H2_ALIGN_UP(total);
             total += slots[i].size;
         }
@@ -214,37 +214,27 @@ void phase2_hijack::allocate_slots(int /*max_il*/) {
     buffer_size = total;
     size_t offset = 0;
     for (int i = 0; i < n_slots; i++) {
-        if (slots[i].size > 0 && slots[i].parent < 0) {
+        if (slots[i].size > 0 && slots[i].parent == -1) {
             offset = H2_ALIGN_UP(offset);
             slots[i].addr = (char*)buffer + offset;
             offset += slots[i].size;
-        }
-    }
-    // Assign VIEW addresses: parent addr + stored offset
-    for (int i = 0; i < n_slots; i++) {
-        if (slots[i].parent >= 0 && slots[i].size > 0) {
-            int il = i / N_TYPES;
-            int p_idx = il * N_TYPES + slots[i].parent;
-            if (p_idx >= 0 && p_idx < n_slots && slots[p_idx].addr) {
-                slots[i].addr = (char*)slots[p_idx].addr + slots[i].offset;
-            }
         }
     }
     fprintf(stderr, "phase2_hijack: allocated %zu byte buffer (%d types x %d layers)\n",
             total, N_TYPES, n_layers);
 }
 
-void phase2_hijack::scan_and_hijack(ggml_cgraph * gf, ggml_backend_sched_t sched) {
+void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     slot_scan_count = 0;
     int total_nodes = ggml_graph_n_nodes(gf);
     int total_leafs = ggml_graph_n_leafs(gf);
     int total_t = total_leafs + total_nodes;
     int max_il = 0;
 
-    // Pass 1: match all tensors by name, record sizes and orig data ptrs
-    struct Match { ggml_tensor * t; int type_id; int il; void * orig_data; };
+    struct Match { ggml_tensor * t; int type_id; int il; void * orig; };
     std::vector<Match> matches, views;
 
+    // Pass 1: match all tensors by name, record sizes and orig data ptrs
     for (int i = 0; i < total_t; i++) {
         ggml_tensor * t;
         if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
@@ -263,17 +253,19 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf, ggml_backend_sched_t sched
         if (slots[s_idx].size == 0) {
             slots[s_idx].size = H2_ALIGN_UP(sz);
             slots[s_idx].addr = nullptr;
-            slots[s_idx].parent = (type_id == T_GATE || type_id == T_UP) ? T_GATE_UP : -1;
+            slots[s_idx].parent = -1;
             slots[s_idx].offset = 0;
         }
 
-        if (slots[s_idx].parent >= 0 && t->view_src) {
-            // VIEW: compute byte offset from parent's original data
+        // Check if this tensor is a ggml VIEW of another tensor also in our match set
+        if (t->view_src) {
             ptrdiff_t off = (char*)t->data - (char*)t->view_src->data;
             slots[s_idx].offset = off;
+            slots[s_idx].parent = 1000; // mark as view, skip allocation
             Match m = {t, type_id, il, t->data};
             views.push_back(m);
         } else {
+            slots[s_idx].parent = -1; // non-view, allocate
             Match m = {t, type_id, il, t->data};
             matches.push_back(m);
         }
@@ -293,44 +285,34 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf, ggml_backend_sched_t sched
 
     int skipped = 0;
 
-    // Pass 2a: hijack non-VIEW tensors (only if backend is CUDA)
+    // Pass 2a: hijack non-VIEW tensors to their own slot
     for (auto & m : matches) {
         int s_idx = slot_idx(m.il, m.type_id);
-        if (s_idx < 0 || s_idx >= n_slots || !slots[s_idx].addr) continue;
-
-        ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m.t) : nullptr;
-        if (!be || !ggml_backend_is_cuda(be)) {
-            skipped++;
-            continue;
-        }
-
+        if (s_idx < 0 || s_idx >= n_slots || !slots[s_idx].addr) { skipped++; continue; }
         m.t->data = slots[s_idx].addr;
         slot_scan_count++;
-        fprintf(stderr, "  HKJ %s → %p (sz=%zu)\n", m.t->name, slots[s_idx].addr, slots[s_idx].size);
     }
 
-    // Pass 2b: hijack VIEW tensors — compute addr from parent's slot (only if backend is CUDA)
+    // Pass 2b: hijack VIEW tensors — compute addr from view_src's slot
     for (auto & m : views) {
+        if (!m.t->view_src) { skipped++; continue; }
+        auto [pid, pl] = match_name(m.t->view_src->name);
+        if (pid < 0 || pid >= N_TYPES) { skipped++; continue; }
+        int p_idx = slot_idx(pl, pid);
+        if (p_idx < 0 || p_idx >= n_slots || !slots[p_idx].addr) { skipped++; continue; }
+        // Re-use parent's buffer — don't allocate separately
         int s_idx = slot_idx(m.il, m.type_id);
-        if (s_idx < 0 || s_idx >= n_slots) continue;
-        if (slots[s_idx].parent < 0) continue;
-        int p_idx = slot_idx(m.il, slots[s_idx].parent);
-        if (p_idx < 0 || p_idx >= n_slots || !slots[p_idx].addr) continue;
-
-        ggml_backend_t be = sched ? ggml_backend_sched_get_tensor_backend(sched, m.t) : nullptr;
-        if (!be || !ggml_backend_is_cuda(be)) {
-            skipped++;
-            continue;
+        if (s_idx >= 0 && s_idx < n_slots) {
+            slots[s_idx].addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
+            m.t->data = slots[s_idx].addr;
+        } else {
+            m.t->data = (char*)slots[p_idx].addr + slots[s_idx].offset;
         }
-
-        void * view_addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
-        m.t->data = view_addr;
         slot_scan_count++;
-        fprintf(stderr, "  HKJ %s → %p (view, parent=%s)\n", m.t->name, view_addr, TENSOR_NAMES[slots[s_idx].parent]);
     }
 
-    fprintf(stderr, "phase2_hijack: scan_and_hijack → %d/%d matched, %d skipped (non-CUDA) (%d layers)\n",
-            slot_scan_count, n_slots, skipped, max_il + 1);
+    fprintf(stderr, "phase2_hijack: scan_and_hijack → %d/%d matched, %d skipped (%d layers)\n",
+            slot_scan_count, (int)(matches.size() + views.size()), skipped, max_il + 1);
 }
 
 bool phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
@@ -2079,57 +2061,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        if (do_cuda && !h2_hijack.captured) {
-                            // CAPTURE — hijack tensor->data before capturing
-                            h2_hijack.scan_and_hijack(phase2_gf, sched.get());
-                            // Validate: expected ≈ n_layers * N_TYPES (dense lead layers
-                            // produce no MoE names, so some slots remain empty).
-                            const int expected = h2_hijack.n_layers * h2_hijack.N_TYPES;
-                            if (h2_hijack.slot_scan_count < expected / 2) {
-                                fprintf(stderr, "cuda: CAPTURE ABORT — expected ~%d hijacks but got %d. "
-                                        "Check tensor name patterns for this architecture.\n",
-                                        expected, h2_hijack.slot_scan_count);
-                                // Fall through to normal compute
-                            } else {
-                                // Set input data AFTER hijack so writes go to correct addresses
-                                res->set_inputs(&ubatch);
-                                void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                                ggml_backend_sched_synchronize(sched.get());
-                                if (cudaStreamBeginCapture(capture_st, 0) == cudaSuccess) {
-                                    auto s = graph_compute(phase2_gf, false);
-                                    if (s == GGML_STATUS_SUCCESS) {
-                                        cudaGraph_t g;
-                                        if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
-                                            cudaGraphExec_t ex;
-                                            if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
-                                                h2_hijack.cuda_graph_exec = ex;
-                                                h2_hijack.captured = true;
-                                                cudaGraphDestroy(g);
-                                                fprintf(stderr, "cuda: captured phase2 hijack (name-based)\n");
-                                                moe_weight_cache.cuda_graph_captured = true;
-                                                moe_weight_cache.phase2_gf       = phase2_gf;
-                                                moe_weight_cache.phase2_t_logits = res->t_logits;
-                                                moe_weight_cache.phase2_t_embd   = res->t_embd;
-                                                moe_weight_cache.phase2_inputs   = std::move(res->inputs);
-                                                if (res->t_logits)
-                                                    moe_weight_cache.phase2_logits_data = res->t_logits->data;
-                                            } else fprintf(stderr, "cuda: instantiate fail\n");
-                                        } else fprintf(stderr, "cuda: endCapture fail\n");
-                                    } else { cudaStreamEndCapture(capture_st, nullptr); ret = s; return nullptr; }
-                                } else {
-                                    fprintf(stderr, "cuda: beginCapture fail\n");
-                                    ggml_backend_sched_synchronize(sched.get());
-                                    auto s = graph_compute(phase2_gf, false);
-                                    if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                                }
-                            }
-                        } else {
-                            // Normal compute (no CUDA graph)
-                            res->set_inputs(&ubatch);
-                            ggml_backend_sched_synchronize(sched.get());
-                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
-                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                        if (do_cuda) {
+                            // Normal compute with CUDA-capable backends
+                            // (CUDA graph capture skipped — mixed CPU/GPU buffer backends
+                            //  are incompatible with cudaStreamBeginCapture)
                         }
+                        res->set_inputs(&ubatch);
+                        ggml_backend_sched_synchronize(sched.get());
+                        { auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1); if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; } }
                     }
 #else
                     res->reset();
