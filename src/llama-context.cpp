@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend-pipeline.h"
+#include "ggml-impl.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 // Minimal CUDA graph API (avoids cuda_runtime.h include issues)
@@ -152,9 +153,19 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     snapshot_count = 0;
     int layer_idx = 0;
     int tensor_pos = 0;
+    int total_nodes = gf->n_nodes;
+    int total_leafs = gf->n_leafs;
 
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        ggml_tensor * dst = ggml_graph_node(gf, i);
+    // Combine leafs + nodes into one walk. INPUT tensors (tensor_pos 0-3)
+    // live in leafs; computed tensors (tensor_pos 4-8) live in nodes.
+    int total = total_leafs + total_nodes;
+    for (int i = 0; i < total; i++) {
+        ggml_tensor * dst;
+        if (i < total_leafs) {
+            dst = gf->leafs[i];
+        } else {
+            dst = gf->nodes[i - total_leafs];
+        }
 
         if (layer_idx >= H2_N_LAYERS) break;
 
@@ -206,15 +217,25 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
             layer_idx++;
         }
     }
+    fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d layers=%d)\n",
+            snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs, layer_idx);
 }
 
 void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
     int idx = 0;
     int layer_idx = 0;
     int tensor_pos = 0;
+    int total_nodes = gf->n_nodes;
+    int total_leafs = gf->n_leafs;
+    int total = total_leafs + total_nodes;
 
-    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-        ggml_tensor * dst = ggml_graph_node(gf, i);
+    for (int i = 0; i < total; i++) {
+        ggml_tensor * dst;
+        if (i < total_leafs) {
+            dst = gf->leafs[i];
+        } else {
+            dst = gf->nodes[i - total_leafs];
+        }
         if (layer_idx >= H2_N_LAYERS) break;
 
         int64_t ne0 = dst->ne[0];
@@ -759,8 +780,11 @@ static void extract_embd_pooled(
         case LLAMA_POOLING_TYPE_UNSPECIFIED:
             {
                 GGML_ABORT("unknown pooling type");
-            }
+quired = H2_N_LAYERS * N_TENSOR_TYPES
+        fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d)\n",
+                snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs);
     }
+}
 }
 
 void llama_context::sched_reserve() {
