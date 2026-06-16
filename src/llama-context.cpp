@@ -1916,9 +1916,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
 #ifdef GGML_USE_CUDA
                     const bool do_cuda = (ubatch.n_tokens == 1);
+                    fprintf(stderr, "DBG: do_cuda=%d captured=%d n_tokens=%d\n",
+                            (int)do_cuda, (int)h2_hijack.captured, ubatch.n_tokens);
                     ggml_cgraph * phase2_gf;
 
                     if (do_cuda && h2_hijack.captured) {
+                        fprintf(stderr, "DBG: entering REPLAY path\n");
                         // REPLAY — rebuild graph, restore tensor addresses,
                         // inject input data from host, launch CUDA graph.
 
@@ -2019,6 +2022,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
                         if (do_cuda && !h2_hijack.captured) {
                             // CAPTURE — hijack tensor->data before capturing
+                            fprintf(stderr, "DBG: entering CAPTURE path\n");
                             h2_hijack.scan_and_hijack(phase2_gf);
                             void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_cuda_set_stream(gpu, 0);
