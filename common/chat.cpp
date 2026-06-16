@@ -2580,22 +2580,28 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     if (result.fail()) {
         // During partial parsing, return partial results if any AST nodes were captured
         // This allows streaming to work correctly for formats like FUNC_MARKDOWN_CODE_BLOCK
-        if (is_partial && result.end > 0) {
-            // Try to extract any partial results from what was successfully parsed
+        if (is_partial) {
+            if (result.end > 0) {
+                // Try to extract any partial results from what was successfully parsed
+                common_chat_msg msg;
+                msg.role = "assistant";
+                std::unique_ptr<common_chat_peg_mapper> mapper;
+                if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
+                    mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+                } else {
+                    mapper = std::make_unique<common_chat_peg_mapper>(msg);
+                }
+                mapper->from_ast(ctx.ast, result);
+
+                if (ctx.is_debug()) {
+                    fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
+                    fflush(stderr);
+                }
+                return msg;
+            }
+            // Nothing parsed yet during streaming — return empty message to try again later
             common_chat_msg msg;
             msg.role = "assistant";
-            std::unique_ptr<common_chat_peg_mapper> mapper;
-            if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
-            } else {
-                mapper = std::make_unique<common_chat_peg_mapper>(msg);
-            }
-            mapper->from_ast(ctx.ast, result);
-
-            if (ctx.is_debug()) {
-                fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
-                fflush(stderr);
-            }
             return msg;
         }
         throw std::runtime_error(std::string("Failed to parse input at pos ") + std::to_string(result.end) + ": " +
