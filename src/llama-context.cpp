@@ -1841,27 +1841,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const bool do_cuda = (ubatch.n_tokens == 1);
                     ggml_cgraph * phase2_gf;
 
-                    if (do_cuda && moe_weight_cache.cuda_graph_captured) {
-                        // REPLAY — skip build, restore inputs, launch graph
-                        res->inputs.clear();
-                        res->inputs = std::move(moe_weight_cache.phase2_inputs);
-                        res->t_logits = moe_weight_cache.phase2_t_logits;
-                        res->t_embd   = moe_weight_cache.phase2_t_embd;
+                    if (do_cuda && h2_hijack.captured) {
+                        // REPLAY — rebuild graph, restore tensor addresses,
+                        // inject input data from host, launch CUDA graph.
+                        res->reset();
+                        ggml_backend_sched_reset(sched.get());
+                        moe_weight_cache.build_layer_only = -1;
+                        moe_weight_cache.build_phase = 2;
+                        phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+                        if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
+                        ggml_backend_sched_reset(sched.get());
+                        force_idxs_to_cpu();
+                        if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
 
                         ggml_backend_t be = ggml_backend_sched_get_backend(sched.get(), 0);
-                        ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
-                        ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
+                        if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
+                        if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        res->set_inputs(&ubatch);
-                        ggml_backend_sched_synchronize(sched.get());
+                        // 1. Restore all tensor->data to static addresses
+                        h2_hijack.scan_and_update_snapshots(phase2_gf);
+                        h2_hijack.restore_all();
 
+                        // 2. Fill host buffers from Phase 1 GPU scratch tensors
+                        for (int il = 0; il < H2_N_LAYERS; il++) {
+                            if (moe_weight_cache.scratch_ffn_inp[il]) {
+                                cudaMemcpy(h2_inject.host_ffn_inp[il],
+                                           moe_weight_cache.scratch_ffn_inp[il]->data,
+                                           H2_SZ_INP, cudaMemcpyDeviceToHost);
+                            }
+                        }
+
+                        // 3. Record phase1 completion on CUDA stream
                         void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         ggml_backend_cuda_set_stream(gpu, 0);
-                        int cu = cudaGraphLaunch((cudaGraphExec_t)moe_weight_cache.cuda_graph_exec, st);
+                        h2_guard.record(st);
+
+                        // 4. Async H2D injection: host → static GPU buffer
+                        h2_inject.inject_all(h2_hijack, st);
+
+                        // 5. Launch CUDA Graph
+                        ggml_backend_sched_synchronize(sched.get());
+                        int cu = cudaGraphLaunch(h2_hijack.cuda_graph_exec, st);
                         if (cu != cudaSuccess) fprintf(stderr, "cuda_replay: %s\n", cudaGetErrorString(cu));
                         ggml_backend_sched_synchronize(sched.get());
 
-                        moe_weight_cache.phase2_inputs = std::move(res->inputs);
+                        // 6. Save logits data pointer for direct readback
+                        if (res->t_logits)
+                            moe_weight_cache.phase2_logits_data = res->t_logits->data;
                     } else {
                         // BUILD
                         res->reset();
@@ -1875,8 +1901,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
                         res->set_inputs(&ubatch);
 
-                        if (do_cuda && !moe_weight_cache.cuda_graph_captured) {
-                            // CAPTURE
+                        if (do_cuda && !h2_hijack.captured) {
+                            // CAPTURE — hijack tensor->data before capturing
+                            h2_hijack.scan_and_hijack(phase2_gf);
                             void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             ggml_backend_cuda_set_stream(gpu, 0);
                             ggml_backend_sched_synchronize(sched.get());
@@ -1887,10 +1914,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                     if (cudaStreamEndCapture(st, &g) == cudaSuccess) {
                                         cudaGraphExec_t ex;
                                         if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
-                                            moe_weight_cache.cuda_graph_exec = (void*)ex;
-                                            moe_weight_cache.cuda_graph_captured = true;
+                                            h2_hijack.cuda_graph_exec = ex;
+                                            h2_hijack.captured = true;
                                             cudaGraphDestroy(g);
-                                            fprintf(stderr, "cuda: captured\n");
+                                            fprintf(stderr, "cuda: captured phase2 hijack\n");
+                                            moe_weight_cache.cuda_graph_captured = true;
                                             moe_weight_cache.phase2_gf       = phase2_gf;
                                             moe_weight_cache.phase2_t_logits = res->t_logits;
                                             moe_weight_cache.phase2_t_embd   = res->t_embd;
