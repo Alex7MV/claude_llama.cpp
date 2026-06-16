@@ -168,9 +168,9 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     int total_nodes = ggml_graph_n_nodes(gf);
     int total_leafs = ggml_graph_n_leafs(gf);
 
-    // Diagnostic dump of first 30 tensors
+    // Diagnostic dump of tensor signatures
     int total_t = total_leafs + total_nodes;
-    int dump_n = total_t < 30 ? total_t : 30;
+    int dump_n = total_t < 100 ? total_t : 100;
     for (int i = 0; i < dump_n; i++) {
         ggml_tensor * t;
         if (i < total_leafs) { t = ggml_graph_leaf(gf, i); } else { t = ggml_graph_node(gf, i - total_leafs); }
@@ -196,7 +196,7 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
 
         int64_t ne0 = dst->ne[0];
 
-        if (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) {
+        if (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
             hijack_one(dst, addr(layer_idx, H2_OFF_INP));
             tensor_pos++; continue;
         }
@@ -211,7 +211,7 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
             tensor_pos++; continue;
         }
 
-        if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) {
+        if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) {
             hijack_one(dst, addr(layer_idx, H2_OFF_RESIDUAL));
             tensor_pos++; continue;
         }
@@ -266,10 +266,10 @@ void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
         int64_t ne0 = dst->ne[0];
         bool match = false;
 
-        if      (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) match = true;
+        if      (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) match = true;
         else if (tensor_pos == 1 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_I32) match = true;
         else if (tensor_pos == 2 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_F32) match = true;
-        else if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) match = true;
+        else if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16)) match = true;
         else if (tensor_pos == 4 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
         else if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
         else if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) match = true;
