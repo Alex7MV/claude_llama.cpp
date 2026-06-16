@@ -213,15 +213,6 @@ struct phase2_guard {
     void wait(void * stream); // cudaStreamWaitEvent
 };
 
-struct phase2_guard {
-    void * phase1_done_event = nullptr; // cudaEvent_t
-
-    void init();
-    void destroy();
-    void record(void * stream);
-    void wait(void * stream); // cudaStreamWaitEvent
-};
-
 #endif // GGML_USE_CUDA
 
 struct llama_context {
