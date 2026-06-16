@@ -156,7 +156,7 @@ struct phase2_hijack {
     bool   captured = false;
     cudaGraphExec_t cuda_graph_exec = nullptr;
 
-    void* addr(int il, size_t off) {
+    void* addr(int il, size_t off) const {
         return (char*)base + il * H2_LAYER_STRIDE + off;
     }
 
