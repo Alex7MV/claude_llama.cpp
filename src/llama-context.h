@@ -188,17 +188,23 @@ struct phase2_hijack {
 
 struct phase2_inject {
     void * host_ffn_inp[H2_N_LAYERS];
-    int    host_moe_ids[H2_N_LAYERS][8];
-    float  host_moe_w[H2_N_LAYERS][8];
+    int  * host_moe_ids[H2_N_LAYERS];
+    float * host_moe_w[H2_N_LAYERS];
 
     void init() {
-        for (int i = 0; i < H2_N_LAYERS; i++)
-            cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP, cudaHostAllocDefault);
+        for (int i = 0; i < H2_N_LAYERS; i++) {
+            cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP,     cudaHostAllocDefault);
+            cudaHostAlloc((void**)&host_moe_ids[i],  H2_SZ_IDS,     cudaHostAllocDefault);
+            cudaHostAlloc((void**)&host_moe_w[i],    H2_SZ_WEIGHTS, cudaHostAllocDefault);
+        }
     }
 
     void destroy() {
-        for (int i = 0; i < H2_N_LAYERS; i++)
-            if (host_ffn_inp[i]) { cudaFreeHost(host_ffn_inp[i]); host_ffn_inp[i] = nullptr; }
+        for (int i = 0; i < H2_N_LAYERS; i++) {
+            if (host_ffn_inp[i])  { cudaFreeHost(host_ffn_inp[i]);  host_ffn_inp[i]  = nullptr; }
+            if (host_moe_ids[i])  { cudaFreeHost(host_moe_ids[i]);  host_moe_ids[i]  = nullptr; }
+            if (host_moe_w[i])    { cudaFreeHost(host_moe_w[i]);    host_moe_w[i]    = nullptr; }
+        }
     }
 
     void fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w) {

@@ -1862,24 +1862,50 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         h2_hijack.scan_and_update_snapshots(phase2_gf);
                         h2_hijack.restore_all();
 
-                        // 2. Fill host buffers from Phase 1 GPU scratch tensors
+                        // 2. Get CUDA stream
+                        void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                        ggml_backend_cuda_set_stream(gpu, 0);
+
+                        // 3. Async D2D: ffn_inp from Phase 1 GPU scratch → static buffer
+                        //    No CPU round-trip — data stays on GPU.
                         for (int il = 0; il < H2_N_LAYERS; il++) {
                             if (moe_weight_cache.scratch_ffn_inp[il]) {
-                                cudaMemcpy(h2_inject.host_ffn_inp[il],
-                                           moe_weight_cache.scratch_ffn_inp[il]->data,
-                                           H2_SZ_INP, cudaMemcpyDeviceToHost);
+                                cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_INP),
+                                                moe_weight_cache.scratch_ffn_inp[il]->data,
+                                                H2_SZ_INP, cudaMemcpyDeviceToDevice, st);
                             }
                         }
 
-                        // 3. Record phase1 completion on CUDA stream
-                        void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                        ggml_backend_cuda_set_stream(gpu, 0);
+                        // 4. Async D2H: moe_ids + moe_weights from GPU scratch → pinned CPU buffers
+                        for (int il = 0; il < H2_N_LAYERS; il++) {
+                            if (moe_weight_cache.scratch_moe_ids[il]) {
+                                cudaMemcpyAsync(h2_inject.host_moe_ids[il],
+                                                moe_weight_cache.scratch_moe_ids[il]->data,
+                                                H2_SZ_IDS, cudaMemcpyDeviceToHost, st);
+                            }
+                            if (moe_weight_cache.scratch_moe_weights[il]) {
+                                cudaMemcpyAsync(h2_inject.host_moe_w[il],
+                                                moe_weight_cache.scratch_moe_weights[il]->data,
+                                                H2_SZ_WEIGHTS, cudaMemcpyDeviceToHost, st);
+                            }
+                        }
+
+                        // 5. Async H2D: pinned CPU buffers → static buffer offsets (ids + weights)
+                        //    Queued on same stream — CUDA guarantees D2H above completes before H2D starts.
+                        for (int il = 0; il < H2_N_LAYERS; il++) {
+                            cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_IDS),
+                                            h2_inject.host_moe_ids[il],
+                                            H2_SZ_IDS, cudaMemcpyHostToDevice, st);
+                            cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_WEIGHTS),
+                                            h2_inject.host_moe_w[il],
+                                            H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, st);
+                        }
+
+                        // 6. Record barrier AFTER all async copies are queued on the stream.
+                        //    cudaGraphLaunch below will not start until all prior stream ops complete.
                         h2_guard.record(st);
 
-                        // 4. Async H2D injection: host → static GPU buffer
-                        h2_inject.inject_all(h2_hijack, st);
-
-                        // 5. Launch CUDA Graph
+                        // 7. Launch CUDA Graph
                         ggml_backend_sched_synchronize(sched.get());
                         int cu = cudaGraphLaunch(h2_hijack.cuda_graph_exec, st);
                         if (cu != cudaSuccess) fprintf(stderr, "cuda_replay: %s\n", cudaGetErrorString(cu));
