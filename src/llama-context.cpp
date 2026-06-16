@@ -14,6 +14,7 @@ extern "C" {
     int  cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, const char*, const char*, unsigned int);
     int  cudaGraphLaunch(cudaGraphExec_t, void*);
     int  cudaGraphDestroy(cudaGraph_t);
+    int  cudaGraphExecDestroy(cudaGraphExec_t);
     const char* cudaGetErrorString(int);
     int  cudaMemcpy(void*, const void*, size_t, int);
 }
@@ -52,6 +53,7 @@ extern "C" {
     int cudaStreamSynchronize(void * stream);
 }
 constexpr int cudaMemcpyDeviceToHost = 2;
+constexpr int cudaMemcpyDeviceToDevice = 3;
 
 // Static memory hijacking: additional CUDA API forward declarations
 extern "C" {
@@ -93,6 +95,57 @@ void llama_context::h2_destroy() {
     h2_hijack.destroy();
     h2_inject.destroy();
     h2_guard.destroy();
+}
+
+void phase2_hijack::init() {
+    cudaMalloc(&base, H2_N_LAYERS * H2_LAYER_STRIDE);
+}
+
+void phase2_hijack::destroy() {
+    if (cuda_graph_exec) { cudaGraphExecDestroy((cudaGraphExec_t)cuda_graph_exec); cuda_graph_exec = nullptr; }
+    if (base)           { cudaFree(base); base = nullptr; }
+}
+
+void phase2_inject::init() {
+    for (int i = 0; i < H2_N_LAYERS; i++) {
+        cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP,     cudaHostAllocDefault);
+        cudaHostAlloc((void**)&host_moe_ids[i],  H2_SZ_IDS,     cudaHostAllocDefault);
+        cudaHostAlloc((void**)&host_moe_w[i],    H2_SZ_WEIGHTS, cudaHostAllocDefault);
+    }
+}
+
+void phase2_inject::destroy() {
+    for (int i = 0; i < H2_N_LAYERS; i++) {
+        if (host_ffn_inp[i])  { cudaFreeHost(host_ffn_inp[i]);  host_ffn_inp[i]  = nullptr; }
+        if (host_moe_ids[i])  { cudaFreeHost(host_moe_ids[i]);  host_moe_ids[i]  = nullptr; }
+        if (host_moe_w[i])    { cudaFreeHost(host_moe_w[i]);    host_moe_w[i]    = nullptr; }
+    }
+}
+
+void phase2_inject::fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w) {
+    memcpy(host_ffn_inp[il], ffn_inp_src, H2_SZ_INP);
+    memcpy(host_moe_ids[il],  ids,         H2_SZ_IDS);
+    memcpy(host_moe_w[il],    w,           H2_SZ_WEIGHTS);
+}
+
+void phase2_inject::inject_all(const phase2_hijack & hijack, void * stream) {
+    for (int il = 0; il < H2_N_LAYERS; il++) {
+        cudaMemcpyAsync(hijack.addr(il, H2_OFF_INP),     host_ffn_inp[il], H2_SZ_INP,     cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(hijack.addr(il, H2_OFF_IDS),     host_moe_ids[il],  H2_SZ_IDS,     cudaMemcpyHostToDevice, stream);
+        cudaMemcpyAsync(hijack.addr(il, H2_OFF_WEIGHTS), host_moe_w[il],    H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, stream);
+    }
+}
+
+void phase2_guard::init() {
+    cudaEventCreate(&phase1_done_event);
+}
+
+void phase2_guard::destroy() {
+    if (phase1_done_event) { cudaEventDestroy(phase1_done_event); phase1_done_event = nullptr; }
+}
+
+void phase2_guard::record(void * stream) {
+    cudaEventRecord(phase1_done_event, stream);
 }
 
 void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {

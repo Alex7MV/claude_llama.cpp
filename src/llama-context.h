@@ -154,25 +154,16 @@ struct phase2_hijack {
     entry  snapshots[MAX_SNAPSHOTS];
     int    snapshot_count = 0;
     bool   captured = false;
-    cudaGraphExec_t cuda_graph_exec = nullptr;
+    void * cuda_graph_exec = nullptr; // cudaGraphExec_t
 
     void* addr(int il, size_t off) const {
         return (char*)base + il * H2_LAYER_STRIDE + off;
     }
 
-    void init() {
-        cudaMalloc(&base, H2_N_LAYERS * H2_LAYER_STRIDE);
-    }
-
-    void destroy() {
-        if (cuda_graph_exec) { cudaGraphExecDestroy(cuda_graph_exec); cuda_graph_exec = nullptr; }
-        if (base)           { cudaFree(base); base = nullptr; }
-    }
-
-    void hijack_one(ggml_tensor * t, void * addr) {
+    void hijack_one(ggml_tensor * t, void * static_addr) {
         snapshots[snapshot_count].t           = t;
-        snapshots[snapshot_count].static_addr = addr;
-        t->data = addr;
+        snapshots[snapshot_count].static_addr = static_addr;
+        t->data = static_addr;
         snapshot_count++;
     }
 
@@ -182,6 +173,8 @@ struct phase2_hijack {
         asm volatile("" ::: "memory");
     }
 
+    void init();
+    void destroy();
     void scan_and_hijack(ggml_cgraph * gf);
     void scan_and_update_snapshots(ggml_cgraph * gf);
 };
@@ -191,46 +184,18 @@ struct phase2_inject {
     int  * host_moe_ids[H2_N_LAYERS];
     float * host_moe_w[H2_N_LAYERS];
 
-    void init() {
-        for (int i = 0; i < H2_N_LAYERS; i++) {
-            cudaHostAlloc(&host_ffn_inp[i], H2_SZ_INP,     cudaHostAllocDefault);
-            cudaHostAlloc((void**)&host_moe_ids[i],  H2_SZ_IDS,     cudaHostAllocDefault);
-            cudaHostAlloc((void**)&host_moe_w[i],    H2_SZ_WEIGHTS, cudaHostAllocDefault);
-        }
-    }
-
-    void destroy() {
-        for (int i = 0; i < H2_N_LAYERS; i++) {
-            if (host_ffn_inp[i])  { cudaFreeHost(host_ffn_inp[i]);  host_ffn_inp[i]  = nullptr; }
-            if (host_moe_ids[i])  { cudaFreeHost(host_moe_ids[i]);  host_moe_ids[i]  = nullptr; }
-            if (host_moe_w[i])    { cudaFreeHost(host_moe_w[i]);    host_moe_w[i]    = nullptr; }
-        }
-    }
-
-    void fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w) {
-        memcpy(host_ffn_inp[il], ffn_inp_src, H2_SZ_INP);
-        memcpy(host_moe_ids[il],  ids,         H2_SZ_IDS);
-        memcpy(host_moe_w[il],    w,           H2_SZ_WEIGHTS);
-    }
-
-    void inject_all(const phase2_hijack & hijack, cudaStream_t stream) {
-        for (int il = 0; il < H2_N_LAYERS; il++) {
-            cudaMemcpyAsync(hijack.addr(il, H2_OFF_INP),     host_ffn_inp[il], H2_SZ_INP,     cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(hijack.addr(il, H2_OFF_IDS),     host_moe_ids[il],  H2_SZ_IDS,     cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(hijack.addr(il, H2_OFF_WEIGHTS), host_moe_w[il],    H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, stream);
-        }
-    }
+    void init();
+    void destroy();
+    void fill_layer(int il, const void * ffn_inp_src, const int * ids, const float * w);
+    void inject_all(const phase2_hijack & hijack, void * stream);
 };
 
 struct phase2_guard {
-    cudaEvent_t phase1_done_event = nullptr;
+    void * phase1_done_event = nullptr; // cudaEvent_t
 
-    void init() { cudaEventCreate(&phase1_done_event); }
-    void destroy() { if (phase1_done_event) { cudaEventDestroy(phase1_done_event); phase1_done_event = nullptr; } }
-
-    void record(cudaStream_t stream) {
-        cudaEventRecord(phase1_done_event, stream);
-    }
+    void init();
+    void destroy();
+    void record(void * stream);
 };
 
 #endif // GGML_USE_CUDA
