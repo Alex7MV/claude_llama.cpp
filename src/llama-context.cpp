@@ -778,12 +778,13 @@ static void extract_embd_pooled(
             } break;
         case LLAMA_POOLING_TYPE_UNSPECIFIED:
             {
+                // diagnostic: cuda_hijack scan stats
+                // quired = H2_N_LAYERS * N_TENSOR_TYPES
+                // fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d)\n",
+                //         snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs);
                 GGML_ABORT("unknown pooling type");
-quired = H2_N_LAYERS * N_TENSOR_TYPES
-        fprintf(stderr, "cuda_hijack: scanned %d/%d tensors (n_nodes=%d n_leafs=%d)\n",
-                snapshot_count, H2_N_LAYERS * N_TENSOR_TYPES, gf->n_nodes, gf->n_leafs);
+            } break;
     }
-}
 }
 
 void llama_context::sched_reserve() {
@@ -2268,6 +2269,11 @@ void llama_context::init_moe_weight_cache() {
         }
     }
     if (!gpu) return;
+
+    if (model.n_gpu_layers() == 0) {
+        LLAMA_LOG_INFO("%s: no GPU layers offloaded, skipping MoE weight cache\n", __func__);
+        return;
+    }
 
     // Find a representative MoE layer to determine tensor shapes
     int ref_il = -1;
