@@ -1911,16 +1911,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        // 1. Restore all tensor->data to static addresses
-                        h2_hijack.scan_and_update_snapshots(phase2_gf);
-                        h2_hijack.restore_all();
-
-                        // 2. Get CUDA stream
+                        // 1. Get CUDA stream BEFORE any data copies
                         void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         ggml_backend_cuda_set_stream(gpu, 0);
 
-                        // 3. Async D2D: ffn_inp from Phase 1 GPU scratch → static buffer
-                        //    No CPU round-trip — data stays on GPU.
+                        // 2. D2D ffn_inp: copy from Phase 1 GPU scratch → static buffer
+                        //    MUST happen BEFORE restore_all() — after hijack,
+                        //    scratch_ffn_inp[il]->data points to OUR static buffer (self-copy).
                         for (int il = 0; il < H2_N_LAYERS; il++) {
                             if (moe_weight_cache.scratch_ffn_inp[il]) {
                                 cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_INP),
@@ -1929,7 +1926,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
 
-                        // 4. Async D2H: moe_ids + moe_weights from GPU scratch → pinned CPU buffers
+                        // 3. D2H moe_ids + moe_weights: GPU scratch → pinned CPU
+                        //    Same constraint: must happen before restore_all().
                         for (int il = 0; il < H2_N_LAYERS; il++) {
                             if (moe_weight_cache.scratch_moe_ids[il]) {
                                 cudaMemcpyAsync(h2_inject.host_moe_ids[il],
@@ -1943,8 +1941,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
 
-                        // 5. Async H2D: pinned CPU buffers → static buffer offsets (ids + weights)
-                        //    Queued on same stream — CUDA guarantees D2H above completes before H2D starts.
+                        // 4. Restore all tensor->data to static addresses (now safe)
+                        h2_hijack.scan_and_update_snapshots(phase2_gf);
+                        h2_hijack.restore_all();
+
+                        // 5. H2D: pinned CPU buffers → static buffer (ids + weights)
+                        //    Uses h2_inject host buffers (unaffected by restore_all).
                         for (int il = 0; il < H2_N_LAYERS; il++) {
                             cudaMemcpyAsync(h2_hijack.addr(il, H2_OFF_IDS),
                                             h2_inject.host_moe_ids[il],
@@ -1954,8 +1956,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                             H2_SZ_WEIGHTS, cudaMemcpyHostToDevice, st);
                         }
 
-                        // 6. Record barrier AFTER all async copies are queued on the stream.
-                        //    cudaGraphLaunch below will not start until all prior stream ops complete.
+                        // 6. Record barrier after all copies are queued
                         h2_guard.record(st);
 
                         // 7. Launch CUDA Graph
