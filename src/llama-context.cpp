@@ -9,6 +9,7 @@ typedef void* cudaStream_t;
 typedef void* cudaEvent_t;
 typedef void* cudaGraph_t;
 typedef void* cudaGraphExec_t;
+typedef int   cudaError_t;
 #define cudaSuccess 0
 extern "C" {
     int  cudaStreamCreate(cudaStream_t*);
@@ -192,7 +193,7 @@ std::pair<int,int> phase2_hijack::match_name(const char * name) const {
     return {-1, -1};
 }
 
-void phase2_hijack::allocate_slots(int max_il) {
+void phase2_hijack::allocate_slots(int /*max_il*/) {
     size_t total = 0;
     for (int i = 0; i < n_slots; i++) {
         if (slots[i].size > 0 && slots[i].parent < 0) {
