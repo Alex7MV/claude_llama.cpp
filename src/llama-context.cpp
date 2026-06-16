@@ -52,6 +52,19 @@ extern "C" {
     int cudaStreamSynchronize(void * stream);
 }
 constexpr int cudaMemcpyDeviceToHost = 2;
+
+// Static memory hijacking: additional CUDA API forward declarations
+extern "C" {
+    int cudaMalloc(void ** devPtr, size_t size);
+    int cudaFree(void * devPtr);
+    int cudaHostAlloc(void ** pHost, size_t size, unsigned int flags);
+    int cudaFreeHost(void * ptr);
+    int cudaEventCreate(void ** event);
+    int cudaEventDestroy(void * event);
+    int cudaEventRecord(void * event, void * stream);
+}
+constexpr int cudaMemcpyHostToDevice = 1;
+constexpr int cudaHostAllocDefault   = 0;
 #endif
 
 
@@ -67,6 +80,113 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+#ifdef GGML_USE_CUDA
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+
+void llama_context::h2_init() {
+    h2_hijack.init();
+    h2_inject.init();
+    h2_guard.init();
+}
+
+void llama_context::h2_destroy() {
+    h2_hijack.destroy();
+    h2_inject.destroy();
+    h2_guard.destroy();
+}
+
+void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
+    snapshot_count = 0;
+    int layer_idx = 0;
+    int tensor_pos = 0;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * dst = ggml_graph_node(gf, i);
+
+        if (layer_idx >= H2_N_LAYERS) break;
+
+        int64_t ne0 = dst->ne[0];
+
+        if (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_INP));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 1 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_I32) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_IDS));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 2 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_F32) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_WEIGHTS));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_RESIDUAL));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 4 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_GATE));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_UP));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_SILU));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 7 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_N_EMBD) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_DOWN));
+            tensor_pos++; continue;
+        }
+
+        if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) {
+            hijack_one(dst, addr(layer_idx, H2_OFF_OUT));
+            tensor_pos = 0;
+            layer_idx++;
+        }
+    }
+}
+
+void phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
+    int idx = 0;
+    int layer_idx = 0;
+    int tensor_pos = 0;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * dst = ggml_graph_node(gf, i);
+        if (layer_idx >= H2_N_LAYERS) break;
+
+        int64_t ne0 = dst->ne[0];
+        bool match = false;
+
+        if      (tensor_pos == 0 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) match = true;
+        else if (tensor_pos == 1 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_I32) match = true;
+        else if (tensor_pos == 2 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == 8 && dst->type == GGML_TYPE_F32) match = true;
+        else if (tensor_pos == 3 && (dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD && dst->type == GGML_TYPE_F16) match = true;
+        else if (tensor_pos == 4 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
+        else if (tensor_pos == 5 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_FFN_DIM) match = true;
+        else if (tensor_pos == 6 && dst->op == GGML_OP_MUL && ne0 == H2_FFN_DIM) match = true;
+        else if (tensor_pos == 7 && dst->op == GGML_OP_MUL_MAT_ID && ne0 == H2_N_EMBD) match = true;
+        else if (tensor_pos == 8 && !(dst->flags & GGML_TENSOR_FLAG_INPUT) && ne0 == H2_N_EMBD) { match = true; layer_idx++; }
+
+        if (match && idx < snapshot_count) {
+            snapshots[idx].t = dst;
+            idx++;
+            tensor_pos = (tensor_pos == 8) ? 0 : tensor_pos + 1;
+        }
+    }
+}
+
+#endif // LLAMA_DEEPSEEK_PIPELINE
+#endif // GGML_USE_CUDA
 
 llama_context::llama_context(
         const llama_model & model,
@@ -431,6 +551,11 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+#ifdef GGML_USE_CUDA
+    h2_init();
+#endif
+#endif
 }
 
 llama_context::~llama_context() {
@@ -474,6 +599,9 @@ llama_context::~llama_context() {
 
         moe_weight_cache.populated = false;
     }
+#ifdef GGML_USE_CUDA
+    h2_destroy();
+#endif
 #endif
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
