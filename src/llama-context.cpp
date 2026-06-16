@@ -5,10 +5,14 @@
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 // Minimal CUDA graph API (avoids cuda_runtime.h include issues)
+typedef void* cudaStream_t;
+typedef void* cudaEvent_t;
 typedef void* cudaGraph_t;
 typedef void* cudaGraphExec_t;
 #define cudaSuccess 0
 extern "C" {
+    int  cudaStreamCreate(cudaStream_t*);
+    int  cudaStreamDestroy(cudaStream_t);
     int  cudaStreamBeginCapture(void*, int);
     int  cudaStreamEndCapture(void*, cudaGraph_t*);
     int  cudaGraphInstantiate(cudaGraphExec_t*, cudaGraph_t, const char*, const char*, unsigned int);
@@ -64,6 +68,7 @@ extern "C" {
     int cudaEventCreate(void ** event);
     int cudaEventDestroy(void * event);
     int cudaEventRecord(void * event, void * stream);
+    int cudaStreamWaitEvent(void * stream, void * event, unsigned int flags);
 }
 constexpr int cudaMemcpyHostToDevice = 1;
 constexpr int cudaHostAllocDefault   = 0;
@@ -1646,14 +1651,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        // Build graph, optionally extracting pipeline data and initializing
-        // the DeepSeek pipeline scheduler (done inside build_graph while the
-        // graph context is still alive).
-#ifdef LLAMA_DEEPSEEK_PIPELINE
         bool want_pipeline = cparams.deepseek_pipeline && model.arch == LLM_ARCH_DEEPSEEK32;
         bool want_moe_cache = cparams.deepseek_pipeline && model.hparams.n_expert > 0;
         struct llama_pipeline_setup pipe_setup;
 
+        // Build graph, optionally extracting pipeline data and initializing
+        // the DeepSeek pipeline scheduler (done inside build_graph while the
+        // graph context is still alive).
+#ifdef LLAMA_DEEPSEEK_PIPELINE
         // Initialize MoE GPU weight cache on first use
         if (want_moe_cache && !moe_weight_cache.populated) {
             init_moe_weight_cache();
@@ -2094,7 +2099,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ret = GGML_STATUS_SUCCESS;
                 return res;
             }
-        }
 #endif
         {
             // Single-phase: full graph (v1 cache or original weights)
