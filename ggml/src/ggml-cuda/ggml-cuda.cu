@@ -3261,7 +3261,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && "unsupported buffer type");
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buf->buft->context;
+    GGML_ASSERT(buft_ctx->device == cuda_ctx->device && "buffer device mismatch");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -3270,7 +3272,13 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && "unsupported buffer type");
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buf->buft->context;
+    if (buft_ctx->device != cuda_ctx->device) {
+        fprintf(stderr, "CUDA get_tensor_async: buf dev=%d ctx dev=%d tensor=%s size=%zu\n",
+            buft_ctx->device, cuda_ctx->device, tensor->name, size);
+    }
+    GGML_ASSERT(buft_ctx->device == cuda_ctx->device && "buffer device mismatch");
 
     cudaStream_t rb_stream = cuda_ctx->readback_stream_get();
 
@@ -3289,7 +3297,9 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && "unsupported buffer type");
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buf->buft->context;
+    GGML_ASSERT(buft_ctx->device == cuda_ctx->device && "buffer device mismatch");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -3300,7 +3310,9 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && "unsupported buffer type");
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buf->buft->context;
+    GGML_ASSERT(buft_ctx->device == cuda_ctx->device && "buffer device mismatch");
 
     cudaStream_t rb_stream = cuda_ctx->readback_stream_get();
 
