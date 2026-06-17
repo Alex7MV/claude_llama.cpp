@@ -2032,6 +2032,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
                         if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
                         ggml_backend_sched_reset(sched.get());
+                        for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++)
+                            ggml_backend_sched_set_tensor_backend(sched.get(), ggml_graph_node(phase2_gf, i), gpu);
+                        for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++)
+                            ggml_backend_sched_set_tensor_backend(sched.get(), ggml_graph_leaf(phase2_gf, i), gpu);
                         force_idxs_to_cpu();
                         if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
 
@@ -2048,17 +2052,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         // 3. Copy scratch data to hijacked static addresses
                         void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                         h2_hijack.copy_data_to_static(st);
-
-                        // 4. Record barrier
-                        h2_guard.record(st);
-
-                        // 5. Launch CUDA Graph
-                        ggml_backend_sched_synchronize(sched.get());
-                        int cu = cudaGraphLaunch(h2_hijack.cuda_graph_exec, st);
-                        if (cu != cudaSuccess) fprintf(stderr, "cuda_replay: %s\n", cudaGetErrorString(cu));
                         ggml_backend_sched_synchronize(sched.get());
 
-                        // 6. Save logits data pointer for direct readback
+                        // 4. Normal graph compute (CUDA graph replay disabled:
+                        //    non-hijacked tensors get different allocator addresses
+                        //    on replay, causing illegal memory access on capture-time
+                        //    addresses recorded in the graph)
+                        {
+                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
+                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                        }
+
+                        // 5. Save logits data pointer for direct readback
                         if (res->t_logits)
                             moe_weight_cache.phase2_logits_data = res->t_logits->data;
                     } else {
