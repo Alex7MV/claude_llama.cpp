@@ -2729,6 +2729,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
         const uint32_t n_embd = hparams.n_embd;
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
+#ifdef GGML_USE_CUDA
+        if (moe_weight_cache.cuda_graph_captured && t_h_pre_norm->data) {
+            cudaMemcpy(embd_pre_norm.data, t_h_pre_norm->data, n_tokens*n_embd*sizeof(float), cudaMemcpyDeviceToHost);
+        } else
+#endif
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
@@ -3107,6 +3112,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 float * embd_pre_norm_out = embd_pre_norm.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
+#ifdef GGML_USE_CUDA
+                if (moe_weight_cache.cuda_graph_captured && t_h_pre_norm->data) {
+                    cudaMemcpy(embd_pre_norm_out, (char*)t_h_pre_norm->data + offset*n_embd*sizeof(float),
+                        n_rows*n_embd*sizeof(float), cudaMemcpyDeviceToHost);
+                } else
+#endif
                 ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
             }
         }
