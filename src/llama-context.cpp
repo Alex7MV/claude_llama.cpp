@@ -11,6 +11,7 @@ typedef void* cudaGraph_t;
 typedef void* cudaGraphExec_t;
 typedef int   cudaError_t;
 #define cudaSuccess 0
+constexpr int cudaStreamCaptureModeGlobal = 0;
 extern "C" {
     int  cudaStreamCreate(cudaStream_t*);
     int  cudaStreamDestroy(cudaStream_t);
@@ -261,7 +262,7 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
         if (t->view_src) {
             ptrdiff_t off = (char*)t->data - (char*)t->view_src->data;
             slots[s_idx].offset = off;
-            slots[s_idx].parent = 1000; // mark as view, skip allocation
+            slots[s_idx].parent = -2; // mark as view, skip allocation
             Match m = {t, type_id, il, t->data};
             views.push_back(m);
         } else {
@@ -289,6 +290,7 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
     for (auto & m : matches) {
         int s_idx = slot_idx(m.il, m.type_id);
         if (s_idx < 0 || s_idx >= n_slots || !slots[s_idx].addr) { skipped++; continue; }
+        slots[s_idx].orig_data = m.orig;
         m.t->data = slots[s_idx].addr;
         slot_scan_count++;
     }
@@ -300,14 +302,13 @@ void phase2_hijack::scan_and_hijack(ggml_cgraph * gf) {
         if (pid < 0 || pid >= N_TYPES) { skipped++; continue; }
         int p_idx = slot_idx(pl, pid);
         if (p_idx < 0 || p_idx >= n_slots || !slots[p_idx].addr) { skipped++; continue; }
-        // Re-use parent's buffer — don't allocate separately
         int s_idx = slot_idx(m.il, m.type_id);
+        void * view_addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
         if (s_idx >= 0 && s_idx < n_slots) {
-            slots[s_idx].addr = (char*)slots[p_idx].addr + slots[s_idx].offset;
-            m.t->data = slots[s_idx].addr;
-        } else {
-            m.t->data = (char*)slots[p_idx].addr + slots[s_idx].offset;
+            slots[s_idx].addr = view_addr;
+            slots[s_idx].orig_data = m.orig;
         }
+        m.t->data = view_addr;
         slot_scan_count++;
     }
 
@@ -343,8 +344,16 @@ bool phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
 
 void phase2_hijack::restore_all() {
     // Data pointers were already set by scan_and_hijack / scan_and_update_snapshots
-    // This is a no-op for the new design but maintained for API compatibility.
     asm volatile("" ::: "memory");
+}
+
+void phase2_hijack::copy_data_to_static(void* cuda_stream) {
+    for (int i = 0; i < n_slots; i++) {
+        if (slots[i].addr && slots[i].orig_data && slots[i].size > 0) {
+            cudaMemcpyAsync(slots[i].addr, slots[i].orig_data,
+                slots[i].size, cudaMemcpyDeviceToDevice, (cudaStream_t)cuda_stream);
+        }
+    }
 }
 
 #endif // LLAMA_DEEPSEEK_PIPELINE
@@ -2027,22 +2036,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         // 1. Restore tensor->data to static buffer addresses
                         h2_hijack.scan_and_update_snapshots(phase2_gf);
 
-                        // 2. Set input data (embeddings, positions, etc.) — writes to
-                        //    allocator-assigned addresses which should be deterministic.
+                        // 2. Set input data
                         res->set_inputs(&ubatch);
 
-                        // 3. Record barrier (copies from Phase 1 scratch are handled
-                        //    directly by the persistent scratch tensors — no D2D needed)
-                        void* st = h2_hijack.stream;
+                        // 3. Copy scratch data to hijacked static addresses
+                        void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                        h2_hijack.copy_data_to_static(st);
+
+                        // 4. Record barrier
                         h2_guard.record(st);
 
-                        // 4. Launch CUDA Graph
+                        // 5. Launch CUDA Graph
                         ggml_backend_sched_synchronize(sched.get());
                         int cu = cudaGraphLaunch(h2_hijack.cuda_graph_exec, st);
                         if (cu != cudaSuccess) fprintf(stderr, "cuda_replay: %s\n", cudaGetErrorString(cu));
                         ggml_backend_sched_synchronize(sched.get());
 
-                        // 5. Save logits data pointer for direct readback
+                        // 6. Save logits data pointer for direct readback
                         if (res->t_logits)
                             moe_weight_cache.phase2_logits_data = res->t_logits->data;
                     } else {
@@ -2062,9 +2072,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
                         if (do_cuda) {
-                            // Normal compute with CUDA-capable backends
-                            // (CUDA graph capture skipped — mixed CPU/GPU buffer backends
-                            //  are incompatible with cudaStreamBeginCapture)
+                            // Normal compute: Phase 2 runs on hybrid CPU/GPU backends.
+                            // (CUDA graph capture infrastructure is in place but disabled
+                            //  pending fix for graph_compute crash during capture.)
                         }
                         res->set_inputs(&ubatch);
                         ggml_backend_sched_synchronize(sched.get());

@@ -152,8 +152,9 @@ struct phase2_hijack {
     struct slot {
         void * addr;       // GPU address in static buffer
         size_t size;       // allocated size (H2_ALIGN_UP of actual tensor size)
-        int    parent;     // TypeId of parent tensor for VIEWs (-1 if not a VIEW)
+        int    parent;     // TypeId of parent tensor for VIEWs, -1=own, -2=view
         ptrdiff_t offset;  // byte offset from parent's addr (for VIEWs)
+        void * orig_data;  // original tensor->data before hijack
     };
 
     // Static GPU buffer
@@ -179,13 +180,17 @@ struct phase2_hijack {
     // Set all matched tensors to their slot addresses
     void restore_all();
 
+    // Copy data from original addresses to hijacked static addresses (D2D)
+    void copy_data_to_static(void* cuda_stream);
+
+    // Parse tensor name "prefix-{il}" → (type_id, il) or (-1, -1)
+    std::pair<int,int> match_name(const char * name) const;
+
     // Lifetime
     void init(int n_moe_layers);
     void destroy();
 
 private:
-    // Parse tensor name "prefix-{il}" → (type_id, il) or (-1, -1)
-    std::pair<int,int> match_name(const char * name) const;
 
     // Allocate once: compute sizes from first scan, cudaMalloc, assign offsets
     void allocate_slots(int max_il);
