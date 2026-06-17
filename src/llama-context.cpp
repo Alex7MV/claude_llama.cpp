@@ -2095,6 +2095,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
                                 ret = GGML_STATUS_ALLOC_FAILED; return nullptr;
                             }
+                            #ifdef GGML_USE_CUDA
+                            fprintf(stderr, "phase2_dump: %d nodes, %d leafs\n",
+                                ggml_graph_n_nodes(phase2_gf), ggml_graph_n_leafs(phase2_gf));
+                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
+                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
+                                ggml_backend_t be_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                                fprintf(stderr, "phase2[node %d]: %s op=%d cuda=%d\n", i, t->name, (int)t->op,
+                                    be_t ? ggml_backend_is_cuda(be_t) : -1);
+                            }
+                            #endif
                             if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                             if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
