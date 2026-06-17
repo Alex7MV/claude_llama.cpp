@@ -1699,7 +1699,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             auto * base = inp.get();
             if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
                 force(akv->self_k_idxs); force(akv->self_v_idxs);
-                force(akv->self_kq_mask); force(akv->self_kq_mask_swa);
+                force(akv->self_kq_mask);
             } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
                 force(ak->self_k_idxs); force(ak->self_kq_mask);
             } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
