@@ -1699,20 +1699,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             auto * base = inp.get();
             if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
                 force(akv->self_k_idxs); force(akv->self_v_idxs);
+                force(akv->self_kq_mask); force(akv->self_kq_mask_swa);
             } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
-                force(ak->self_k_idxs);
+                force(ak->self_k_idxs); force(ak->self_kq_mask);
             } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
                 force(dsa->self_k_idxs_mla); force(dsa->self_k_idxs_lid);
+                force(dsa->self_kq_mask_mla); force(dsa->self_kq_mask_lid);
             } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
                 force(iswa->self_k_idxs); force(iswa->self_v_idxs);
                 force(iswa->self_k_idxs_swa); force(iswa->self_v_idxs_swa);
+                force(iswa->self_kq_mask); force(iswa->self_kq_mask_swa);
             } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
                 force(hyb->inp_attn->self_k_idxs); force(hyb->inp_attn->self_v_idxs);
+                force(hyb->inp_attn->self_kq_mask);
             } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
                 force(hybk->inp_attn->self_k_idxs);
+                force(hybk->inp_attn->self_kq_mask);
             } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
                 force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
                 force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
+                force(hybiswa->inp_attn->self_kq_mask); force(hybiswa->inp_attn->self_kq_mask_swa);
             } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
                 force(oid->out_ids);
             }
