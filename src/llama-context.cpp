@@ -12,6 +12,7 @@ typedef void* cudaGraphExec_t;
 typedef int   cudaError_t;
 #define cudaSuccess 0
 constexpr int cudaStreamCaptureModeGlobal = 0;
+constexpr int cudaStreamCaptureModeRelaxed = 2;
 extern "C" {
     int  cudaStreamCreate(cudaStream_t*);
     int  cudaStreamDestroy(cudaStream_t);
@@ -335,7 +336,11 @@ bool phase2_hijack::scan_and_update_snapshots(ggml_cgraph * gf) {
         void * target = slots[s_idx].addr;
         if (!target) continue;
 
-        if (t->data != target) { t->data = target; }
+        // Save current data ptr as source for D2D copy before overwriting
+        if (t->data != target) {
+            slots[s_idx].orig_data = t->data;
+            t->data = target;
+        }
         found++;
     }
 
@@ -2071,14 +2076,90 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        if (do_cuda) {
-                            // Normal compute: Phase 2 runs on hybrid CPU/GPU backends.
-                            // (CUDA graph capture infrastructure is in place but disabled
-                            //  pending fix for graph_compute crash during capture.)
+                        if (do_cuda && !h2_hijack.captured) {
+                            // --- CAPTURE PATH ---
+                            // 1. Reset + force All Phase 2 ops/srcs to GPU, then alloc
+                            ggml_backend_sched_reset(sched.get());
+                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
+                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
+                                auto [tid, il] = h2_hijack.match_name(t->name);
+                                if (tid >= 0) ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
+                                if (t->op == GGML_OP_GLU) {
+                                    for (int s = 0; s < 2 && t->src[s]; s++)
+                                        ggml_backend_sched_set_tensor_backend(sched.get(), t->src[s], gpu);
+                                }
+                                if (t->op == GGML_OP_MUL_MAT_ID) {
+                                    for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
+                                        if (s == 0) continue; // src[0]=weight: MoE cache GPU buffer, don't force
+                                        ggml_backend_sched_set_tensor_backend(sched.get(), t->src[s], gpu);
+                                    }
+                                }
+                            }
+                            for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
+                                ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
+                                auto [tid, il] = h2_hijack.match_name(t->name);
+                                if (tid >= 0) ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
+                            }
+                            force_idxs_to_cpu();
+                            if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
+                                ret = GGML_STATUS_ALLOC_FAILED; return nullptr;
+                            }
+                            if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
+                            if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
+
+                            // 3. Hijack tensor->data to static GPU addresses
+                            h2_hijack.scan_and_hijack(phase2_gf);
+                            if (h2_hijack.slot_scan_count < (h2_hijack.n_layers * h2_hijack.N_TYPES) / 2) {
+                                fprintf(stderr, "cuda: CAPTURE ABORT — expected ~%d hijacks, got %d\n",
+                                        h2_hijack.n_layers * h2_hijack.N_TYPES, h2_hijack.slot_scan_count);
+                                res->set_inputs(&ubatch);
+                                ggml_backend_sched_synchronize(sched.get());
+                                auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
+                                if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                            } else {
+                                // 4. Set inputs + D2D copy Phase 1 data to static addresses
+                                res->set_inputs(&ubatch);
+                                void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                                h2_hijack.copy_data_to_static(capture_st);
+                                ggml_backend_sched_synchronize(sched.get());
+
+                                // 5. CUDA Graph Capture
+                                if (cudaStreamBeginCapture(capture_st, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
+                                    auto s = graph_compute(phase2_gf, false);
+                                    if (s == GGML_STATUS_SUCCESS) {
+                                        cudaGraph_t g;
+                                        if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
+                                            cudaGraphExec_t ex;
+                                            if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
+                                                h2_hijack.cuda_graph_exec = ex;
+                                                h2_hijack.captured = true;
+                                                cudaGraphDestroy(g);
+                                                fprintf(stderr, "cuda: captured phase2 hijack (name-based)\n");
+                                                moe_weight_cache.cuda_graph_captured = true;
+                                                moe_weight_cache.phase2_gf       = phase2_gf;
+                                                moe_weight_cache.phase2_t_logits = res->t_logits;
+                                                moe_weight_cache.phase2_t_embd   = res->t_embd;
+                                                moe_weight_cache.phase2_inputs   = std::move(res->inputs);
+                                                if (res->t_logits)
+                                                    moe_weight_cache.phase2_logits_data = res->t_logits->data;
+                                            } else fprintf(stderr, "cuda: instantiate fail\n");
+                                        } else fprintf(stderr, "cuda: endCapture fail\n");
+                                    } else {
+                                        cudaStreamEndCapture(capture_st, nullptr);
+                                        ret = s; return nullptr;
+                                    }
+                                } else {
+                                    fprintf(stderr, "cuda: beginCapture fail, using normal compute\n");
+                                    auto s = graph_compute(phase2_gf, false);
+                                    if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                                }
+                            }
+                        } else {
+                            res->set_inputs(&ubatch);
+                            ggml_backend_sched_synchronize(sched.get());
+                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
+                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
                         }
-                        res->set_inputs(&ubatch);
-                        ggml_backend_sched_synchronize(sched.get());
-                        { auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1); if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; } }
                     }
 #else
                     res->reset();

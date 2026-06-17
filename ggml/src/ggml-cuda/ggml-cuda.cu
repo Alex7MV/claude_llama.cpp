@@ -3486,6 +3486,13 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     // Synchronize compute stream — covers all kernels and cuBLAS work
+    {
+        cudaStreamCaptureStatus s;
+        if (cudaStreamIsCapturing(cuda_ctx->stream(), &s) == cudaSuccess
+            && s != cudaStreamCaptureStatusNone) {
+            return;
+        }
+    }
     if (!ggml_cuda_adaptive_wait(cuda_ctx->stream(), cuda_ctx->device,
             &cuda_ctx->t_wait_us, &cuda_ctx->n_wait_ops,
             &cuda_ctx->t_wait_phase1_us, &cuda_ctx->t_wait_phase2_us,
