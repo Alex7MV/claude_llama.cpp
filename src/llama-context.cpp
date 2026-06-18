@@ -11,7 +11,6 @@ typedef void* cudaGraph_t;
 typedef void* cudaGraphExec_t;
 typedef int   cudaError_t;
 #define cudaSuccess 0
-constexpr int cudaStreamCaptureModeGlobal = 0;
 constexpr int cudaStreamCaptureModeRelaxed = 2;
 extern "C" {
     int  cudaStreamCreate(cudaStream_t*);
@@ -61,7 +60,6 @@ extern "C" {
 }
 constexpr int cudaMemcpyDeviceToHost = 2;
 constexpr int cudaMemcpyDefault = 4;
-constexpr int cudaMemcpyDeviceToDevice = 3;
 
 // Static memory hijacking: additional CUDA API forward declarations
 extern "C" {
@@ -74,7 +72,6 @@ extern "C" {
     int cudaEventRecord(void * event, void * stream);
     int cudaStreamWaitEvent(void * stream, void * event, unsigned int flags);
 }
-constexpr int cudaMemcpyHostToDevice = 1;
 constexpr int cudaHostAllocDefault   = 0;
 #endif
 
@@ -883,7 +880,7 @@ static void extract_embd_pooled(
         case LLAMA_POOLING_TYPE_UNSPECIFIED:
             {
                 GGML_ABORT("unknown pooling type");
-            } break;
+            }
     }
 }
 
