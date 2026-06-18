@@ -2105,7 +2105,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                        if (do_cuda && !h2_hijack.captured) {
+                        if (do_cuda) {
                             // --- CAPTURE PATH ---
                             // 1. Reset + force matched MoE tensors to GPU (cascade to consumers)
                             ggml_backend_sched_reset(sched.get());
@@ -2140,50 +2140,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
                             // 3. Hijack tensor->data to static GPU addresses
-                            h2_hijack.scan_and_hijack(phase2_gf);
-                            if (h2_hijack.slot_scan_count < (h2_hijack.n_layers * h2_hijack.N_TYPES) / 2) {
-                                fprintf(stderr, "cuda: CAPTURE ABORT — expected ~%d hijacks, got %d\n",
-                                        h2_hijack.n_layers * h2_hijack.N_TYPES, h2_hijack.slot_scan_count);
-                                res->set_inputs(&ubatch);
-                                ggml_backend_sched_synchronize(sched.get());
-                                auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
-                                if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                            } else {
-                                // 4. Set inputs + D2D copy Phase 1 data to static addresses
-                                res->set_inputs(&ubatch);
-                                void* capture_st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                                h2_hijack.copy_data_to_static(capture_st);
-                                fprintf(stderr, "phase2: D2D copy done, starting capture\n");
-                                ggml_backend_sched_synchronize(sched.get());
-
-                                // 5. CUDA Graph Capture
-                                fprintf(stderr, "phase2: beginCapture...\n");
-                                if (cudaStreamBeginCapture(capture_st, cudaStreamCaptureModeRelaxed) == cudaSuccess) {
-                                    fprintf(stderr, "phase2: capture started, computing...\n");
-                                    auto s = graph_compute(phase2_gf, false);
-                                    fprintf(stderr, "phase2: graph_compute done status=%d\n", (int)s);
-                                    if (s == GGML_STATUS_SUCCESS) {
-                                        cudaGraph_t g;
-                                        if (cudaStreamEndCapture(capture_st, &g) == cudaSuccess) {
-                                            cudaGraphExec_t ex;
-                                            if (cudaGraphInstantiate(&ex, g, NULL, NULL, 0) == cudaSuccess) {
-                                                h2_hijack.cuda_graph_exec = ex;
-                                                h2_hijack.captured = true;
-                                                cudaGraphDestroy(g);
-                                                fprintf(stderr, "cuda: captured phase2 hijack (name-based)\n");
-                                                moe_weight_cache.cuda_graph_captured = true;
-                                                moe_weight_cache.phase2_gf       = phase2_gf;
-                                                moe_weight_cache.phase2_t_logits = res->t_logits;
-                                                moe_weight_cache.phase2_t_embd   = res->t_embd;
-                                                moe_weight_cache.phase2_inputs   = std::move(res->inputs);
-                                                if (res->t_logits)
-                                                    moe_weight_cache.phase2_logits_data = res->t_logits->data;
-                                            } else fprintf(stderr, "cuda: instantiate fail\n");
-                                        } else fprintf(stderr, "cuda: endCapture fail\n");
-                                    } else {
-                                        cudaStreamEndCapture(capture_st, nullptr);
-                                        ret = s; return nullptr;
-                                    }
+h2_hijack.scan_and_hijack(phase2_gf);
+                            res->set_inputs(&ubatch);
+                            void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
+                            h2_hijack.copy_data_to_static(st);
+                            ggml_backend_sched_synchronize(sched.get());
+                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
+                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
                                 } else {
                                     fprintf(stderr, "cuda: beginCapture fail, using normal compute\n");
                                     auto s = graph_compute(phase2_gf, false);
