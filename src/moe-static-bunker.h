@@ -52,6 +52,7 @@ struct phase2_hijack {
     bool   captured = false;
     void * cuda_graph_exec = nullptr;
     void * stream = nullptr;
+    int    device = -1;  // CUDA device ID for static buffer, recorded at init
 
     void init(int n_moe_layers);
     void destroy();

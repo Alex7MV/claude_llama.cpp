@@ -132,6 +132,10 @@ void moe_prefetcher::worker_loop() {
             ggml_tensor * src_arr[] = { item.src_gate, item.src_up, item.src_down };
             size_t sb[3] = { item.slice_bytes[0], item.slice_bytes[1], item.slice_bytes[2] };
 
+            ggml_backend_t be = (ggml_backend_t)item.gpu_backend;
+            int saved_stream = ggml_backend_cuda_get_stream(be);
+            ggml_backend_cuda_set_stream(be, 2);
+
             ggml_backend_cuda_pipeline_expert_skip_prefetch(
                 dst_arr, src_arr, sb,
                 item.expert_mask, item.moe_remap,
@@ -139,9 +143,14 @@ void moe_prefetcher::worker_loop() {
                 (const int32_t *)item.host_remap,
                 nullptr,
                 (ggml_backend_event_t)(item.prefetch_done ? item.prefetch_done : completion_event_),
-                (ggml_backend_t)item.gpu_backend);
+                be);
+
+            ggml_backend_cuda_set_stream(be, saved_stream);
         }
 
+        if (completion_event_) {
+            ggml_backend_event_synchronize((ggml_backend_event_t)completion_event_);
+        }
         fence_.store(1, std::memory_order_release);
 
         {

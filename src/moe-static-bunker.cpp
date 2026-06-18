@@ -18,6 +18,7 @@ extern "C" {
     int  cudaStreamCreate(void ** stream);
     int  cudaStreamDestroy(void * stream);
     int  cudaStreamSynchronize(void * stream);
+    int  cudaGetDevice(int * device);
     int  cudaGraphExecDestroy(void * graphExec);
     int  cudaGraphDestroy(void * graph);
     const char * cudaGetErrorString(int);
@@ -35,6 +36,7 @@ void phase2_hijack::init(int n_moe_layers) {
     cudaStream_t s;
     cudaStreamCreate(&s);
     stream = s;
+    cudaGetDevice(&device);
     captured = false;
     buffer = nullptr;
     buffer_size = 0;

@@ -1561,6 +1561,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 std::vector<ggml_tensor *> saved_kept_down = moe_weight_cache.kept_down;
 
                 if (gpu) {
+                    ggml_backend_event_t prefetch_done = nullptr;
                     const int64_t n_layer = model.hparams.n_layer;
                     const int64_t n_layer_dense_lead = model.hparams.n_layer_dense_lead;
                     const int first_il = (int)n_layer_dense_lead;
@@ -1571,7 +1572,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     GGML_ASSERT(n_moe <= 256);
                     int32_t kept_host[256];
                     memset(kept_host, 0, sizeof(kept_host));
-                    ggml_backend_event_t prefetch_done = nullptr;
 
                     const int64_t nexp = model.hparams.n_expert;
                     const size_t s_expert_mask = (size_t)((nexp + 63) / 64) * sizeof(uint64_t);
@@ -1689,41 +1689,81 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
                     }
-                    // Prefetch ALL MoE layers (synchronous — single Phase 2 graph uses all compact buffers)
-                    for (int _i = 0; _i < n_moe; _i++) {
-                        const int _il = first_il + _i;
-                        const int32_t _kept = kept_host[_i];
-                        if (_kept > 0 && _kept <= (int32_t)moe_weight_cache.max_kept
-                            && moe_weight_cache.kept_up[_il]
-                            && moe_weight_cache.expert_mask_vec[_il]
-                            && moe_weight_cache.remap_vec[_il])
-                        {
-#ifdef GGML_USE_CUDA
-                            auto * _sg = model.layers[_il].ffn_gate_exps;
-                            auto * _su = model.layers[_il].ffn_up_exps;
-                            auto * _sd = model.layers[_il].ffn_down_exps;
-                            if (_sg && _su && _sd) {
-                                ggml_tensor * _dst_arr[] = {
-                                    moe_weight_cache.kept_gate[_il],
-                                    moe_weight_cache.kept_up[_il],
-                                    moe_weight_cache.kept_down[_il]
-                                };
-                                ggml_tensor * _src_arr[] = { _sg, _su, _sd };
-                                size_t _sb[] = {
-                                    ggml_row_size(_sg->type, _sg->ne[0] * _sg->ne[1]),
-                                    ggml_row_size(_su->type, _su->ne[0] * _su->ne[1]),
-                                    ggml_row_size(_sd->type, _sd->ne[0] * _sd->ne[1]),
-                                };
-                                const uint64_t * _hm = host_masks_batch.data() + _i * (s_expert_mask / sizeof(uint64_t));
-                                const int32_t  * _hr = host_remaps_batch.data() + _i * (s_remap / sizeof(int32_t));
-                                ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                                    _dst_arr, _src_arr, _sb,
-                                    moe_weight_cache.expert_mask_vec[_il],
-                                    moe_weight_cache.remap_vec[_il],
-                                    _hm, _hr,
-                                    nullptr, prefetch_done, gpu);
+                    // Prefetch ALL MoE layers
+                    if (moe_prefetch_started && ubatch.n_tokens == 1) {
+                        std::vector<moe::prefetch_work_item> work_items;
+                        for (int _i = 0; _i < n_moe; _i++) {
+                            const int _il = first_il + _i;
+                            const int32_t _kept = kept_host[_i];
+                            if (_kept > 0 && _kept <= (int32_t)moe_weight_cache.max_kept
+                                && moe_weight_cache.kept_up[_il]
+                                && moe_weight_cache.expert_mask_vec[_il]
+                                && moe_weight_cache.remap_vec[_il])
+                            {
+                                auto * _sg = model.layers[_il].ffn_gate_exps;
+                                auto * _su = model.layers[_il].ffn_up_exps;
+                                auto * _sd = model.layers[_il].ffn_down_exps;
+                                if (_sg && _su && _sd) {
+                                    moe::prefetch_work_item item;
+                                    item.dst_gate  = moe_weight_cache.kept_gate[_il];
+                                    item.dst_up    = moe_weight_cache.kept_up[_il];
+                                    item.dst_down  = moe_weight_cache.kept_down[_il];
+                                    item.src_gate  = _sg;
+                                    item.src_up    = _su;
+                                    item.src_down  = _sd;
+                                    item.expert_mask = moe_weight_cache.expert_mask_vec[_il];
+                                    item.moe_remap   = moe_weight_cache.remap_vec[_il];
+                                    item.host_mask  = (void*)(host_masks_batch.data() + _i * (s_expert_mask / sizeof(uint64_t)));
+                                    item.host_remap = (void*)(host_remaps_batch.data() + _i * (s_remap / sizeof(int32_t)));
+                                    item.slice_bytes[0] = ggml_row_size(_sg->type, _sg->ne[0] * _sg->ne[1]);
+                                    item.slice_bytes[1] = ggml_row_size(_su->type, _su->ne[0] * _su->ne[1]);
+                                    item.slice_bytes[2] = ggml_row_size(_sd->type, _sd->ne[0] * _sd->ne[1]);
+                                    item.max_kept    = moe_weight_cache.max_kept;
+                                    item.gpu_backend = gpu;
+                                    item.stream      = moe_prefetch.get_stream();
+                                    work_items.push_back(item);
+                                }
                             }
+                        }
+                        prefetch_done = ggml_backend_event_new(gpu_dev);
+                        moe_prefetch.launch_prefetch(work_items, prefetch_done);
+                    } else {
+                        prefetch_done = ggml_backend_event_new(gpu_dev);
+                        for (int _i = 0; _i < n_moe; _i++) {
+                            const int _il = first_il + _i;
+                            const int32_t _kept = kept_host[_i];
+                            if (_kept > 0 && _kept <= (int32_t)moe_weight_cache.max_kept
+                                && moe_weight_cache.kept_up[_il]
+                                && moe_weight_cache.expert_mask_vec[_il]
+                                && moe_weight_cache.remap_vec[_il])
+                            {
+#ifdef GGML_USE_CUDA
+                                auto * _sg = model.layers[_il].ffn_gate_exps;
+                                auto * _su = model.layers[_il].ffn_up_exps;
+                                auto * _sd = model.layers[_il].ffn_down_exps;
+                                if (_sg && _su && _sd) {
+                                    ggml_tensor * _dst_arr[] = {
+                                        moe_weight_cache.kept_gate[_il],
+                                        moe_weight_cache.kept_up[_il],
+                                        moe_weight_cache.kept_down[_il]
+                                    };
+                                    ggml_tensor * _src_arr[] = { _sg, _su, _sd };
+                                    size_t _sb[] = {
+                                        ggml_row_size(_sg->type, _sg->ne[0] * _sg->ne[1]),
+                                        ggml_row_size(_su->type, _su->ne[0] * _su->ne[1]),
+                                        ggml_row_size(_sd->type, _sd->ne[0] * _sd->ne[1]),
+                                    };
+                                    const uint64_t * _hm = host_masks_batch.data() + _i * (s_expert_mask / sizeof(uint64_t));
+                                    const int32_t  * _hr = host_remaps_batch.data() + _i * (s_remap / sizeof(int32_t));
+                                    ggml_backend_cuda_pipeline_expert_skip_prefetch(
+                                        _dst_arr, _src_arr, _sb,
+                                        moe_weight_cache.expert_mask_vec[_il],
+                                        moe_weight_cache.remap_vec[_il],
+                                        _hm, _hr,
+                                        nullptr, prefetch_done, gpu);
+                                }
 #endif
+                            }
                         }
                     }
                     const int64_t t_rb_prefetch = ggml_time_us();
@@ -1763,6 +1803,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 (long long)model.hparams.n_expert);
                         }
                     }
+
+#ifdef GGML_USE_CUDA
+                    if (moe_prefetch_started && ubatch.n_tokens == 1 && prefetch_done) {
+                        moe_prefetch.wait_prefetch_fence(prefetch_done);
+                    }
+#endif
 
                 } // end if(gpu) — autonomous Phase 2 follows
 
