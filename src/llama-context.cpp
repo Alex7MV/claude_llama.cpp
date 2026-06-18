@@ -88,6 +88,26 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     }
     throw std::runtime_error("Unsupported ctx type");
 }
+#ifdef LLAMA_DEEPSEEK_PIPELINE
+#ifdef GGML_USE_CUDA
+
+void llama_context::h2_init() {
+    const auto & hparams = model.hparams;
+    int n_moe_layers = (int)hparams.n_layer - (int)hparams.n_layer_dense_lead;
+    if (n_moe_layers < 0) n_moe_layers = 0;
+    h2_hijack.init(n_moe_layers);
+    h2_inject.init();
+    h2_guard.init();
+}
+
+void llama_context::h2_destroy() {
+    h2_hijack.destroy();
+    h2_inject.destroy();
+    h2_guard.destroy();
+}
+
+#endif // GGML_USE_CUDA
+#endif // LLAMA_DEEPSEEK_PIPELINE
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
