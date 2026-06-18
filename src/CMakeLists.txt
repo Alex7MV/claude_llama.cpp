@@ -34,6 +34,9 @@ add_library(llama
             llama-mmap.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
+            moe-hijacker.cpp
+            moe-prefetcher.cpp
+            moe-static-bunker.cpp
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
