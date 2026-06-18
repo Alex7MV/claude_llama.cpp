@@ -2139,20 +2139,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
                             if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
-                            // 3. Hijack tensor->data to static GPU addresses
-h2_hijack.scan_and_hijack(phase2_gf);
+                            h2_hijack.scan_and_hijack(phase2_gf);
                             res->set_inputs(&ubatch);
                             void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
                             h2_hijack.copy_data_to_static(st);
                             ggml_backend_sched_synchronize(sched.get());
                             auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
                             if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                                } else {
-                                    fprintf(stderr, "cuda: beginCapture fail, using normal compute\n");
-                                    auto s = graph_compute(phase2_gf, false);
-                                    if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                                }
-                            }
                         } else {
                             res->set_inputs(&ubatch);
                             ggml_backend_sched_synchronize(sched.get());
