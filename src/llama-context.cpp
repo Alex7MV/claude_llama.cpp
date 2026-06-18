@@ -2106,52 +2106,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
 
                         if (do_cuda) {
-                            // --- CAPTURE PATH ---
-                            // 1. Reset + force matched MoE tensors to GPU (cascade to consumers)
-                            ggml_backend_sched_reset(sched.get());
-                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                                auto [tid, il] = h2_hijack.match_name(t->name);
-                                if (tid >= 0) ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
-                            }
-                            for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
-                                ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
-                                auto [tid, il] = h2_hijack.match_name(t->name);
-                                if (tid >= 0) ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
-                            }
-                            // Cascade: force VIEW (op=37) and ADD (op=2) nodes that consume
-                            // matched tensors (catches expert output combination chain only)
-                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                                if (t->op != 37 && t->op != 2) continue;
-                                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
-                                    auto [sid, sil] = h2_hijack.match_name(t->src[s]->name);
-                                    if (sid >= 0) {
-                                        ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
-                                        break;
-                                    }
-                                }
-                            }
-                            force_idxs_to_cpu();
-                            if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
-                                ret = GGML_STATUS_ALLOC_FAILED; return nullptr;
-                            }
-                            if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched.get(), res->t_logits, be);
-                            if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched.get(), res->t_embd,   be);
-
-                            h2_hijack.scan_and_hijack(phase2_gf);
-                            res->set_inputs(&ubatch);
-                            void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                            h2_hijack.copy_data_to_static(st);
-                            ggml_backend_sched_synchronize(sched.get());
-                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
-                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                        } else {
-                            res->set_inputs(&ubatch);
-                            ggml_backend_sched_synchronize(sched.get());
-                            auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1);
-                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
                         }
+                        res->set_inputs(&ubatch);
+                        ggml_backend_sched_synchronize(sched.get());
+                        { auto s = graph_compute(phase2_gf, ubatch.n_tokens > 1); if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; } }
                     }
 #else
                     res->reset();
