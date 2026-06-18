@@ -1505,7 +1505,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             if (want_moe_cache && cparams.moe_two_phase && !cparams.warmup && moe_weight_cache.populated &&
                 moe_weight_cache.scratch_ffn_inp.size() > 0 && !want_pipeline) {
 
-                const int64_t t_p1_start = ggml_time_us();
                 LLAMA_LOG_INFO("%s: Phase 1 start (%d tokens, %d experts_used)\n", __func__, (int)ubatch.n_tokens, (int)model.hparams.n_expert_used);
 
                 // ---- Phase 1: build routing+attention graph ----
@@ -1540,8 +1539,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
                 // Synchronize Phase 1 GPU work before autonomous Phase 2 stream operations
                 ggml_backend_sched_synchronize(sched.get());
-                const int64_t t_p1_compute = ggml_time_us();
-                fprintf(stderr, "phase1: %ld us\n", t_p1_compute - t_p1_start);
 
                 // ---- Threshold + Expert Fetch ----
                 LLAMA_LOG_INFO("%s: threshold+fetch start\n", __func__);
@@ -1580,8 +1577,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const size_t total_remap_nbytes = (size_t)n_moe * s_remap;
                     std::vector<uint64_t> host_masks_batch(total_mask_nbytes / sizeof(uint64_t));
                     std::vector<int32_t> host_remaps_batch(total_remap_nbytes / sizeof(int32_t));
-
-                    const int64_t t_rb_start = ggml_time_us();
 
                     // Phase 1a: launch ALL threshold kernels back-to-back.
                     // Each writes to its own expert_mask_vec[il], remap_vec[il], kept_counts[il].
@@ -1766,8 +1761,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             }
                         }
                     }
-                    const int64_t t_rb_prefetch = ggml_time_us();
-                    fprintf(stderr, "readback_prefetch: %ld us\n", t_rb_prefetch - t_rb_start);
 
                     // Update sparsity stats and compact_ready from all layers
                     moe_weight_cache.compact_ready = false;
