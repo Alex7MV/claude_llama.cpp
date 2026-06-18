@@ -2047,24 +2047,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             if (tid >= 0)
                                 ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
                         }
-                        // Cascade: force nodes whose src tensors match ffn_moe_*
-                        bool changed;
-                        do {
-                            changed = false;
-                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                                ggml_backend_t be_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                                if (be_t && ggml_backend_is_cuda(be_t)) continue;
-                                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
-                                    auto [sid, sil] = h2_hijack.match_name(t->src[s]->name);
-                                    if (sid >= 0) {
-                                        ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
-                                        changed = true;
-                                        break;
-                                    }
+                        // Cascade: force VIEW (op=37) and ADD (op=2) consumers of matched tensors
+                        for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
+                            ggml_tensor * t = ggml_graph_node(phase2_gf, i);
+                            if (t->op != 37 && t->op != 2) continue;
+                            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
+                                auto [sid, sil] = h2_hijack.match_name(t->src[s]->name);
+                                if (sid >= 0) {
+                                    ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
+                                    break;
                                 }
                             }
-                        } while (changed);
+                        }
                         force_idxs_to_cpu();
                         if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
 
@@ -2125,25 +2119,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 auto [tid, il] = h2_hijack.match_name(t->name);
                                 if (tid >= 0) ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
                             }
-                            // Cascade: force nodes whose src tensors match ffn_moe_*
-                            // (catches VIEW and ADD nodes that consume matched tensors)
-                            bool changed;
-                            do {
-                                changed = false;
-                                for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                                    ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                                    ggml_backend_t be_t = ggml_backend_sched_get_tensor_backend(sched.get(), t);
-                                    if (be_t && ggml_backend_is_cuda(be_t)) continue;
-                                    for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
-                                        auto [sid, sil] = h2_hijack.match_name(t->src[s]->name);
-                                        if (sid >= 0) {
-                                            ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
-                                            changed = true;
-                                            break;
-                                        }
+                            // Cascade: force VIEW (op=37) and ADD (op=2) nodes that consume
+                            // matched tensors (catches expert output combination chain only)
+                            for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
+                                ggml_tensor * t = ggml_graph_node(phase2_gf, i);
+                                if (t->op != 37 && t->op != 2) continue;
+                                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
+                                    auto [sid, sil] = h2_hijack.match_name(t->src[s]->name);
+                                    if (sid >= 0) {
+                                        ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
+                                        break;
                                     }
                                 }
-                            } while (changed);
+                            }
                             force_idxs_to_cpu();
                             if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
                                 ret = GGML_STATUS_ALLOC_FAILED; return nullptr;
