@@ -2094,8 +2094,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             ggml_backend_sched_reset(sched.get());
                             for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++)
                                 ggml_backend_sched_set_tensor_backend(sched.get(), ggml_graph_node(phase2_gf, i), gpu);
-                            for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++)
-                                ggml_backend_sched_set_tensor_backend(sched.get(), ggml_graph_leaf(phase2_gf, i), gpu);
                             force_idxs_to_cpu();
                             if (!ggml_backend_sched_alloc_graph(sched.get(), phase2_gf)) {
                                 ret = GGML_STATUS_ALLOC_FAILED; return nullptr;
