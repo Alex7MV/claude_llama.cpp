@@ -12,6 +12,10 @@
 #include "ggml-backend-pipeline.h"
 #include "pipeline-sched.h"
 
+#ifdef GGML_USE_CUDA
+#include "moe-static-bunker.h"
+#endif
+
 #include <atomic>
 #include <map>
 #include <vector>
@@ -107,118 +111,6 @@ struct llama_moe_weight_cache {
     bool   skip_phase2_attn = false; // skip attention in Phase 2 — use Phase 1 ffn_inp (experimental)
 };
 #endif
-
-// Static memory hijacking for MoE Phase 2 CUDA Graph.
-// Allocates a fixed VRAM buffer, hijacks tensor->data pointers
-// before CUDA Graph capture, and restores them before each replay.
-// Uses name-based tensor matching instead of position-based scanning,
-// so it works with any model architecture (DeepSeek-V3, Kimi-K2, etc.).
-#ifdef GGML_USE_CUDA
-
-#define H2_ALIGN         256
-#define H2_ALIGN_UP(x)   (((x) + (H2_ALIGN - 1)) & ~(H2_ALIGN - 1))
-#define H2_N_LAYERS_MAX  128
-
-struct phase2_hijack {
-    // Name patterns matched in order — MUST match Phase 2 FFN subgraph
-    // ffn_moe_gate_up  = fused gate+up MUL_MAT_ID output
-    // ffn_moe_gate     = first-half VIEW of gate_up (ffn_dim)
-    // ffn_moe_up       = second-half VIEW of gate_up (ffn_dim)
-    // ffn_moe_swiglu   = activation output (ffn_dim × n_expert_used)
-    // ffn_moe_down     = down-proj MUL_MAT_ID output (n_embd × n_expert_used)
-    // ffn_moe_weighted = weighted expert output (n_embd × n_expert_used)
-    // ffn_moe_out      = summed expert output (n_embd)
-    static constexpr const char * TENSOR_NAMES[7] = {
-        "ffn_moe_gate_up",
-        "ffn_moe_gate",
-        "ffn_moe_up",
-        "ffn_moe_swiglu",
-        "ffn_moe_down",
-        "ffn_moe_weighted",
-        "ffn_moe_out",
-    };
-    enum TypeId : int {
-        T_GATE_UP   = 0,
-        T_GATE      = 1,
-        T_UP        = 2,
-        T_SWIGLU    = 3,
-        T_DOWN      = 4,
-        T_WEIGHTED  = 5,
-        T_OUT       = 6,
-        N_TYPES     = 7,
-    };
-
-    // Per-(layer, type) slot: where in the static buffer
-    struct slot {
-        void * addr;       // GPU address in static buffer
-        size_t size;       // allocated size (H2_ALIGN_UP of actual tensor size)
-        int    parent;     // TypeId of parent tensor for VIEWs, -1=own, -2=view
-        ptrdiff_t offset;  // byte offset from parent's addr (for VIEWs)
-        void * orig_data;  // original tensor->data before hijack
-    };
-
-    // Static GPU buffer
-    void * buffer = nullptr;
-    size_t buffer_size = 0;
-    int    n_layers = 0;
-
-    // Pre-computed slot info indexed by [il * N_TYPES + type_id]
-    slot * slots = nullptr;
-    int    n_slots = 0;
-    int    slot_scan_count = 0; // number of successful slot lookups during last scan
-
-    bool   captured = false;
-    void * cuda_graph_exec = nullptr; // cudaGraphExec_t
-    void * stream = nullptr;          // cudaStream_t
-
-    // CAPTURE: scan graph, match by name, allocate buffer, hijack data ptrs
-    void scan_and_hijack(ggml_cgraph * gf);
-
-    // REPLAY: scan graph, match by name, restore data ptrs from stored slots
-    bool scan_and_update_snapshots(ggml_cgraph * gf);
-
-    // Set all matched tensors to their slot addresses
-    void restore_all();
-
-    // Copy data from original addresses to hijacked static addresses (D2D)
-    void copy_data_to_static(void* cuda_stream);
-
-    // Parse tensor name "prefix-{il}" → (type_id, il) or (-1, -1)
-    std::pair<int,int> match_name(const char * name) const;
-
-    // Lifetime
-    void init(int n_moe_layers);
-    void destroy();
-
-private:
-
-    // Allocate once: compute sizes from first scan, cudaMalloc, assign offsets
-    void allocate_slots(int max_il);
-
-    // Get slot index: il * N_TYPES + type_id
-    int slot_idx(int il, int type_id) const { return il * N_TYPES + type_id; }
-};
-
-struct phase2_inject {
-    void * host_moe_ids[H2_N_LAYERS_MAX];
-    float * host_moe_w[H2_N_LAYERS_MAX];
-
-    void init();
-    void destroy();
-    void fill_layer(int il, const int * ids, const float * w);
-    void inject_all(void * stream);
-};
-
-struct phase2_guard {
-    void * phase1_done_event = nullptr; // cudaEvent_t
-
-    void init();
-    void destroy();
-    void record(void * stream);
-    void wait(void * stream); // cudaStreamWaitEvent
-};
-
-#endif // GGML_USE_CUDA
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
