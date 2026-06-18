@@ -55,11 +55,9 @@ struct phase2_hijack {
 
     void init(int n_moe_layers);
     void destroy();
+    void allocate_slots(int max_il);
 
     int slot_idx(int il, int type_id) const { return il * N_TYPES + type_id; }
-
-private:
-    void allocate_slots(int max_il);
 };
 
 struct phase2_inject {

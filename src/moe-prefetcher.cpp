@@ -86,12 +86,13 @@ void moe_prefetcher::launch_prefetch(
             if (host_mask_ptr && host_remap_ptr) {
                 ggml_tensor * dst_arr[] = { item.dst_gate, item.dst_up, item.dst_down };
                 ggml_tensor * src_arr[] = { item.src_gate, item.src_up, item.src_down };
+                size_t sb[3] = { item.slice_bytes[0], item.slice_bytes[1], item.slice_bytes[2] };
                 ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                    dst_arr, src_arr, item.slice_bytes,
+                    dst_arr, src_arr, sb,
                     item.expert_mask, item.moe_remap,
                     (const uint64_t *)host_mask_ptr,
                     (const int32_t *)host_remap_ptr,
-                    nullptr, completion_event, (ggml_backend_t)item.gpu_backend);
+                    nullptr, (ggml_backend_event_t)completion_event, (ggml_backend_t)item.gpu_backend);
             }
         }
         return;
@@ -112,10 +113,6 @@ void moe_prefetcher::wait_prefetch_fence(void * /*completion_event*/) {
     fence_.store(0, std::memory_order_release);
 }
 
-void * moe_prefetcher::get_stream() const {
-    return h2d_stream_;
-}
-
 void moe_prefetcher::worker_loop() {
     pin_to_management_cores();
 
@@ -133,14 +130,15 @@ void moe_prefetcher::worker_loop() {
 
             ggml_tensor * dst_arr[] = { item.dst_gate, item.dst_up, item.dst_down };
             ggml_tensor * src_arr[] = { item.src_gate, item.src_up, item.src_down };
+            size_t sb[3] = { item.slice_bytes[0], item.slice_bytes[1], item.slice_bytes[2] };
 
             ggml_backend_cuda_pipeline_expert_skip_prefetch(
-                dst_arr, src_arr, item.slice_bytes,
+                dst_arr, src_arr, sb,
                 item.expert_mask, item.moe_remap,
                 (const uint64_t *)item.host_mask,
                 (const int32_t *)item.host_remap,
                 nullptr,
-                item.prefetch_done ? item.prefetch_done : completion_event_,
+                (ggml_backend_event_t)(item.prefetch_done ? item.prefetch_done : completion_event_),
                 (ggml_backend_t)item.gpu_backend);
         }
 

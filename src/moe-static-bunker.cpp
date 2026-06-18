@@ -22,6 +22,7 @@ extern "C" {
     int  cudaGraphDestroy(void * graph);
     const char * cudaGetErrorString(int);
 }
+typedef void* cudaStream_t;
 constexpr int cudaHostAllocDefault   = 0;
 
 // --- phase2_hijack ---
