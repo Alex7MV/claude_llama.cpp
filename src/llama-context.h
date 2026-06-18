@@ -14,6 +14,7 @@
 
 #ifdef GGML_USE_CUDA
 #include "moe-static-bunker.h"
+#include "moe-hijacker.h"
 #endif
 
 #include <atomic>
