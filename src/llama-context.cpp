@@ -11,7 +11,6 @@ typedef void* cudaGraph_t;
 typedef void* cudaGraphExec_t;
 typedef int   cudaError_t;
 #define cudaSuccess 0
-constexpr int cudaStreamCaptureModeRelaxed = 2;
 extern "C" {
     int  cudaStreamCreate(cudaStream_t*);
     int  cudaStreamDestroy(cudaStream_t);
@@ -59,7 +58,6 @@ extern "C" {
     int cudaStreamSynchronize(void * stream);
 }
 constexpr int cudaMemcpyDeviceToHost = 2;
-constexpr int cudaMemcpyDefault = 4;
 
 // Static memory hijacking: additional CUDA API forward declarations
 extern "C" {
@@ -72,9 +70,8 @@ extern "C" {
     int cudaEventRecord(void * event, void * stream);
     int cudaStreamWaitEvent(void * stream, void * event, unsigned int flags);
 }
-constexpr int cudaHostAllocDefault   = 0;
-#endif
 
+#endif
 
 
 //

@@ -12,6 +12,7 @@
 
 extern "C" {
     int cudaMemcpyAsync(void * dst, const void * src, size_t count, int kind, void * stream);
+    void ggml_backend_sched_set_tensor_backend(void * sched, ggml_tensor * t, void * backend);
 }
 constexpr int cudaMemcpyDefault = 4;
 
@@ -171,8 +172,6 @@ void cascade_force_moe_consumers(
     void * sched,
     void * gpu_backend)
 {
-    extern void ggml_backend_sched_set_tensor_backend(void * sched, ggml_tensor * t, void * backend);
-
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         ggml_tensor * t = ggml_graph_node(gf, i);
         if (t->op != 37 && t->op != 2) continue;
