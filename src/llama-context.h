@@ -15,6 +15,7 @@
 #ifdef GGML_USE_CUDA
 #include "moe-static-bunker.h"
 #include "moe-hijacker.h"
+#include "moe-prefetcher.h"
 #endif
 
 #include <atomic>
@@ -426,6 +427,8 @@ private:
     phase2_hijack h2_hijack;
     phase2_inject h2_inject;
     phase2_guard  h2_guard;
+    moe::moe_prefetcher moe_prefetch;
+    bool                moe_prefetch_started = false;
 
     void h2_init();
     void h2_destroy();
