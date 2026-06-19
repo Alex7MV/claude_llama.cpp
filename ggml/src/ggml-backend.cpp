@@ -441,11 +441,6 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
     return backend->iface.graph_plan_compute(backend, plan);
 }
 
-void ggml_backend_graph_plan_update(ggml_backend_t backend, ggml_backend_graph_plan_t plan, struct ggml_cgraph * cgraph) {
-    if (!backend || !backend->iface.graph_plan_update) return;
-    backend->iface.graph_plan_update(backend, plan, cgraph);
-}
-
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
     ggml_backend_synchronize(backend);

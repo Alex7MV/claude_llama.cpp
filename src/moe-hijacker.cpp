@@ -185,23 +185,6 @@ void cascade_force_moe_consumers(
     }
 }
 
-// ---- Phase 2 Graph Plan Cache ----
-
-void phase2_graph_cache::capture(ggml_backend_graph_plan_t plan, ggml_backend_t backend) {
-    phase2_plan = plan;
-    plan_backend = backend;
-    valid = true;
-}
-
-void phase2_graph_cache::release() {
-    if (phase2_plan && plan_backend) {
-        ggml_backend_graph_plan_free(plan_backend, phase2_plan);
-        phase2_plan = nullptr;
-        plan_backend = nullptr;
-    }
-    valid = false;
-}
-
 } // namespace moe
 
 #endif // GGML_USE_CUDA

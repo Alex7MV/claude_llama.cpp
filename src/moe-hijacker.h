@@ -33,11 +33,9 @@ void cascade_force_moe_consumers(
 
 struct phase2_graph_cache {
     bool valid = false;
-    ggml_backend_graph_plan_t phase2_plan = nullptr;
-    ggml_backend_t plan_backend = nullptr;
 
-    void capture(ggml_backend_graph_plan_t plan, ggml_backend_t backend);
-    void release();
+    void capture() { valid = true; }
+    void release() { valid = false; }
 };
 
 } // namespace moe

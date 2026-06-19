@@ -1817,158 +1817,92 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const bool do_cuda = (ubatch.n_tokens == 1);
                     ggml_cgraph * phase2_gf;
 
-                    if (do_cuda && h2_hijack.captured && phase2_cache.valid) {
-                        // REPLAY — rebuild graph, alloc via fast galloc, execute via CUDA graph plan
-                        res->reset();
-                        ggml_backend_sched_reset(sched_phase2.get());
-                        moe_weight_cache.build_layer_only = -1;
-                        moe_weight_cache.build_phase = 2;
-                        phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
-                        if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
-                        ggml_backend_sched_reset(sched_phase2.get());
-                        for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                            ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                            auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                            if (tid >= 0)
-                                ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                        }
-                        for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
-                            ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
-                            auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                            if (tid >= 0)
-                                ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                        }
-                        moe::cascade_force_moe_consumers(h2_hijack, phase2_gf, sched_phase2.get(), gpu);
-                        if (backend_cpu) {
-                            auto force = [&](ggml_tensor * t) {
-                                if (t) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, backend_cpu);
-                            };
-                            for (auto & inp : res->inputs) {
-                                auto * base = inp.get();
-                                if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
-                                    force(akv->self_k_idxs); force(akv->self_v_idxs); force(akv->self_kq_mask);
-                                } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
-                                    force(ak->self_k_idxs); force(ak->self_kq_mask);
-                                } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
-                                    force(dsa->self_k_idxs_mla); force(dsa->self_k_idxs_lid);
-                                    force(dsa->self_kq_mask_mla); force(dsa->self_kq_mask_lid);
-                                } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
-                                    force(iswa->self_k_idxs); force(iswa->self_v_idxs);
-                                    force(iswa->self_k_idxs_swa); force(iswa->self_v_idxs_swa);
-                                    force(iswa->self_kq_mask); force(iswa->self_kq_mask_swa);
-                                } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
-                                    force(hyb->inp_attn->self_k_idxs); force(hyb->inp_attn->self_v_idxs);
-                                    force(hyb->inp_attn->self_kq_mask);
-                                } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
-                                    force(hybk->inp_attn->self_k_idxs); force(hybk->inp_attn->self_kq_mask);
-                                } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
-                                    force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
-                                    force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
-                                    force(hybiswa->inp_attn->self_kq_mask); force(hybiswa->inp_attn->self_kq_mask_swa);
-                                } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
-                                    force(oid->out_ids);
-                                }
+                    // Unified native compute via isolated sched_phase2.
+                    // galloc fast-path (backend_ids_changed=false) skips reserve_n on Token 2+.
+                    if (!sched_phase2) {
+                        const size_t phase2_n = std::max((size_t)graph_max_nodes(ubatch.n_tokens), (size_t)10000);
+                        sched_phase2.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), phase2_n, false, cparams.op_offload));
+                    }
+                    res->reset();
+                    ggml_backend_sched_reset(sched_phase2.get());
+                    moe_weight_cache.build_layer_only = -1;
+                    moe_weight_cache.build_phase = 2;
+                    phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+                    if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
+                    ggml_backend_sched_reset(sched_phase2.get());
+                    for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
+                        ggml_tensor * t = ggml_graph_node(phase2_gf, i);
+                        auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
+                        if (tid >= 0)
+                            ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
+                    }
+                    for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
+                        ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
+                        auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
+                        if (tid >= 0)
+                            ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
+                    }
+                    moe::cascade_force_moe_consumers(h2_hijack, phase2_gf, sched_phase2.get(), gpu);
+                    if (backend_cpu) {
+                        auto force = [&](ggml_tensor * t) {
+                            if (t) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, backend_cpu);
+                        };
+                        for (auto & inp : res->inputs) {
+                            auto * base = inp.get();
+                            if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
+                                force(akv->self_k_idxs); force(akv->self_v_idxs); force(akv->self_kq_mask);
+                            } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
+                                force(ak->self_k_idxs); force(ak->self_kq_mask);
+                            } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
+                                force(dsa->self_k_idxs_mla); force(dsa->self_k_idxs_lid);
+                                force(dsa->self_kq_mask_mla); force(dsa->self_kq_mask_lid);
+                            } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
+                                force(iswa->self_k_idxs); force(iswa->self_v_idxs);
+                                force(iswa->self_k_idxs_swa); force(iswa->self_v_idxs_swa);
+                                force(iswa->self_kq_mask); force(iswa->self_kq_mask_swa);
+                            } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
+                                force(hyb->inp_attn->self_k_idxs); force(hyb->inp_attn->self_v_idxs);
+                                force(hyb->inp_attn->self_kq_mask);
+                            } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
+                                force(hybk->inp_attn->self_k_idxs); force(hybk->inp_attn->self_kq_mask);
+                            } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
+                                force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
+                                force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
+                                force(hybiswa->inp_attn->self_kq_mask); force(hybiswa->inp_attn->self_kq_mask_swa);
+                            } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
+                                force(oid->out_ids);
                             }
                         }
-                        // Fast-path gal oc: galloc_alloc_graph (no reserve_n) → same addresses
-                        if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+                    }
+
+                    // alloc_graph: Token 1 = full reserve+alloc; Token 2+ = galloc fast-path (no reserve_n)
+                    if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+
+                    // Track cache hit for server metrics
+                    if (do_cuda && phase2_cache.valid) {
                         n_reused++;
-                        graphs_reused++;
-
-                        ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
-                        if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_logits, be);
-                        if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_embd,   be);
-
-                        moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
-                        res->set_inputs(&ubatch);
-                        void* st = ggml_backend_cuda_get_stream_ptr(gpu, 0);
-                        moe::copy_data_to_static(h2_hijack, st);
-                        ggml_backend_sched_synchronize(sched_phase2.get());
-
-                        // CUDA Graph plan replay — single cudaGraphLaunch (addresses stable via galloc fast-path)
-                        {
-                            auto s = ggml_backend_graph_plan_compute(gpu, phase2_cache.phase2_plan);
-                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                        }
-
-                        if (res->t_logits)
-                            moe_weight_cache.phase2_logits_data = res->t_logits->data;
-                    } else {
-                        // BUILD (first token or phase2 plan invalidated)
-                        if (!sched_phase2) {
-                            const size_t phase2_n = std::max((size_t)graph_max_nodes(ubatch.n_tokens), (size_t)10000);
-                            sched_phase2.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), phase2_n, false, cparams.op_offload));
-                        }
-                        res->reset();
-                        ggml_backend_sched_reset(sched_phase2.get());
-                        moe_weight_cache.build_layer_only = -1;
-                        moe_weight_cache.build_phase = 2;
-                        phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
-                        if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
-                        ggml_backend_sched_reset(sched_phase2.get());
-                        for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                            ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                            auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                            if (tid >= 0)
-                                ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                        }
-                        for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
-                            ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
-                            auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                            if (tid >= 0)
-                                ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                        }
-                        moe::cascade_force_moe_consumers(h2_hijack, phase2_gf, sched_phase2.get(), gpu);
-                        if (backend_cpu) {
-                            auto force = [&](ggml_tensor * t) {
-                                if (t) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, backend_cpu);
-                            };
-                            for (auto & inp : res->inputs) {
-                                auto * base = inp.get();
-                                if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
-                                    force(akv->self_k_idxs); force(akv->self_v_idxs);
-                                    force(akv->self_kq_mask);
-                                } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
-                                    force(ak->self_k_idxs); force(ak->self_kq_mask);
-                                } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
-                                    force(dsa->self_k_idxs_mla); force(dsa->self_k_idxs_lid);
-                                    force(dsa->self_kq_mask_mla); force(dsa->self_kq_mask_lid);
-                                } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
-                                    force(iswa->self_k_idxs); force(iswa->self_v_idxs);
-                                    force(iswa->self_k_idxs_swa); force(iswa->self_v_idxs_swa);
-                                    force(iswa->self_kq_mask); force(iswa->self_kq_mask_swa);
-                                } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
-                                    force(hyb->inp_attn->self_k_idxs); force(hyb->inp_attn->self_v_idxs);
-                                    force(hyb->inp_attn->self_kq_mask);
-                                } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
-                                    force(hybk->inp_attn->self_k_idxs);
-                                    force(hybk->inp_attn->self_kq_mask);
-                                } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
-                                    force(hybiswa->inp_attn->self_k_idxs); force(hybiswa->inp_attn->self_v_idxs);
-                                    force(hybiswa->inp_attn->self_k_idxs_swa); force(hybiswa->inp_attn->self_v_idxs_swa);
-                                    force(hybiswa->inp_attn->self_kq_mask); force(hybiswa->inp_attn->self_kq_mask_swa);
-                                } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
-                                    force(oid->out_ids);
-                                }
-                            }
-                        }
-                        if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
-
-                        ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
-                        if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_logits, be);
-                        if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_embd,   be);
-
-                        if (do_cuda) {
-                            moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
-                        }
-                        res->set_inputs(&ubatch);
-                        ggml_backend_sched_synchronize(sched_phase2.get());
-
-                        // Compile CUDA graph plan (captures first compute)
-                        phase2_cache.capture(ggml_backend_graph_plan_create(gpu, phase2_gf), gpu);
-                        if (!phase2_cache.phase2_plan) { ret = GGML_STATUS_FAILED; return nullptr; }
+                    }
+                    if (!phase2_cache.valid) {
+                        phase2_cache.capture();
                         h2_hijack.captured = true;
                     }
+
+                    ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
+                    if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_logits, be);
+                    if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_embd,   be);
+
+                    if (do_cuda) {
+                        moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
+                    }
+                    res->set_inputs(&ubatch);
+                    ggml_backend_sched_synchronize(sched_phase2.get());
+                    {
+                        auto s = ggml_backend_sched_graph_compute_async(sched_phase2.get(), phase2_gf);
+                        if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                    }
+
+                    if (res->t_logits)
+                        moe_weight_cache.phase2_logits_data = res->t_logits->data;
 #else
                     res->reset();
                     ggml_backend_sched_reset(sched.get());
