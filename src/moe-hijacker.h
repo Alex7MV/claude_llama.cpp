@@ -1,20 +1,17 @@
 #pragma once
 
-// Graph scanning, cascade forcing, and deep-copy caching for MoE Phase 2.
+// Graph scanning and cascade forcing for MoE Phase 2.
 // Operates on phase2_hijack structs via reference parameters.
 // All functions are in namespace moe.
 
 #ifdef GGML_USE_CUDA
 
 #include <utility>
-#include <unordered_map>
-#include <vector>
 
 #include "ggml-backend.h"
 
 struct phase2_hijack;
 struct ggml_cgraph;
-struct ggml_tensor;
 
 namespace moe {
 
@@ -36,16 +33,10 @@ void cascade_force_moe_consumers(
 
 struct phase2_graph_cache {
     bool valid = false;
-    ggml_cgraph * persistent_gf = nullptr;
-    std::vector<ggml_tensor *> persistent_tensors;
 
     void capture() { valid = true; }
-    void release();
+    void release() { valid = false; }
 };
-
-void deep_copy_phase2_graph(
-    phase2_graph_cache & cache,
-    ggml_cgraph * src_gf);
 
 } // namespace moe
 

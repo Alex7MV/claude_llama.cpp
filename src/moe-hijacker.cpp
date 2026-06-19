@@ -4,12 +4,10 @@
 #include "moe-static-bunker.h"
 
 #include "ggml.h"
-#include "../ggml/src/ggml-impl.h"
 #include "ggml-backend.h"
 
 #include <cstdio>
 #include <cstring>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -185,76 +183,6 @@ void cascade_force_moe_consumers(
             }
         }
     }
-}
-
-// ---- Phase 2 Graph Deep-Copy ----
-
-void phase2_graph_cache::release() {
-    for (auto * t : persistent_tensors) delete t;
-    persistent_tensors.clear();
-    if (persistent_gf) { delete[] (char *)persistent_gf; persistent_gf = nullptr; }
-    valid = false;
-}
-
-void deep_copy_phase2_graph(
-    phase2_graph_cache & cache,
-    ggml_cgraph * src_gf)
-{
-    cache.release();
-
-    int n_nodes = ggml_graph_n_nodes(src_gf);
-    int n_leafs = ggml_graph_n_leafs(src_gf);
-    int total_t = n_nodes + n_leafs;
-
-    std::unordered_map<const ggml_tensor *, ggml_tensor *> map;
-
-    auto dup_tensor = [&](const ggml_tensor * src) -> ggml_tensor * {
-        auto * dst = new ggml_tensor(*src);
-        for (int s = 0; s < GGML_MAX_SRC; s++) dst->src[s] = src->src[s];
-        dst->view_src = src->view_src;
-        map[src] = dst;
-        cache.persistent_tensors.push_back(dst);
-        return dst;
-    };
-
-    for (int i = 0; i < n_leafs; i++) dup_tensor(ggml_graph_leaf(src_gf, i));
-    for (int i = 0; i < n_nodes; i++) dup_tensor(ggml_graph_node(src_gf, i));
-
-    for (auto * dst : cache.persistent_tensors) {
-        for (int s = 0; s < GGML_MAX_SRC; s++) {
-            if (dst->src[s]) {
-                auto it = map.find(dst->src[s]);
-                if (it != map.end()) dst->src[s] = it->second;
-            }
-        }
-        if (dst->view_src) {
-            auto it = map.find(dst->view_src);
-            if (it != map.end()) dst->view_src = it->second;
-        }
-    }
-
-    size_t graph_bytes = sizeof(ggml_cgraph) + (size_t)total_t * sizeof(ggml_tensor *) * 2;
-    char * buf = new char[graph_bytes]();
-    cache.persistent_gf = (ggml_cgraph *)buf;
-    cache.persistent_gf->size    = total_t;
-    cache.persistent_gf->n_nodes = 0;
-    cache.persistent_gf->n_leafs = 0;
-    cache.persistent_gf->nodes   = (ggml_tensor **)(buf + sizeof(ggml_cgraph));
-    cache.persistent_gf->leafs   = cache.persistent_gf->nodes + total_t;
-    cache.persistent_gf->order   = src_gf->order;
-    cache.persistent_gf->uid     = 0;
-
-    for (int i = 0; i < n_leafs; i++) {
-        auto it = map.find(ggml_graph_leaf(src_gf, i));
-        cache.persistent_gf->leafs[cache.persistent_gf->n_leafs++] = it->second;
-    }
-    for (int i = 0; i < n_nodes; i++) {
-        auto it = map.find(ggml_graph_node(src_gf, i));
-        cache.persistent_gf->nodes[cache.persistent_gf->n_nodes++] = it->second;
-    }
-
-    cache.valid = true;
-    fprintf(stderr, "deep_copy_phase2_graph: copied %d nodes + %d leafs\n", n_nodes, n_leafs);
 }
 
 } // namespace moe
