@@ -1872,6 +1872,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         }
                         // Fast-path gal oc: galloc_alloc_graph (no reserve_n) → same addresses
                         if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+                        n_reused++;
                         graphs_reused++;
 
                         ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
@@ -1884,8 +1885,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         moe::copy_data_to_static(h2_hijack, st);
                         ggml_backend_sched_synchronize(sched_phase2.get());
 
-                        // CUDA Graph plan: update addresses via cudaGraphExecUpdate then launch
-                        ggml_backend_graph_plan_update(gpu, phase2_cache.phase2_plan, phase2_gf);
+                        // CUDA Graph plan replay — single cudaGraphLaunch (addresses stable via galloc fast-path)
                         {
                             auto s = ggml_backend_graph_plan_compute(gpu, phase2_cache.phase2_plan);
                             if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
