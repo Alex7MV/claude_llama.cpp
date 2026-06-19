@@ -408,6 +408,12 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+#ifdef GGML_USE_CUDA
+    ggml_backend_sched_ptr sched_phase2;
+    moe::phase2_graph_cache phase2_cache;
+    int graphs_reused = 0;
+#endif
+
     // Pipelined prefill scheduler (optional, created when cparams.pipeline_depth > 0)
     ggml_backend_sched_pipelined_t sched_pipeline = nullptr;
     std::atomic<bool> sched_pipeline_init_attempted{false};

@@ -4,6 +4,7 @@
 #include "moe-static-bunker.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #include <cstring>
@@ -12,7 +13,6 @@
 
 extern "C" {
     int cudaMemcpyAsync(void * dst, const void * src, size_t count, int kind, void * stream);
-    void ggml_backend_sched_set_tensor_backend(void * sched, ggml_tensor * t, void * backend);
 }
 constexpr int cudaMemcpyDefault = 4;
 
@@ -169,8 +169,8 @@ void copy_data_to_static(phase2_hijack & h2, void * cuda_stream) {
 void cascade_force_moe_consumers(
     phase2_hijack & h2,
     ggml_cgraph * gf,
-    void * sched,
-    void * gpu_backend)
+    ggml_backend_sched_t sched,
+    ggml_backend_t gpu_backend)
 {
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
         ggml_tensor * t = ggml_graph_node(gf, i);
@@ -183,6 +183,23 @@ void cascade_force_moe_consumers(
             }
         }
     }
+}
+
+// ---- Phase 2 Graph Plan Cache ----
+
+void phase2_graph_cache::capture(ggml_backend_graph_plan_t plan, ggml_backend_t backend) {
+    phase2_plan = plan;
+    plan_backend = backend;
+    valid = true;
+}
+
+void phase2_graph_cache::release() {
+    if (phase2_plan && plan_backend) {
+        ggml_backend_graph_plan_free(plan_backend, phase2_plan);
+        phase2_plan = nullptr;
+        plan_backend = nullptr;
+    }
+    valid = false;
 }
 
 } // namespace moe

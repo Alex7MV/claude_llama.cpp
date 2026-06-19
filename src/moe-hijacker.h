@@ -8,6 +8,8 @@
 
 #include <utility>
 
+#include "ggml-backend.h"
+
 struct phase2_hijack;
 struct ggml_cgraph;
 
@@ -26,8 +28,17 @@ void copy_data_to_static(phase2_hijack & h2, void * cuda_stream);
 void cascade_force_moe_consumers(
     phase2_hijack & h2,
     ggml_cgraph * gf,
-    void * sched,
-    void * gpu_backend);
+    ggml_backend_sched_t sched,
+    ggml_backend_t gpu_backend);
+
+struct phase2_graph_cache {
+    bool valid = false;
+    ggml_backend_graph_plan_t phase2_plan = nullptr;
+    ggml_backend_t plan_backend = nullptr;
+
+    void capture(ggml_backend_graph_plan_t plan, ggml_backend_t backend);
+    void release();
+};
 
 } // namespace moe
 

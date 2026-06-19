@@ -5091,6 +5091,89 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+struct ggml_cuda_graph_plan {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t instance = nullptr;
+};
+
+static ggml_backend_graph_plan_t ggml_backend_cuda_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    auto * plan = new ggml_cuda_graph_plan();
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, const_cast<ggml_cgraph *>(cgraph), false, false, nullptr);
+
+    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &plan->graph));
+    CUDA_CHECK(cudaGraphInstantiate(&plan->instance, plan->graph, nullptr, nullptr, 0));
+
+    return (ggml_backend_graph_plan_t)plan;
+}
+
+static void ggml_backend_cuda_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    (void)backend;
+    auto * p = (ggml_cuda_graph_plan *)plan;
+    if (!p) return;
+    if (p->instance) { CUDA_CHECK(cudaGraphExecDestroy(p->instance)); p->instance = nullptr; }
+    if (p->graph)    { CUDA_CHECK(cudaGraphDestroy(p->graph));       p->graph    = nullptr; }
+    delete p;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto * p = (ggml_cuda_graph_plan *)plan;
+    CUDA_CHECK(cudaGraphLaunch(p->instance, cuda_ctx->stream()));
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cuda_graph_plan_update(ggml_backend_t backend, ggml_backend_graph_plan_t plan, const struct ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    auto * p = (ggml_cuda_graph_plan *)plan;
+    if (!p || !p->instance) return;
+
+    cudaGraph_t new_graph = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+        ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, const_cast<ggml_cgraph *>(cgraph), false, false, nullptr);
+
+    CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &new_graph));
+
+#if CUDART_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo result_info;
+    cudaError_t stat = cudaGraphExecUpdate(p->instance, new_graph, &result_info);
+#else
+    cudaGraphNode_t errorNode;
+    cudaGraphExecUpdateResult result_info;
+    cudaError_t stat = cudaGraphExecUpdate(p->instance, new_graph, &errorNode, &result_info);
+#endif
+
+    if (stat == cudaErrorGraphExecUpdateFailure) {
+        (void)cudaGetLastError();
+        CUDA_CHECK(cudaGraphExecDestroy(p->instance));
+        p->instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&p->instance, new_graph, nullptr, nullptr, 0));
+    } else {
+        GGML_ASSERT(stat == cudaSuccess);
+    }
+
+    CUDA_CHECK(cudaGraphDestroy(new_graph));
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -5100,10 +5183,10 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_tensor_2d_async     = */ ggml_backend_cuda_get_tensor_2d_async,
     /* .cpy_tensor_async        = */ ggml_backend_cuda_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_cuda_synchronize,
-    /* .graph_plan_create       = */ NULL,
-    /* .graph_plan_free         = */ NULL,
-    /* .graph_plan_update       = */ NULL,
-    /* .graph_plan_compute      = */ NULL,
+    /* .graph_plan_create       = */ ggml_backend_cuda_graph_plan_create,
+    /* .graph_plan_free         = */ ggml_backend_cuda_graph_plan_free,
+    /* .graph_plan_update       = */ ggml_backend_cuda_graph_plan_update,
+    /* .graph_plan_compute      = */ ggml_backend_cuda_graph_plan_compute,
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
