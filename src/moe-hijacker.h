@@ -14,7 +14,6 @@
 
 struct phase2_hijack;
 struct ggml_cgraph;
-struct ggml_context;
 struct ggml_tensor;
 
 namespace moe {
@@ -38,7 +37,6 @@ void cascade_force_moe_consumers(
 struct phase2_graph_cache {
     bool valid = false;
     ggml_cgraph * persistent_gf = nullptr;
-    struct ggml_context * persistent_ctx = nullptr;
     std::vector<ggml_tensor *> persistent_tensors;
 
     void capture() { valid = true; }
