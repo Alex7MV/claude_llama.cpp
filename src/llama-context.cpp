@@ -1817,33 +1817,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     const bool do_cuda = (ubatch.n_tokens == 1);
                     ggml_cgraph * phase2_gf;
 
-                    // Unified native compute via isolated sched_phase2.
-                    // galloc fast-path (backend_ids_changed=false) skips reserve_n on Token 2+.
-                    if (!sched_phase2) {
-                        const size_t phase2_n = std::max((size_t)graph_max_nodes(ubatch.n_tokens), (size_t)10000);
-                        sched_phase2.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), phase2_n, false, cparams.op_offload));
-                    }
-                    res->reset();
-                    ggml_backend_sched_reset(sched_phase2.get());
-                    moe_weight_cache.build_layer_only = -1;
-                    moe_weight_cache.build_phase = 2;
-                    phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
-                    if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
-                    ggml_backend_sched_reset(sched_phase2.get());
-                    for (int i = 0; i < ggml_graph_n_nodes(phase2_gf); i++) {
-                        ggml_tensor * t = ggml_graph_node(phase2_gf, i);
-                        auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                        if (tid >= 0)
-                            ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                    }
-                    for (int i = 0; i < ggml_graph_n_leafs(phase2_gf); i++) {
-                        ggml_tensor * t = ggml_graph_leaf(phase2_gf, i);
-                        auto [tid, il] = moe::match_hijack_name(h2_hijack, t->name);
-                        if (tid >= 0)
-                            ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, gpu);
-                    }
-                    moe::cascade_force_moe_consumers(h2_hijack, phase2_gf, sched_phase2.get(), gpu);
-                    if (backend_cpu) {
+                    auto force_idxs_to_cpu_p2 = [&]() {
+                        if (!backend_cpu) return;
                         auto force = [&](ggml_tensor * t) {
                             if (t) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), t, backend_cpu);
                         };
@@ -1873,33 +1848,158 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                                 force(oid->out_ids);
                             }
                         }
-                    }
+                    };
 
-                    // alloc_graph: Token 1 = full reserve+alloc; Token 2+ = galloc fast-path (no reserve_n)
-                    if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) { ret = GGML_STATUS_ALLOC_FAILED; return nullptr; }
+                    auto graph_compute_with_sched = [&](ggml_cgraph * gf, ggml_backend_sched_t sched) -> bool {
+                        auto s = ggml_backend_sched_graph_compute_async(sched, gf);
+                        return s == GGML_STATUS_SUCCESS;
+                    };
 
-                    // Track cache hit for server metrics
                     if (do_cuda && phase2_cache.valid) {
+                        // ---- Path B: Token 2+ REPLAY ----
+                        // Reuse the permanent captured graph. Do NOT rebuild, do NOT re-run cascade,
+                        // and do NOT call alloc_graph; physical addresses are already locked in sched_phase2.
+                        GGML_ASSERT(ubatch.n_tokens == 1);
+                        GGML_ASSERT(phase2_cache.persistent_gf != nullptr);
+                        phase2_gf = phase2_cache.persistent_gf;
+                        force_idxs_to_cpu_p2();
+                        if (do_cuda) {
+                            moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
+                        }
+                        res->set_inputs(&ubatch);
+                        if (!graph_compute_with_sched(phase2_gf, sched_phase2.get())) { ret = GGML_STATUS_FAILED; return nullptr; }
                         n_reused++;
-                    }
-                    if (!phase2_cache.valid) {
-                        phase2_cache.capture();
-                    }
+                    } else {
+                        // ---- Path A: Token 1 BUILD ----
+                        if (!sched_phase2) {
+                            const size_t phase2_n = std::max((size_t)graph_max_nodes(ubatch.n_tokens), (size_t)10000);
+                            sched_phase2.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), phase2_n, false, cparams.op_offload));
+                        }
+                        phase2_cache.release();
+                        res->reset();
+                        ggml_backend_sched_reset(sched_phase2.get());
+                        moe_weight_cache.build_layer_only = -1;
+                        moe_weight_cache.build_phase = 2;
 
-                    ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
-                    if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_logits, be);
-                    if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_embd,   be);
+                        phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
+                        if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
 
-                    if (do_cuda) {
-                        moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
-                    }
-                    res->set_inputs(&ubatch);
-                    ggml_backend_sched_synchronize(sched_phase2.get());
-                    {
-                        auto s = ggml_backend_sched_graph_compute_async(sched_phase2.get(), phase2_gf);
-                        if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
-                    }
+                        // Persist the Phase 2 graph structure across res->reset().
+                        // Tensor objects remain shared with the freshly built graph, so
+                        // framework-owned backend metadata is preserved exactly.
+                        moe::capture_phase2_graph(phase2_cache, phase2_gf);
+                        if (!phase2_cache.persistent_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
 
+                        // All further work uses the persistent copy.
+                        phase2_gf = phase2_cache.persistent_gf;
+
+                        // Force ADD/VIEW consumers of the hijacked MoE outputs onto GPU.
+                        // Must run on the persistent graph so backends are stored against
+                        // the scheduler-owned tensor pointers.
+                        moe::cascade_force_moe_consumers(h2_hijack, phase2_gf, sched_phase2.get(), gpu);
+
+                        // Lock physical addresses once. No allocator call on Token 2+.
+                        if (!ggml_backend_sched_alloc_graph(sched_phase2.get(), phase2_gf)) {
+                            ret = GGML_STATUS_ALLOC_FAILED;
+                            return nullptr;
+                        }
+
+                        // Direction for final output/input views.
+                        {
+                            ggml_backend_t be = ggml_backend_sched_get_backend(sched_phase2.get(), 0);
+                            if (res->t_logits) ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_logits, be);
+                            if (res->t_embd)   ggml_backend_sched_set_tensor_backend(sched_phase2.get(), res->t_embd,   be);
+                        }
+
+                        // Redirect input/output views to persistent tensors.
+                        {
+                            auto remap_ptr = [&](ggml_tensor *& t) { t = phase2_cache.remap(t); };
+                            for (auto & inp : res->inputs) {
+                                auto * base = inp.get();
+                                if (auto * akv = dynamic_cast<llm_graph_input_attn_kv *>(base)) {
+                                    remap_ptr(akv->self_k_idxs); remap_ptr(akv->self_v_idxs);
+                                    remap_ptr(akv->self_kq_mask); remap_ptr(akv->self_kq_mask_cnv);
+                                    remap_ptr(akv->self_k_rot); remap_ptr(akv->self_v_rot);
+                                } else if (auto * ak = dynamic_cast<llm_graph_input_attn_k *>(base)) {
+                                    remap_ptr(ak->self_k_idxs); remap_ptr(ak->self_kq_mask);
+                                    remap_ptr(ak->self_kq_mask_cnv);
+                                } else if (auto * dsa = dynamic_cast<llm_graph_input_attn_k_dsa *>(base)) {
+                                    remap_ptr(dsa->self_k_idxs_mla); remap_ptr(dsa->self_k_idxs_lid);
+                                    remap_ptr(dsa->self_kq_mask_mla); remap_ptr(dsa->self_kq_mask_mla_cnv);
+                                    remap_ptr(dsa->self_kq_mask_lid); remap_ptr(dsa->self_kq_mask_lid_cnv);
+                                    remap_ptr(dsa->self_k_rot_lid);
+                                } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(base)) {
+                                    remap_ptr(iswa->self_k_idxs); remap_ptr(iswa->self_v_idxs);
+                                    remap_ptr(iswa->self_k_idxs_swa); remap_ptr(iswa->self_v_idxs_swa);
+                                    remap_ptr(iswa->self_kq_mask); remap_ptr(iswa->self_kq_mask_cnv);
+                                    remap_ptr(iswa->self_kq_mask_swa); remap_ptr(iswa->self_kq_mask_swa_cnv);
+                                    remap_ptr(iswa->self_k_rot); remap_ptr(iswa->self_v_rot);
+                                    remap_ptr(iswa->self_k_rot_swa); remap_ptr(iswa->self_v_rot_swa);
+                                } else if (auto * nc = dynamic_cast<llm_graph_input_attn_no_cache *>(base)) {
+                                    remap_ptr(nc->self_kq_mask); remap_ptr(nc->self_kq_mask_cnv);
+                                    remap_ptr(nc->self_kq_mask_swa); remap_ptr(nc->self_kq_mask_swa_cnv);
+                                } else if (auto * cross = dynamic_cast<llm_graph_input_attn_cross *>(base)) {
+                                    remap_ptr(cross->cross_kq_mask); remap_ptr(cross->cross_kq_mask_cnv);
+                                } else if (auto * embd = dynamic_cast<llm_graph_input_embd *>(base)) {
+                                    remap_ptr(embd->tokens); remap_ptr(embd->embd);
+                                } else if (auto * embd_h = dynamic_cast<llm_graph_input_embd_h *>(base)) {
+                                    remap_ptr(embd_h->tokens); remap_ptr(embd_h->embd); remap_ptr(embd_h->h);
+                                } else if (auto * pos = dynamic_cast<llm_graph_input_pos *>(base)) {
+                                    remap_ptr(pos->pos);
+                                } else if (auto * temp = dynamic_cast<llm_graph_input_attn_temp *>(base)) {
+                                    remap_ptr(temp->attn_scale);
+                                } else if (auto * pb = dynamic_cast<llm_graph_input_pos_bucket *>(base)) {
+                                    remap_ptr(pb->pos_bucket);
+                                } else if (auto * pbk = dynamic_cast<llm_graph_input_pos_bucket_kv *>(base)) {
+                                    remap_ptr(pbk->pos_bucket);
+                                } else if (auto * oid = dynamic_cast<llm_graph_input_out_ids *>(base)) {
+                                    remap_ptr(oid->out_ids);
+                                } else if (auto * mean = dynamic_cast<llm_graph_input_mean *>(base)) {
+                                    remap_ptr(mean->mean);
+                                } else if (auto * cls = dynamic_cast<llm_graph_input_cls *>(base)) {
+                                    remap_ptr(cls->cls);
+                                } else if (auto * rs = dynamic_cast<llm_graph_input_rs *>(base)) {
+                                    remap_ptr(rs->s_copy); remap_ptr(rs->s_copy_main); remap_ptr(rs->s_copy_extra);
+                                } else if (auto * ce = dynamic_cast<llm_graph_input_cross_embd *>(base)) {
+                                    remap_ptr(ce->cross_embd);
+                                } else if (auto * hyb = dynamic_cast<llm_graph_input_mem_hybrid *>(base)) {
+                                    remap_ptr(hyb->inp_attn->self_k_idxs); remap_ptr(hyb->inp_attn->self_v_idxs);
+                                    remap_ptr(hyb->inp_attn->self_kq_mask); remap_ptr(hyb->inp_attn->self_kq_mask_cnv);
+                                    remap_ptr(hyb->inp_attn->self_k_rot); remap_ptr(hyb->inp_attn->self_v_rot);
+                                    remap_ptr(hyb->inp_rs->s_copy); remap_ptr(hyb->inp_rs->s_copy_main);
+                                    remap_ptr(hyb->inp_rs->s_copy_extra);
+                                } else if (auto * hybk = dynamic_cast<llm_graph_input_mem_hybrid_k *>(base)) {
+                                    remap_ptr(hybk->inp_attn->self_k_idxs); remap_ptr(hybk->inp_attn->self_kq_mask);
+                                    remap_ptr(hybk->inp_attn->self_kq_mask_cnv);
+                                    remap_ptr(hybk->inp_rs->s_copy); remap_ptr(hybk->inp_rs->s_copy_main);
+                                    remap_ptr(hybk->inp_rs->s_copy_extra);
+                                } else if (auto * hybiswa = dynamic_cast<llm_graph_input_mem_hybrid_iswa *>(base)) {
+                                    remap_ptr(hybiswa->inp_attn->self_k_idxs); remap_ptr(hybiswa->inp_attn->self_v_idxs);
+                                    remap_ptr(hybiswa->inp_attn->self_k_idxs_swa); remap_ptr(hybiswa->inp_attn->self_v_idxs_swa);
+                                    remap_ptr(hybiswa->inp_attn->self_kq_mask); remap_ptr(hybiswa->inp_attn->self_kq_mask_cnv);
+                                    remap_ptr(hybiswa->inp_attn->self_kq_mask_swa); remap_ptr(hybiswa->inp_attn->self_kq_mask_swa_cnv);
+                                    remap_ptr(hybiswa->inp_attn->self_k_rot); remap_ptr(hybiswa->inp_attn->self_v_rot);
+                                    remap_ptr(hybiswa->inp_attn->self_k_rot_swa); remap_ptr(hybiswa->inp_attn->self_v_rot_swa);
+                                    remap_ptr(hybiswa->inp_rs->s_copy); remap_ptr(hybiswa->inp_rs->s_copy_main);
+                                    remap_ptr(hybiswa->inp_rs->s_copy_extra);
+                                }
+                            }
+                            remap_ptr(res->t_logits); remap_ptr(res->t_embd);
+                        }
+
+                        if (do_cuda) {
+                            moe::scan_and_update_snapshots(h2_hijack, phase2_gf);
+                        }
+                        res->set_inputs(&ubatch);
+                        ggml_backend_sched_synchronize(sched_phase2.get());
+                        {
+                            auto s = ggml_backend_sched_graph_compute_async(sched_phase2.get(), phase2_gf);
+                            if (s != GGML_STATUS_SUCCESS) { ret = s; return nullptr; }
+                        }
+                        if (do_cuda) {
+                            phase2_cache.valid = true;
+                        }
+                    }
                     if (res->t_logits)
                         moe_weight_cache.phase2_logits_data = res->t_logits->data;
 #endif
