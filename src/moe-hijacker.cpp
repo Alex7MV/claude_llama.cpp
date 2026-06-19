@@ -161,15 +161,11 @@ void capture_phase2_graph(phase2_graph_cache & cache, ggml_cgraph * src_gf) {
         return;
     }
 
+    // ggml_graph_cpy copies nodes/leafs AND the visited_hash_set + use_counts,
+    // which the scheduler's allocator and compute rely on.
+    ggml_graph_cpy(src_gf, cache.persistent_gf);
     cache.persistent_gf->order = src_gf->order;
     cache.persistent_gf->uid   = src_gf->uid;
-
-    for (int i = 0; i < n_leafs; i++) {
-        cache.persistent_gf->leafs[cache.persistent_gf->n_leafs++] = ggml_graph_leaf(src_gf, i);
-    }
-    for (int i = 0; i < n_nodes; i++) {
-        cache.persistent_gf->nodes[cache.persistent_gf->n_nodes++] = ggml_graph_node(src_gf, i);
-    }
 
     cache.valid = true;
     fprintf(stderr, "capture_phase2_graph: %d nodes + %d leafs (shallow, size=%d)\n", n_nodes, n_leafs, gsize);

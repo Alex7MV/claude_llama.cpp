@@ -1884,12 +1884,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         phase2_gf = model.build_graph(gparams, nullptr, nullptr, &moe_weight_cache);
                         if (!phase2_gf) { ret = GGML_STATUS_FAILED; return nullptr; }
 
-                        // Inputs must be written and CPU-assigned before capture.
-                        // alloc_graph needs the final shapes and host-buffer inputs,
-                        // and the persistent graph will share these tensor objects.
-                        force_idxs_to_cpu_p2();
-                        res->set_inputs(&ubatch);
-
                         // Persist the Phase 2 graph structure across res->reset().
                         // Tensor objects remain shared with the freshly built graph, so
                         // framework-owned backend metadata is preserved exactly.
